@@ -19,9 +19,3 @@ clean:
 	@rm -rf $(BIN_DIR)
 	@go clean
 	@echo "✅ Clean complete"
-
-run: build
-	./$(BIN_DIR)/$(BINARY_NAME)
-
-hello: build
-	./$(BIN_DIR)/$(BINARY_NAME) hello

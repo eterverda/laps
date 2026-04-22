@@ -18,44 +18,13 @@ import (
 	"syscall"
 
 	"github.com/fpvladder/laps/host/internal/config"
-	"github.com/spf13/cobra"
 	"golang.org/x/text/language"
 )
 
 const maxTTSCacheSize = 200 * 1024
 
-// Context key for language
-type langKey struct{}
-
-// WithLang returns a new context with language set
-func WithLang(ctx context.Context, lang language.Tag) context.Context {
-	return context.WithValue(ctx, langKey{}, lang)
-}
-
-// LangFromContext extracts language from context, returns empty tag if not set
-func LangFromContext(ctx context.Context) language.Tag {
-	if lang, ok := ctx.Value(langKey{}).(language.Tag); ok {
-		return lang
-	}
-	return language.Und
-}
-
 // Speak synthesizes and plays text using Google TTS
-func Speak(ctx context.Context, text string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		slog.Warn("failed to load config", "err", err)
-		cfg = config.Default()
-	}
-
-	lang := LangFromContext(ctx)
-	if lang == language.Und {
-		lang = cfg.Lang
-	}
-	if lang == language.Und {
-		lang = language.Russian
-	}
-
+func Speak(ctx context.Context, lang language.Tag, text string) error {
 	// Get base language code (e.g., "ru" from "ru-RU")
 	base, _ := lang.Base()
 	langCode := base.String()
@@ -91,7 +60,7 @@ func Speak(ctx context.Context, text string) error {
 	return nil
 }
 
-func runSpeak(cmd *cobra.Command, args []string) {
+func runSpeak(cfg *config.Config, args []string) {
 	// Create cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -113,14 +82,7 @@ func runSpeak(cmd *cobra.Command, args []string) {
 	text := strings.Join(args, " ")
 	slog.Debug("text to speak", "text", text)
 
-	// Get lang from flag and store in context
-	if langStr, _ := cmd.Flags().GetString("lang"); langStr != "" {
-		if lang, err := language.Parse(langStr); err == nil {
-			ctx = WithLang(ctx, lang)
-		}
-	}
-
-	if err := Speak(ctx, text); err != nil {
+	if err := Speak(ctx, cfg.Lang, text); err != nil {
 		if err == context.Canceled {
 			slog.Info("speak cancelled")
 			return

@@ -25,19 +25,19 @@ func Default() *Config {
 }
 
 // Load загружает конфигурацию из файла или создаёт по умолчанию
-func Load() (*Config, error) {
-	configPath, err := getConfigPath()
-	if err != nil {
-		return nil, fmt.Errorf("не удалось определить путь к конфигу: %w", err)
+func Load(providedConfigPath string) (*Config, error) {
+	configPath := providedConfigPath
+	if configPath == "" {
+		defaultPath, err := getConfigPath()
+		if err != nil {
+			return nil, fmt.Errorf("не удалось определить путь к конфигу: %w", err)
+		}
+		configPath = defaultPath
 	}
 
-	// Если файл не существует — создаём с дефолтами
+	// Если файл не существует — возвращаем дефолт
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		cfg := Default()
-		if err := cfg.Save(); err != nil {
-			return nil, fmt.Errorf("не удалось создать конфиг: %w", err)
-		}
-		return cfg, nil
+		return Default(), nil
 	}
 
 	// Читаем файл
@@ -57,31 +57,6 @@ func Load() (*Config, error) {
 	}
 
 	return &cfg, nil
-}
-
-// Save сохраняет конфигурацию в файл
-func (c *Config) Save() error {
-	configPath, err := getConfigPath()
-	if err != nil {
-		return err
-	}
-
-	// Создаём директорию если нужно
-	configDir := filepath.Dir(configPath)
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return fmt.Errorf("не удалось создать директорию: %w", err)
-	}
-
-	data, err := yaml.Marshal(c)
-	if err != nil {
-		return fmt.Errorf("не удалось сериализовать конфиг: %w", err)
-	}
-
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
-		return fmt.Errorf("не удалось записать конфиг: %w", err)
-	}
-
-	return nil
 }
 
 // getConfigPath возвращает путь к файлу конфигурации

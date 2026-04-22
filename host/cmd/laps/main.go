@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 
 	"github.com/fpvladder/laps/host/internal/config"
 	"github.com/spf13/cobra"
@@ -12,33 +11,9 @@ import (
 )
 
 func main() {
-	/* pre-parse --lang flag before cobra initialization */
-	langStr := ""
-	for i, arg := range os.Args {
-		if arg == "--lang" && i+1 < len(os.Args) {
-			langStr = os.Args[i+1]
-			break
-		}
-		if strings.HasPrefix(arg, "--lang=") {
-			langStr = strings.TrimPrefix(arg, "--lang=")
-			break
-		}
-	}
-	/* end pre-parse */
+	cfg := parseConfig()
 
-	var lang language.Tag
-	if langStr != "" {
-		lang, _ = language.Parse(langStr)
-	}
-	if lang == language.Und {
-		if cfg, err := config.Load(); err == nil {
-			lang = cfg.Lang
-		}
-	}
-	if lang == language.Und {
-		lang = language.Russian
-	}
-	initI18n(lang)
+	initI18n(cfg.Lang)
 
 	root := &cobra.Command{
 		Use:   T("cmd.laps.use"),
@@ -50,6 +25,7 @@ func main() {
 	}
 
 	root.PersistentFlags().String("lang", "", T("cmd.laps.flags.lang.usage"))
+	root.PersistentFlags().String("config-file", "", T("cmd.laps.flags.config-file.usage"))
 	root.PersistentFlags().String("loglevel", "warn", T("cmd.laps.flags.loglevel.usage"))
 
 	root.AddCommand(&cobra.Command{
@@ -74,11 +50,38 @@ func main() {
 		Use:   T("cmd.speak.use"),
 		Short: T("cmd.speak.short"),
 		Long:  T("cmd.speak.long"),
-		Run:   runSpeak,
+		Run: func(cmd *cobra.Command, args []string) {
+			runSpeak(cfg, args)
+		},
 	})
 
 	if err := root.Execute(); err != nil {
 		slog.Error("execution error", "err", err)
 		os.Exit(1)
 	}
+}
+
+// parseConfig extracts --lang and --config-file from raw args using cobra,
+// loads config and returns it. Unknown flags are ignored.
+func parseConfig() *config.Config {
+	cmd := &cobra.Command{
+		FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
+	}
+	cmd.PersistentFlags().String("lang", "", "")
+	cmd.PersistentFlags().String("config-file", "", "")
+	cmd.Execute()
+
+	langStr, _ := cmd.Flags().GetString("lang")
+	configFile, _ := cmd.Flags().GetString("config-file")
+
+	cfg, _ := config.Load(configFile)
+	if cfg == nil {
+		cfg = config.Default()
+	}
+	if langStr != "" {
+		if tag, err := language.Parse(langStr); err == nil {
+			cfg.Lang = tag
+		}
+	}
+	return cfg
 }

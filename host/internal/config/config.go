@@ -2,29 +2,30 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 
-	"golang.org/x/text/language"
 	"gopkg.in/yaml.v3"
+
+	"github.com/fpvladder/laps/host/internal/locale"
 )
 
 // Config структура конфигурации
 type Config struct {
-	Lang language.Tag `yaml:"lang"` // язык интерфейса, например ru, en-US, pt-BR
+	Locale locale.Locale `yaml:"locale,omitempty"` // язык интерфейса, например ru, en-US, pt-BR
 }
 
 // Default возвращает конфигурацию по умолчанию
 func Default() *Config {
 	return &Config{
-		Lang: detectSystemLang(),
+		Locale: locale.System(),
 	}
 }
 
-// Load загружает конфигурацию из файла или создаёт по умолчанию
+// Load загружает конфигурацию из файла.
+// Если файл не существует — возвращает пустой конфиг.
 func Load(providedConfigPath string) (*Config, error) {
 	configPath := providedConfigPath
 	if configPath == "" {
@@ -35,9 +36,9 @@ func Load(providedConfigPath string) (*Config, error) {
 		configPath = defaultPath
 	}
 
-	// Если файл не существует — возвращаем дефолт
+	// Если файл не существует — возвращаем пустой конфиг
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return Default(), nil
+		return &Config{}, nil
 	}
 
 	// Читаем файл
@@ -51,12 +52,18 @@ func Load(providedConfigPath string) (*Config, error) {
 		return nil, fmt.Errorf("не удалось распарсить конфиг: %w", err)
 	}
 
-	// Если lang пустой — используем системный
-	if cfg.Lang == language.Und {
-		cfg.Lang = detectSystemLang()
-	}
-
 	return &cfg, nil
+}
+
+// Override возвращает копию текущего конфига, в которой непустые поля other
+// заменяют соответствующие поля.
+func (c *Config) Override(other *Config) *Config {
+	if other == nil {
+		return c
+	}
+	return &Config{
+		Locale: cmp.Or(other.Locale, c.Locale),
+	}
 }
 
 // getConfigPath возвращает путь к файлу конфигурации
@@ -74,33 +81,4 @@ func getConfigPath() (string, error) {
 	}
 
 	return filepath.Join(configDir, "config.yaml"), nil
-}
-
-// detectSystemLang определяет язык системы
-func detectSystemLang() language.Tag {
-	lang := os.Getenv("LANG")
-	if lang == "" {
-		lang = os.Getenv("LC_ALL")
-	}
-
-	// ru_RU.UTF-8 → ru_RU
-	if idx := strings.Index(lang, "."); idx != -1 {
-		lang = lang[:idx]
-	}
-
-	// Если не определён — пробуем macOS
-	if lang == "" || lang == "C" || lang == "POSIX" {
-		if runtime.GOOS == "darwin" {
-			// Пробуем defaults read
-			// Здесь можно добавить exec.Command, но это замедлит старт
-			// Пока просто en
-		}
-		return language.English
-	}
-
-	tag, err := language.Parse(lang)
-	if err != nil {
-		return language.English
-	}
-	return tag
 }

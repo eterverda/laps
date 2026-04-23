@@ -4,7 +4,9 @@ cmd:
     short: "FPV Lap Timer"
     long: "Laps — open-source lap timing system для FPV дрон-рейсинга"
     flags:
-      lang:
+      config-file:
+        usage: "Путь к файлу конфигурации"
+      locale:
         usage: "Язык (переопределяет конфиг)"
       loglevel:
         usage: "Уровень логирования: debug, info, warn, error"
@@ -32,3 +34,7 @@ cmd:
         macOS:    встроенный afplay (или brew install ffmpeg)
         Debian:   sudo apt install ffmpeg
         Arch:     sudo pacman -S ffmpeg
+cli:
+  logs:
+    parsed-config: "Распарсенный конфиг"
+    result-config: "Итоговый конфиг"

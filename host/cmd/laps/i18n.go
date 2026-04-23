@@ -6,6 +6,8 @@ import (
 	"github.com/nicksnyder/go-i18n/v2/i18n"
 	"golang.org/x/text/language"
 	"gopkg.in/yaml.v3"
+
+	"github.com/fpvladder/laps/host/internal/locale"
 )
 
 //go:embed i18n.*.yaml
@@ -14,7 +16,7 @@ var localeFS embed.FS
 var i18nBundle *i18n.Bundle
 var i18nLocalizer *i18n.Localizer
 
-func initI18n(lang language.Tag) {
+func initI18n(loc locale.Locale) {
 	if i18nBundle == nil {
 		i18nBundle = i18n.NewBundle(language.Russian)
 		i18nBundle.RegisterUnmarshalFunc("yaml", yaml.Unmarshal)
@@ -30,10 +32,10 @@ func initI18n(lang language.Tag) {
 		}
 	}
 
-	if lang == language.Und {
-		lang = language.Russian
+	if loc.IsRoot() {
+		loc = locale.Locale(language.Russian)
 	}
-	i18nLocalizer = i18n.NewLocalizer(i18nBundle, lang.String())
+	i18nLocalizer = i18n.NewLocalizer(i18nBundle, loc.String())
 }
 
 func T(key string) string {

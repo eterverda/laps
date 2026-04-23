@@ -18,16 +18,14 @@ import (
 	"syscall"
 
 	"github.com/fpvladder/laps/host/internal/config"
-	"golang.org/x/text/language"
+	"github.com/fpvladder/laps/host/internal/locale"
 )
 
 const maxTTSCacheSize = 200 * 1024
 
 // Speak synthesizes and plays text using Google TTS
-func Speak(ctx context.Context, lang language.Tag, text string) error {
-	// Get base language code (e.g., "ru" from "ru-RU")
-	base, _ := lang.Base()
-	langCode := base.String()
+func Speak(ctx context.Context, loc locale.Locale, text string) error {
+	langCode := loc.String()
 
 	if err := cleanupCache(maxTTSCacheSize); err != nil {
 		slog.Warn("cache cleanup failed", "err", err)
@@ -82,7 +80,7 @@ func runSpeak(cfg *config.Config, args []string) {
 	text := strings.Join(args, " ")
 	slog.Debug("text to speak", "text", text)
 
-	if err := Speak(ctx, cfg.Lang, text); err != nil {
+	if err := Speak(ctx, cfg.Locale, text); err != nil {
 		if err == context.Canceled {
 			slog.Info("speak cancelled")
 			return

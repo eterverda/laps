@@ -6,14 +6,24 @@ import (
 	"os"
 
 	"github.com/fpvladder/laps/host/internal/config"
+	"github.com/fpvladder/laps/host/internal/locale"
 	"github.com/spf13/cobra"
-	"golang.org/x/text/language"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
-	cfg := parseConfig()
+	parsedConfig := parseConfig()
+	cfg := config.Default().Override(parsedConfig)
 
-	initI18n(cfg.Lang)
+	initI18n(cfg.Locale)
+
+	fmt.Printf("// %s\n", T("cli.logs.parsed-config"))
+	yaml.NewEncoder(os.Stdout).Encode(parsedConfig)
+	fmt.Println()
+
+	fmt.Printf("// %s\n", T("cli.logs.result-config"))
+	yaml.NewEncoder(os.Stdout).Encode(cfg)
+	fmt.Println()
 
 	root := &cobra.Command{
 		Use:   T("cmd.laps.use"),
@@ -24,7 +34,7 @@ func main() {
 		},
 	}
 
-	root.PersistentFlags().String("lang", "", T("cmd.laps.flags.lang.usage"))
+	root.PersistentFlags().String("locale", "", T("cmd.laps.flags.locale.usage"))
 	root.PersistentFlags().String("config-file", "", T("cmd.laps.flags.config-file.usage"))
 	root.PersistentFlags().String("loglevel", "warn", T("cmd.laps.flags.loglevel.usage"))
 
@@ -61,26 +71,23 @@ func main() {
 	}
 }
 
-// parseConfig extracts --lang and --config-file from raw args using cobra,
+// parseConfig extracts --locale and --config-file from raw args using cobra,
 // loads config and returns it. Unknown flags are ignored.
 func parseConfig() *config.Config {
 	cmd := &cobra.Command{
 		FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
 	}
-	cmd.PersistentFlags().String("lang", "", "")
+	cmd.PersistentFlags().String("locale", "", "")
 	cmd.PersistentFlags().String("config-file", "", "")
 	cmd.Execute()
 
-	langStr, _ := cmd.Flags().GetString("lang")
+	localeStr, _ := cmd.Flags().GetString("locale")
 	configFile, _ := cmd.Flags().GetString("config-file")
 
 	cfg, _ := config.Load(configFile)
-	if cfg == nil {
-		cfg = config.Default()
-	}
-	if langStr != "" {
-		if tag, err := language.Parse(langStr); err == nil {
-			cfg.Lang = tag
+	if localeStr != "" {
+		if loc, err := locale.Parse(localeStr); err == nil {
+			cfg.Locale = loc
 		}
 	}
 	return cfg

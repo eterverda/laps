@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8" ?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -19,12 +19,14 @@
     <key>LSMinimumSystemVersion</key>
     <string>10.15</string>
     <key>LSUIElement</key>
-    <false/>
+    <false />
     <key>CFBundleIconFile</key>
     <string>icon</string>
     <key>NSHighResolutionCapable</key>
-    <true/>
+    <true />
     <key>NSRequiresAquaSystemAppearance</key>
-    <false/>
+    <false />
+    <key>NSCameraUsageDescription</key>
+    <string>Laps needs camera access for video capture display</string>
 </dict>
 </plist>

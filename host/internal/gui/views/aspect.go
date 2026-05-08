@@ -65,20 +65,10 @@ func (a Aspect) Layout(gtx layout.Context, widget layout.Widget) layout.Dimensio
 	stack := op.Affine(transform).Push(gtx.Ops)
 	defer stack.Pop()
 
-	// Record child operations with virtual constraints
-	childOps := new(op.Ops)
-	macro := op.Record(childOps)
-	childGtx := layout.Context{
-		Ops:         childOps,
-		Constraints: layout.Exact(a.Size),
-		Metric:      gtx.Metric,
-		Locale:      gtx.Locale,
-		Source:      gtx.Source,
-		Now:         gtx.Now,
-	}
+	// Call widget with virtual constraints
+	childGtx := gtx
+	childGtx.Constraints = layout.Exact(a.Size)
 	widget(childGtx)
-	callOp := macro.Stop()
-	callOp.Add(gtx.Ops)
 
 	return layout.Dimensions{Size: gtx.Constraints.Max}
 }

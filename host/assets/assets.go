@@ -5,6 +5,8 @@ import (
 	_ "embed"
 )
 
+//go:generate go run gioui.org/cmd/svg2gio -pkg assets -o testcard.go images/testcard.svg
+
 //go:embed fonts/FiraCodeNerdFontMono-Regular.ttf
 var FiraCodeTTF []byte
 

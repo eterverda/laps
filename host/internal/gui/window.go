@@ -28,14 +28,20 @@ func mainWindow() error {
 		app.Size(unit.Dp(1280), unit.Dp(720)),
 	)
 
-	m := state.NewMachine()
+	m := state.NewMachine(w.Invalidate)
 
 	var ops op.Ops
+	entered := false
 	for {
 		switch e := w.Event().(type) {
 		case app.DestroyEvent:
+			m.State.Exit()
 			return e.Err
 		case app.FrameEvent:
+			if !entered {
+				entered = true
+				m.State.Enter()
+			}
 			gtx := app.NewContext(&ops, e)
 			m.State.Layout(gtx)
 			e.Frame(gtx.Ops)

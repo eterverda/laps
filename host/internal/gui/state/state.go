@@ -17,14 +17,16 @@ const (
 )
 
 type State interface {
+	Enter()
 	Layout(gtx layout.Context) layout.Dimensions
+	Exit()
 }
 
 type Machine struct {
 	State State
 }
 
-func NewMachine() *Machine {
+func NewMachine(invalidate func()) *Machine {
 	faceRegular, err := opentype.Parse(assets.FiraCodeTTF)
 	if err != nil {
 		panic(err)
@@ -51,6 +53,6 @@ func NewMachine() *Machine {
 		TextSize: textSize,
 	}
 
-	s := NewOnlyState(th)
+	s := NewOnlyState(th, invalidate)
 	return &Machine{State: s}
 }

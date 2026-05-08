@@ -8,9 +8,11 @@ Always use `make` for building:
 make build
 ```
 
-This produces the binary at `bin/laps`.
+This produces the binary at `build/bin/laps`.
 
 ## Other make targets
 
-- `make clean` — remove build artifacts
-- `make all` — alias for `make build`
+- `make install-symlink` — create `build/bin/laps-cli` symlink
+- `make app-bundle` — build macOS `.app` bundle at `build/Laps.app`
+- `make clean` — remove all build artifacts
+- `make all` — alias for `make build install-symlink`

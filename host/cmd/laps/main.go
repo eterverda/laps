@@ -4,14 +4,25 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 
 	"github.com/fpvladder/laps/host/internal/config"
+	"github.com/fpvladder/laps/host/internal/gui"
 	"github.com/fpvladder/laps/host/internal/locale"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
 
 func main() {
+	if shouldRunGui() {
+		gui.Run()
+		return
+	}
+
+	// CLI mode
 	parsedConfig := parseConfig()
 	cfg := config.Default().Override(parsedConfig)
 
@@ -66,13 +77,11 @@ func main() {
 	})
 
 	if err := root.Execute(); err != nil {
-		slog.Error("execution error", "err", err)
+		slog.Error("cli error", "err", err)
 		os.Exit(1)
 	}
 }
 
-// parseConfig extracts --locale and --config-file from raw args using cobra,
-// loads config and returns it. Unknown flags are ignored.
 func parseConfig() *config.Config {
 	cmd := &cobra.Command{
 		FParseErrWhitelist: cobra.FParseErrWhitelist{UnknownFlags: true},
@@ -91,4 +100,21 @@ func parseConfig() *config.Config {
 		}
 	}
 	return cfg
+}
+
+func shouldRunGui() bool {
+	if runtime.GOOS == "darwin" {
+		if exe, err := os.Executable(); err == nil {
+			if strings.Contains(exe, ".app/Contents/MacOS/") {
+				return true
+			}
+		}
+	}
+	if filepath.Base(os.Args[0]) == "laps-cli" {
+		return false
+	}
+	if slices.Contains(os.Args[1:], "--gui") {
+		return true
+	}
+	return len(os.Args) == 1
 }

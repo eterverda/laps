@@ -1,6 +1,17 @@
 [package]
-name = "laps-host"
+name = "laps"
 version = "0.1.0"
 edition = "2024"
+description = "Desktop application for the Laps timing system"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
+eframe = "0.29"
+egui = "0.29"
+
+[package.metadata.bundle]
+name = "Laps"
+identifier = "ru.fpvladder.laps"
+icon = ["packaging/osx/icon.icns"]
+osx_minimum_system_version = "10.15"
+osx_info_plist_exts = ["packaging/osx/Info.plist.ext"]

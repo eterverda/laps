@@ -1,4 +1,4 @@
-package state
+package gui
 
 import (
 	"image"
@@ -8,6 +8,7 @@ import (
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/paint"
+	"gioui.org/widget"
 	"gioui.org/widget/material"
 
 	"github.com/fpvladder/laps/host/driver/webcam"
@@ -21,33 +22,16 @@ const (
 )
 
 type OnlyState struct {
-	th           *material.Theme
-	webcam       *webcam.Webcam
-	invalidate   func()
-	webcamClient int
+	th       *material.Theme
+	webcam   *webcam.Webcam
+	jumboBtn widget.Clickable
 }
 
-func NewOnlyState(th *material.Theme, invalidate func()) *OnlyState {
+func NewOnlyState(th *material.Theme, webcam *webcam.Webcam) *OnlyState {
 	return &OnlyState{
-		th:         th,
-		webcam:     webcam.New(webcamWidth, webcamHeight, webcamDeviceLabel),
-		invalidate: invalidate,
+		th:     th,
+		webcam: webcam,
 	}
-}
-
-func (s *OnlyState) Enter() {
-	if s.webcamClient != 0 {
-		return
-	}
-	s.webcamClient = s.webcam.Retain(s.invalidate)
-}
-
-func (s *OnlyState) Exit() {
-	if s.webcamClient == 0 {
-		return
-	}
-	s.webcam.Release(s.webcamClient)
-	s.webcamClient = 0
 }
 
 func (s *OnlyState) Layout(gtx layout.Context) layout.Dimensions {
@@ -55,12 +39,20 @@ func (s *OnlyState) Layout(gtx layout.Context) layout.Dimensions {
 	paint.ColorOp{Color: color.NRGBA{A: 255}}.Add(gtx.Ops)
 	paint.PaintOp{}.Add(gtx.Ops)
 
-	frame, err := s.webcam.Frame()
+	frame, frameTime, err := s.webcam.Frame()
+	if frameTime >= 0 {
+		gtx.Execute(op.InvalidateCmd{At: gtx.Now.Add(frameTime)})
+	}
 
 	grid := views.NewGrid(s.th)
 	grid.AnchorColor = color.NRGBA{R: 255, G: 255, B: 255, A: 31}
 	grid.AnchorRows = 5
 	grid.AnchorCols = 10
+
+	// Check jumbotron button click
+	if s.jumboBtn.Clicked(gtx) {
+		go jumbotronWindow(s.th, s.webcam)
+	}
 
 	// 4 viewfinders in a row: gap 4, vf 34x20, gap 4, vf 34x20, gap 4, vf 34x20, gap 4, vf 34x20, gap 4
 	// Total: 4 + 34 + 4 + 34 + 4 + 34 + 4 + 34 + 4 = 160 cells wide
@@ -105,6 +97,15 @@ func (s *OnlyState) Layout(gtx layout.Context) layout.Dimensions {
 			}),
 			views.Cell(image.Rect(118, 3, 150, 12), func(gtx layout.Context) layout.Dimensions {
 				return views.Viewfinder{MinX: 0.5, MinY: 0.5, MaxX: 1.0, MaxY: 1.0}.Layout(gtx, frame, err)
+			}),
+			views.Cell(image.Rect(1, 43, 11, 44), func(gtx layout.Context) layout.Dimensions {
+				btn := material.Button(s.th, &s.jumboBtn, "Jumbotron")
+				btn.Background = color.NRGBA{R: 0, G: 128, B: 255, A: 255}
+				btn.Color = color.NRGBA{R: 255, G: 255, B: 255, A: 255}
+				btn.CornerRadius = 0
+				btn.Inset = layout.Inset{}
+				btn.TextSize = s.th.TextSize
+				return btn.Layout(gtx)
 			}),
 		)
 	})

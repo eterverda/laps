@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pion/mediadevices"
 	_ "github.com/pion/mediadevices/pkg/driver/camera"
@@ -17,6 +18,8 @@ import (
 
 var ErrNoFrame = errors.New("no frame available")
 
+const idleTimeout = 5 * time.Second
+
 // Webcam captures video frames from a camera device.
 type Webcam struct {
 	mu          sync.RWMutex
@@ -25,9 +28,9 @@ type Webcam struct {
 	width       int
 	height      int
 	deviceLabel string
-	clients     map[int]func()
-	nextID      int
-	refCount    atomic.Int32
+	lastRead    atomic.Int64 // unix nanoseconds
+	running     atomic.Bool
+	frameTime   time.Duration // frame interval based on fps
 }
 
 // New creates a new webcam that captures at the given resolution.
@@ -37,49 +40,49 @@ func New(width, height int, deviceLabel string) *Webcam {
 		width:       width,
 		height:      height,
 		deviceLabel: deviceLabel,
-		clients:     make(map[int]func()),
 	}
 }
 
-// Retain registers a client and starts capture if this is the first retain.
-// Returns a client ID that must be passed to Release.
-func (w *Webcam) Retain(c func()) int {
-	w.mu.Lock()
-	id := w.nextID
-	w.nextID++
-	w.clients[id] = c
-	w.mu.Unlock()
-	if w.refCount.Add(1) == 1 {
+func (w *Webcam) touch() {
+	w.lastRead.Store(time.Now().UnixNano())
+}
+
+// Frame returns the latest captured frame, the recommended frame interval, and any error.
+// The frame interval is based on the configured frame rate (e.g. 30fps = ~33ms).
+// Returns -1 as interval if no frame is available yet or on error.
+func (w *Webcam) Frame() (*image.RGBA, time.Duration, error) {
+	w.touch()
+	if w.running.CompareAndSwap(false, true) {
 		go w.run()
 	}
-	return id
-}
 
-// Release unregisters a client by ID and stops capture if this was the last release.
-func (w *Webcam) Release(id int) {
-	w.mu.Lock()
-	delete(w.clients, id)
-	w.mu.Unlock()
-	if w.refCount.Add(-1) == 0 {
-		w.mu.Lock()
-		w.clients = make(map[int]func())
-		w.mu.Unlock()
-	}
-}
-
-func (w *Webcam) notify() {
 	w.mu.RLock()
-	clients := make([]func(), 0, len(w.clients))
-	for _, c := range w.clients {
-		clients = append(clients, c)
+	defer w.mu.RUnlock()
+	if w.err != nil {
+		return nil, -1, w.err
 	}
-	w.mu.RUnlock()
-	for _, c := range clients {
-		c()
+	if w.frame == nil {
+		return nil, -1, ErrNoFrame
 	}
+	return w.frame, w.frameTime, nil
 }
 
 func (w *Webcam) run() {
+	for {
+		w.capture()
+
+		// Wait until someone calls Frame() again
+		w.running.Store(false)
+		for {
+			time.Sleep(100 * time.Millisecond)
+			if w.running.Load() {
+				break
+			}
+		}
+	}
+}
+
+func (w *Webcam) capture() {
 	devices := mediadevices.EnumerateDevices()
 	if len(devices) == 0 {
 		w.setError(errors.New("no capture devices found"))
@@ -107,6 +110,7 @@ func (w *Webcam) run() {
 			c.Width = prop.Int(w.width)
 			c.Height = prop.Int(w.height)
 			c.FrameRate = prop.Float(30)
+			w.frameTime = time.Second / 30
 			c.FrameFormat = prop.FrameFormat(frame.FormatRGBA)
 		},
 	})
@@ -128,8 +132,8 @@ func (w *Webcam) run() {
 
 	fmt.Println("[webcam] capture started")
 	for {
-		if w.refCount.Load() == 0 {
-			fmt.Println("[webcam] capture stopped")
+		if time.Since(time.Unix(0, w.lastRead.Load())) > idleTimeout {
+			fmt.Println("[webcam] capture stopped (idle)")
 			return
 		}
 
@@ -144,12 +148,16 @@ func (w *Webcam) run() {
 		draw.Draw(rgba, bounds, img, bounds.Min, draw.Src)
 		release()
 
+		now := time.Now()
 		w.mu.Lock()
+		if w.frame != nil {
+			w.frameTime = now.Sub(time.Unix(0, w.lastRead.Load()))
+		} else {
+			w.frameTime = -1
+		}
 		w.frame = rgba
 		w.err = nil
 		w.mu.Unlock()
-
-		w.notify()
 	}
 }
 
@@ -158,19 +166,4 @@ func (w *Webcam) setError(err error) {
 	w.err = err
 	w.mu.Unlock()
 	fmt.Printf("[webcam] error: %v\n", err)
-	w.notify()
-}
-
-// Frame returns the latest captured frame and any error.
-// Returns ErrNoFrame if no frame has been captured yet.
-func (w *Webcam) Frame() (*image.RGBA, error) {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	if w.err != nil {
-		return nil, w.err
-	}
-	if w.frame == nil {
-		return nil, ErrNoFrame
-	}
-	return w.frame, nil
 }

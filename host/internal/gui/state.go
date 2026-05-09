@@ -1,4 +1,4 @@
-package state
+package gui
 
 import (
 	"gioui.org/font"
@@ -26,7 +26,11 @@ type Machine struct {
 	State State
 }
 
-func NewMachine(invalidate func()) *Machine {
+func (m *Machine) Shutdown() {
+	m.State.Exit()
+}
+
+func NewTheme() *material.Theme {
 	faceRegular, err := opentype.Parse(assets.FiraCodeTTF)
 	if err != nil {
 		panic(err)
@@ -40,7 +44,7 @@ func NewMachine(invalidate func()) *Machine {
 	boldFont := faceBold.Font()
 	boldFont.Weight = font.Bold
 
-	th := &material.Theme{
+	return &material.Theme{
 		Shaper: text.NewShaper(
 			text.WithCollection(
 				[]font.FontFace{
@@ -52,7 +56,4 @@ func NewMachine(invalidate func()) *Machine {
 		Face:     regularFont.Typeface,
 		TextSize: textSize,
 	}
-
-	s := NewOnlyState(th, invalidate)
-	return &Machine{State: s}
 }

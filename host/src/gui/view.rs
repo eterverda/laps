@@ -176,11 +176,12 @@ impl GridCalc {
         ui: &mut egui::Ui,
         content: impl FnOnce(&mut egui::Ui) -> R,
     ) -> egui::InnerResponse<R> {
-        let rect = egui::Rect::from_min_max(self.marker, self.pos);
-
+        let rect = egui::Rect::from_two_pos(self.marker, self.pos);
         let layout = egui::Layout::centered_and_justified(egui::Direction::LeftToRight);
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+
         let inner = content(&mut child_ui);
+
         let response = child_ui.response();
         egui::InnerResponse::new(inner, response)
     }
@@ -249,7 +250,7 @@ impl Grid {
 pub struct Letterbox {
     min_virtual_size: egui::Vec2,
     max_virtual_size: egui::Vec2,
-    outline: egui::Stroke,
+    outline: bool,
 }
 
 impl Letterbox {
@@ -259,7 +260,7 @@ impl Letterbox {
         Self {
             min_virtual_size,
             max_virtual_size: min_virtual_size,
-            outline: egui::Stroke::NONE,
+            outline: false,
         }
     }
 
@@ -270,8 +271,8 @@ impl Letterbox {
     }
 
     #[inline]
-    pub fn outline(mut self, stroke: impl Into<egui::Stroke>) -> Self {
-        self.outline = stroke.into();
+    pub fn outline(mut self, on: bool) -> Self {
+        self.outline = on;
         self
     }
 
@@ -324,8 +325,67 @@ impl Letterbox {
         let screen_offset = min_rect + offset;
         let rect = egui::Rect::from_min_size(screen_offset, virtual_size * scale);
 
-        if !self.outline.is_empty() {
-            ui.painter().rect_stroke(rect, 0.0, self.outline);
+        if self.outline {
+            let window = ui.min_rect();
+            let stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x07));
+            let step = 12.0;
+            let count = ((window.width() + window.height()) / step).ceil() as i32;
+            for i in 0..count {
+                let off = i as f32 * step;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(window.min.x, window.min.y + off),
+                        egui::pos2(window.min.x + off, window.min.y),
+                    ],
+                    stroke,
+                );
+            }
+
+            // Erase hatch inside letterbox
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+
+            // Dim surrounding area
+            let dim = egui::Color32::from_white_alpha(0x01);
+
+            if rect.height() < window.height() {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(window.min.x, window.min.y),
+                        egui::pos2(window.max.x, rect.min.y),
+                    ),
+                    0.0,
+                    dim,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(window.min.x, rect.max.y),
+                        egui::pos2(window.max.x, window.max.y),
+                    ),
+                    0.0,
+                    dim,
+                );
+            }
+            if rect.width() < window.width() {
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(window.min.x, rect.min.y),
+                        egui::pos2(rect.min.x, rect.max.y),
+                    ),
+                    0.0,
+                    dim,
+                );
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.max.x, rect.min.y),
+                        egui::pos2(window.max.x, rect.max.y),
+                    ),
+                    0.0,
+                    dim,
+                );
+            }
+
+            ui.painter()
+                .rect_stroke(rect, 0.0, (1.0, egui::Color32::from_white_alpha(0x0f)));
         }
 
         let area_id = ui.id().with("letterbox_area");

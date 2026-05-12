@@ -8,8 +8,6 @@ use std::time::Duration;
 
 type ImageSlot = Arc<Mutex<Option<egui::ColorImage>>>;
 
-type ImageCallback = Box<dyn Fn() + Send + Sync>;
-
 pub struct Webcam {
     slot: ImageSlot,
     texture: Option<egui::TextureHandle>,
@@ -18,7 +16,7 @@ pub struct Webcam {
 }
 
 impl Webcam {
-    pub fn start(on_frame: ImageCallback) -> Option<Self> {
+    pub fn start(on_frame: impl Fn() + Send + Sync + 'static) -> Option<Self> {
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
             Ok(c) => c,
             Err(e) => {

@@ -67,7 +67,7 @@ impl GridCalc {
 
     #[inline]
     #[allow(dead_code)]
-    pub const fn absolute_px(&mut self, x: f32, y: f32) -> &mut GridCalc {
+    pub const fn absolute_xy(&mut self, x: f32, y: f32) -> &mut GridCalc {
         self.pos.x = x;
         self.pos.y = y;
         self
@@ -97,7 +97,7 @@ impl GridCalc {
 
     #[inline]
     #[allow(dead_code)]
-    pub const fn relative_px(&mut self, dx: f32, dy: f32) -> &mut GridCalc {
+    pub const fn relative_xy(&mut self, dx: f32, dy: f32) -> &mut GridCalc {
         self.pos.x += dx;
         self.pos.y += dy;
         self
@@ -139,7 +139,7 @@ impl GridCalc {
 
     #[inline]
     #[allow(dead_code)]
-    pub const fn snap_px(&mut self, rounding: Rounding) -> &mut GridCalc {
+    pub const fn snap_xy(&mut self, rounding: Rounding) -> &mut GridCalc {
         self.snap_x(rounding).snap_y(rounding)
     }
 
@@ -156,18 +156,23 @@ impl GridCalc {
     }
 
     #[inline]
-    pub const fn size_px(&self, cols: usize, rows: usize) -> egui::Vec2 {
-        egui::vec2(self.width_px(cols), self.height_px(rows))
+    pub const fn size_of(&self, cols: usize, rows: usize) -> egui::Vec2 {
+        egui::vec2(self.width_of(cols), self.height_of(rows))
     }
 
     #[inline]
-    pub const fn width_px(&self, cols: usize) -> f32 {
+    pub const fn width_of(&self, cols: usize) -> f32 {
         cols as f32 * self.cell_size.x
     }
 
     #[inline]
-    pub const fn height_px(&self, rows: usize) -> f32 {
+    pub const fn height_of(&self, rows: usize) -> f32 {
         rows as f32 * self.cell_size.y
+    }
+
+    #[inline]
+    pub const fn rect(&self) -> egui::Rect {
+        egui::Rect::from_min_max(self.marker, self.pos)
     }
 
     #[inline]

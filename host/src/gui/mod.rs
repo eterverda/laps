@@ -3,6 +3,14 @@ mod view;
 
 const FONT_REGULAR: egui::FontId = egui::FontId::new(13.0, egui::FontFamily::Monospace);
 
+const FULL_UV: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+const QUADRANT_UVS: [egui::Rect; 4] = [
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.5, 0.5)),
+    egui::Rect::from_min_max(egui::pos2(0.5, 0.0), egui::pos2(1.0, 0.5)),
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.5), egui::pos2(0.5, 1.0)),
+    egui::Rect::from_min_max(egui::pos2(0.5, 0.5), egui::pos2(1.0, 1.0)),
+];
+
 struct App {
     font_size: Option<egui::Vec2>,
     webcam: Option<crate::driver::webcam::Webcam>,
@@ -37,15 +45,15 @@ impl eframe::App for App {
 
                 let calc = view::GridCalc::new(font_size.x, font_size.y);
 
-                view::Letterbox::new(calc.size_px(160, 45))
-                    .max_virtual_height(calc.height_px(50))
+                view::Letterbox::new(calc.size_of(160, 45))
+                    .max_virtual_height(calc.height_of(50))
                     .outline(true)
                     .show(ui, |ui| {
                         if guidelines::ENABLED {
-                            guidelines::marker_grid(ui, calc.size_px(10, 5));
+                            guidelines::marker_grid(ui, calc.size_of(10, 5));
 
-                            let xs = [calc.width_px(40), calc.width_px(80), calc.width_px(120)];
-                            let ys = [calc.height_px(2)];
+                            let xs = [calc.width_of(40), calc.width_of(80), calc.width_of(120)];
+                            let ys = [calc.height_of(2)];
 
                             for x in xs {
                                 guidelines::dashed_line(ui, egui::Direction::TopDown, x);
@@ -55,39 +63,23 @@ impl eframe::App for App {
                             }
                         }
 
-                        let uvs = [
-                            egui::Rect::from_x_y_ranges(0.0..=0.5, 0.0..=0.5),
-                            egui::Rect::from_x_y_ranges(0.0..=0.5, 0.5..=1.0),
-                            egui::Rect::from_x_y_ranges(0.5..=1.0, 0.0..=0.5),
-                            egui::Rect::from_x_y_ranges(0.5..=1.0, 0.5..=1.0),
-                        ];
-
-                        for (i, uv) in uvs.into_iter().enumerate() {
-                            calc.clone()
-                                .absolute(4, 3)
-                                .relative(40 * i as isize, 0)
-                                .mark()
-                                .relative(32, 9)
-                                .show(ui, |ui| {
-                                    if let Some(tex) = webcam_texture {
-                                        ui.painter().image(
-                                            tex.id(),
-                                            ui.max_rect(),
-                                            uv,
-                                            egui::Color32::WHITE,
-                                        );
-                                    } else {
-                                        ui.painter().image(
-                                            self.testcard.id(),
-                                            ui.max_rect(),
-                                            egui::Rect::from_min_max(
-                                                egui::pos2(0.0, 0.0),
-                                                egui::pos2(1.0, 1.0),
-                                            ),
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
-                                });
+                        for i in 0..QUADRANT_UVS.len() {
+                            let (t, uv) = if let Some(tex) = webcam_texture {
+                                (tex.id(), QUADRANT_UVS[i])
+                            } else {
+                                (self.testcard.id(), FULL_UV)
+                            };
+                            ui.painter().image(
+                                t,
+                                calc.clone()
+                                    .absolute(4, 3)
+                                    .relative(40 * i as isize, 0)
+                                    .mark()
+                                    .relative(32, 9)
+                                    .rect(),
+                                uv,
+                                egui::Color32::WHITE,
+                            );
                         }
 
                         calc.clone()

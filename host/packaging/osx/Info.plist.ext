@@ -1,2 +1,2 @@
-	<key>NSCameraUsageDescription</key>
-	<string>Laps needs camera access for video capture display</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Laps needs camera access for video capture display</string>

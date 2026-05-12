@@ -5,12 +5,20 @@ const FONT_REGULAR: egui::FontId = egui::FontId::new(13.0, egui::FontFamily::Mon
 
 struct App {
     font_size: Option<egui::Vec2>,
+    webcam: Option<crate::driver::webcam::Webcam>,
+    testcard: egui::TextureHandle,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
+        let ctx_clone = ctx.clone();
+        let webcam = crate::driver::webcam::Webcam::start(Box::new(move || {
+            ctx_clone.request_repaint();
+        }));
         Self {
             font_size: Option::default(),
+            webcam,
+            testcard: ctx.load_texture("testcard", load_testcard(), egui::TextureOptions::NEAREST),
         }
     }
 }
@@ -22,6 +30,11 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
+                let webcam_texture = match self.webcam.as_mut() {
+                    Some(w) => w.update(ctx),
+                    None => None,
+                };
+
                 let calc = view::GridCalc::new(font_size.x, font_size.y);
 
                 view::Letterbox::new(calc.size_px(160, 45))
@@ -40,6 +53,41 @@ impl eframe::App for App {
                             for y in ys {
                                 guidelines::dashed_line(ui, egui::Direction::LeftToRight, y);
                             }
+                        }
+
+                        let uvs = [
+                            egui::Rect::from_x_y_ranges(0.0..=0.5, 0.0..=0.5),
+                            egui::Rect::from_x_y_ranges(0.0..=0.5, 0.5..=1.0),
+                            egui::Rect::from_x_y_ranges(0.5..=1.0, 0.0..=0.5),
+                            egui::Rect::from_x_y_ranges(0.5..=1.0, 0.5..=1.0),
+                        ];
+
+                        for (i, uv) in uvs.into_iter().enumerate() {
+                            calc.clone()
+                                .absolute(4, 3)
+                                .relative(40 * i as isize, 0)
+                                .mark()
+                                .relative(32, 9)
+                                .show(ui, |ui| {
+                                    if let Some(tex) = webcam_texture {
+                                        ui.painter().image(
+                                            tex.id(),
+                                            ui.max_rect(),
+                                            uv,
+                                            egui::Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().image(
+                                            self.testcard.id(),
+                                            ui.max_rect(),
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 0.0),
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                });
                         }
 
                         calc.clone()
@@ -64,6 +112,36 @@ impl eframe::App for App {
                             });
                     });
             });
+    }
+}
+
+fn load_testcard() -> egui::ColorImage {
+    let tree = resvg::usvg::Tree::from_data(
+        crate::assets::TESTCARD_SVG,
+        &resvg::usvg::Options::default(),
+    )
+    .expect("failed to parse testcard.svg");
+
+    let size = tree.size();
+    let w = size.width() as u32;
+    let h = size.height() as u32;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h).expect("failed to create pixmap");
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::default(),
+        &mut pixmap.as_mut(),
+    );
+
+    let pixels: Vec<egui::Color32> = pixmap
+        .data()
+        .chunks_exact(4)
+        .map(|p| egui::Color32::from_rgba_premultiplied(p[0], p[1], p[2], p[3]))
+        .collect();
+
+    egui::ColorImage {
+        size: [w as usize, h as usize],
+        pixels,
     }
 }
 
@@ -111,7 +189,7 @@ pub fn run() {
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            Ok(Box::new(App::new(&cc.egui_ctx)))
         }),
     )
     .unwrap();

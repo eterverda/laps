@@ -5,27 +5,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use yuv::{YuvPackedImage, YuvRange, YuvStandardMatrix};
 
-pub struct Frame {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-}
+type ImageSlot = Arc<Mutex<Option<egui::ColorImage>>>;
 
-type FrameSlot = Arc<Mutex<Option<Frame>>>;
-
-type FrameCallback = Box<dyn Fn() + Send + Sync>;
+type ImageCallback = Box<dyn Fn() + Send + Sync>;
 
 pub struct Webcam {
-    slot: FrameSlot,
+    slot: ImageSlot,
     texture: Option<egui::TextureHandle>,
     running: Arc<AtomicBool>,
     _thread: thread::JoinHandle<()>,
 }
 
 impl Webcam {
-    pub fn start(on_frame: FrameCallback) -> Option<Self> {
+    pub fn start(on_frame: ImageCallback) -> Option<Self> {
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
             Ok(c) => c,
             Err(e) => {
@@ -39,7 +32,7 @@ impl Webcam {
         let name = info.human_name();
         log::info!("starting capture from [{}] {}", index, name);
 
-        let slot: FrameSlot = Arc::new(Mutex::new(None));
+        let slot: ImageSlot = Arc::default();
         let slot_clone = Arc::clone(&slot);
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
@@ -65,8 +58,6 @@ impl Webcam {
             let height = fmt.resolution().height();
             log::info!("capture stream opened, format: {:?}", fmt);
 
-            let mut rgba_buf = vec![0u8; (width * height * 4) as usize];
-
             loop {
                 if !running_clone.load(Ordering::Relaxed) {
                     log::info!("capture thread stopping");
@@ -82,7 +73,12 @@ impl Webcam {
                     }
                 };
 
-                let packed = YuvPackedImage {
+                let mut image = egui::ColorImage::new(
+                    [width as usize, height as usize],
+                    egui::Color32::TRANSPARENT,
+                );
+
+                let packed = yuv::YuvPackedImage {
                     yuy: &raw,
                     yuy_stride: width * 2,
                     width,
@@ -90,20 +86,14 @@ impl Webcam {
                 };
                 yuv::yuyv422_to_rgba(
                     &packed,
-                    &mut rgba_buf,
+                    bytemuck::cast_slice_mut(&mut image.pixels),
                     width * 4,
-                    YuvRange::Full,
-                    YuvStandardMatrix::Bt601,
+                    yuv::YuvRange::Full,
+                    yuv::YuvStandardMatrix::Bt601,
                 )
                 .unwrap();
 
-                let frame = Frame {
-                    width,
-                    height,
-                    rgba: rgba_buf.clone(),
-                };
-
-                *slot_clone.lock().unwrap() = Some(frame);
+                *slot_clone.lock().unwrap() = Some(image);
 
                 on_frame();
             }
@@ -122,26 +112,19 @@ impl Webcam {
     }
 
     pub fn update(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
-        let frame = {
+        let image = {
             let mut guard = self.slot.lock().unwrap();
             guard.take()
         };
 
-        if let Some(frame) = frame {
-            let size = [frame.width as usize, frame.height as usize];
-            let pixels: Vec<egui::Color32> = bytemuck::cast_vec(frame.rgba);
-            let color_image = egui::ColorImage { size, pixels };
-
+        if let Some(image) = image {
             match &mut self.texture {
-                Some(tex) => {
-                    tex.set(color_image, egui::TextureOptions::NEAREST);
+                Some(texture) => {
+                    texture.set(image, egui::TextureOptions::NEAREST);
                 }
                 None => {
-                    self.texture = Some(ctx.load_texture(
-                        "camera",
-                        color_image,
-                        egui::TextureOptions::NEAREST,
-                    ));
+                    self.texture =
+                        Some(ctx.load_texture("camera", image, egui::TextureOptions::NEAREST));
                 }
             }
         }

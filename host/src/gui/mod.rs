@@ -2,13 +2,12 @@ use crate::gui::live::Live;
 
 mod guidelines;
 mod live;
+mod menu;
+mod style;
 mod view;
 
-const FONT_REGULAR: egui::FontId = egui::FontId::new(13.0, egui::FontFamily::Monospace);
-const FONT_REGULAR_X2: egui::FontId = egui::FontId::new(26.0, egui::FontFamily::Monospace);
-
 enum State {
-    None,
+    Menu(menu::Menu),
     Live(live::Live),
 }
 
@@ -16,8 +15,8 @@ enum State {
 pub struct Navigator(Option<State>);
 
 impl Navigator {
-    fn goto(&mut self, state: State) {
-        self.0 = Some(state);
+    fn goto(&mut self, state: impl Into<State>) {
+        self.0 = Some(state.into());
     }
 }
 
@@ -40,22 +39,15 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 let mut navigator = Navigator::default();
 
-                match &mut self.state {
-                    State::None => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(ui.available_height() / 2.0 - 12.0);
-                            if ui.button("Start").clicked() {
-                                navigator.goto(State::Live(live::Live::new(ctx)));
-                            }
-                        });
-                    }
-                    State::Live(live) => live.update(ui, &mut navigator),
+                match self.state {
+                    State::Menu(ref mut menu) => menu.update(ui, &mut navigator),
+                    State::Live(ref mut live) => live.update(ui, &mut navigator),
                 }
 
                 match navigator.0 {
                     Some(state) => self.state = state,
                     None => {}
-                };
+                }
             });
     }
 }
@@ -75,15 +67,6 @@ fn setup_fonts(ctx: &egui::Context) {
         vec!["fira_regular".to_owned(), "fira_bold".to_owned()],
     );
     ctx.set_fonts(fonts);
-}
-
-fn measure_font(ctx: &egui::Context) -> egui::Vec2 {
-    let layout_job = egui::text::LayoutJob::single_section(
-        "M".to_owned(),
-        egui::TextFormat::simple(FONT_REGULAR, egui::Color32::WHITE),
-    );
-    let galley = ctx.fonts(|f| f.layout_job(layout_job));
-    galley.rect.size()
 }
 
 pub fn run() {
@@ -108,4 +91,13 @@ pub fn run() {
         }),
     )
     .unwrap();
+}
+
+fn measure_text(ctx: &egui::Context, font: egui::FontId, text: impl Into<String>) -> egui::Vec2 {
+    let layout_job = egui::text::LayoutJob::single_section(
+        text.into(),
+        egui::TextFormat::simple(font, egui::Color32::WHITE),
+    );
+    let galley = ctx.fonts(|f| f.layout_job(layout_job));
+    galley.rect.size()
 }

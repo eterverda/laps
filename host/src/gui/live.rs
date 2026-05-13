@@ -1,5 +1,3 @@
-use crate::gui::measure_font;
-
 use super::*;
 
 const FULL_UV: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -11,9 +9,15 @@ const QUADRANT_UVS: [egui::Rect; 4] = [
 ];
 
 pub struct Live {
-    font_size: Option<egui::Vec2>,
+    symbol_size: Option<egui::Vec2>,
     webcam: Option<crate::driver::webcam::Webcam>,
     testcard: egui::TextureHandle,
+}
+
+impl Into<State> for Live {
+    fn into(self) -> State {
+        State::Live(self)
+    }
 }
 
 impl Live {
@@ -23,7 +27,7 @@ impl Live {
             move || ctx.request_repaint()
         });
         Self {
-            font_size: Default::default(),
+            symbol_size: Default::default(),
             webcam,
             testcard: ctx.load_texture("testcard", load_testcard(), egui::TextureOptions::NEAREST),
         }
@@ -31,8 +35,11 @@ impl Live {
 
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
         let ctx = ui.ctx();
-        let font_size = self.font_size.get_or_insert_with(|| measure_font(ctx));
-        let calc = view::GridCalc::new(font_size.x, font_size.y);
+        let symbol_size = self
+            .symbol_size
+            .get_or_insert_with(|| measure_text(ctx, style::FONT_REGULAR, "M"));
+
+        let calc = view::GridCalc::new(symbol_size.x, symbol_size.y);
         let webcam_texture = match self.webcam.as_mut() {
             Some(w) => w.update(ui.ctx()),
             None => None,
@@ -88,7 +95,7 @@ impl Live {
                                     egui::RichText::new(
                                         "The quick brown fox jumps over the lazy dog да выпей чаю!",
                                     )
-                                    .font(FONT_REGULAR)
+                                    .font(style::FONT_REGULAR)
                                     .color(egui::Color32::WHITE),
                                 )
                                 .selectable(false)
@@ -106,7 +113,7 @@ impl Live {
                     .show(ui, |ui| {
                         let button = egui::Button::new(
                             egui::RichText::new(" ⎋ ")
-                                .font(FONT_REGULAR_X2)
+                                .font(style::FONT_REGULAR_X2)
                                 .color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(0, 0, 128))
@@ -114,7 +121,7 @@ impl Live {
                         .frame(false);
 
                         if ui.add(button).clicked() {
-                            navigator.goto(State::None);
+                            navigator.goto(menu::Menu);
                         }
                     })
             });

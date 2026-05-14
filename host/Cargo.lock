@@ -2130,6 +2130,7 @@ dependencies = [
  "nokhwa",
  "resvg",
  "simplelog",
+ "time",
  "yuv",
 ]
 

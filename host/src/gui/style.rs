@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const FONT_SIZE_REGULAR: f32 = 13.0;
 pub const FONT_SIZE_REGULAR_X2: f32 = FONT_SIZE_REGULAR * 2f32;
 

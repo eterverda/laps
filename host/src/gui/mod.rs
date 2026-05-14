@@ -25,9 +25,9 @@ struct App {
 }
 
 impl App {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new() -> Self {
         Self {
-            state: State::Live(Live::new(ctx)),
+            state: State::Live(Live::new()),
         }
     }
 }
@@ -87,7 +87,7 @@ pub fn run() {
         options,
         Box::new(|cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new(&cc.egui_ctx)))
+            Ok(Box::new(App::new()))
         }),
     )
     .unwrap();

@@ -13,7 +13,7 @@ impl Menu {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() / 2.0 - 12.0);
             if ui.button("Start").clicked() {
-                navigator.goto(live::Live::new(ui.ctx()));
+                navigator.goto(live::Live::new());
             }
         });
     }

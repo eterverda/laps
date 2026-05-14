@@ -17,9 +17,16 @@ enum Commands {
 
 fn setup_logging() {
     use simplelog::*;
+    use time::macros::format_description;
     TermLogger::init(
         LevelFilter::Debug,
-        ConfigBuilder::new().set_time_format_rfc3339().build(),
+        ConfigBuilder::new()
+            .set_time_format_custom(format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"
+            ))
+            .set_time_offset_to_local()
+            .unwrap()
+            .build(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
     )

@@ -8,10 +8,23 @@ const QUADRANT_UVS: [egui::Rect; 4] = [
     egui::Rect::from_min_max(egui::pos2(0.5, 0.5), egui::pos2(1.0, 1.0)),
 ];
 
-pub struct Live {
-    symbol_size: Option<egui::Vec2>,
-    webcam: Option<crate::driver::webcam::Webcam>,
+struct Res {
+    symbol_size: egui::Vec2,
     testcard: egui::TextureHandle,
+}
+
+impl Res {
+    fn new(ctx: &egui::Context) -> Self {
+        Self {
+            symbol_size: measure_text(ctx, style::FONT_REGULAR, "M"),
+            testcard: ctx.load_texture("testcard", load_testcard(), egui::TextureOptions::NEAREST),
+        }
+    }
+}
+
+pub struct Live {
+    res: Option<Res>,
+    webcam: Option<crate::driver::webcam::Webcam>,
 }
 
 impl Into<State> for Live {
@@ -21,29 +34,30 @@ impl Into<State> for Live {
 }
 
 impl Live {
-    pub fn new(ctx: &egui::Context) -> Self {
-        let webcam = crate::driver::webcam::Webcam::start({
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
-        });
+    pub fn new() -> Self {
         Self {
-            symbol_size: Default::default(),
-            webcam,
-            testcard: ctx.load_texture("testcard", load_testcard(), egui::TextureOptions::NEAREST),
+            res: None,
+            webcam: None,
         }
     }
 
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
-        let ctx = ui.ctx();
-        let symbol_size = self
-            .symbol_size
-            .get_or_insert_with(|| measure_text(ctx, style::FONT_REGULAR, "M"));
+        enum Action {
+            ToggleCamera,
+            GotoMenu,
+            None,
+        }
+        let mut action = Action::None;
 
-        let calc = view::GridCalc::new(symbol_size.x, symbol_size.y);
-        let webcam_texture = match self.webcam.as_mut() {
-            Some(w) => w.update(ui.ctx()),
-            None => None,
-        };
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::W)) {
+            action = Action::GotoMenu;
+        }
+
+        let ctx = ui.ctx();
+        let res = self.res.get_or_insert_with(|| Res::new(ctx));
+        let webcam_texture = self.webcam.as_mut().and_then(|it| it.update(ui.ctx()));
+
+        let calc = view::GridCalc::new(res.symbol_size.x, res.symbol_size.y);
 
         view::Letterbox::new(calc.size_of(160, 45))
             .max_virtual_height(calc.height_of(50))
@@ -64,10 +78,10 @@ impl Live {
                 }
 
                 for i in 0..QUADRANT_UVS.len() {
-                    let (t, uv) = if let Some(tex) = webcam_texture {
-                        (tex.id(), QUADRANT_UVS[i])
+                    let (t, uv) = if let Some(webcam) = webcam_texture {
+                        (webcam.id(), QUADRANT_UVS[i])
                     } else {
-                        (self.testcard.id(), FULL_UV)
+                        (res.testcard.id(), FULL_UV)
                     };
                     ui.painter().image(
                         t,
@@ -108,23 +122,62 @@ impl Live {
                     .absolute_pos2(ui.available_size().to_pos2())
                     .snap(view::Rounding::Floor)
                     .mark()
-                    .relative(-6, -2)
+                    .relative(-10, -1)
                     .relative(-2, -1)
                     .show(ui, |ui| {
                         let button = egui::Button::new(
-                            egui::RichText::new(" ⎋ ")
-                                .font(style::FONT_REGULAR_X2)
+                            egui::RichText::new(" Выход ⌘W ")
+                                .font(style::FONT_REGULAR)
                                 .color(egui::Color32::WHITE),
                         )
-                        .fill(egui::Color32::from_rgb(0, 0, 128))
+                        .fill(egui::Color32::BLUE)
                         .stroke(egui::Stroke::NONE)
                         .frame(false);
 
                         if ui.add(button).clicked() {
-                            navigator.goto(menu::Menu);
+                            action = Action::GotoMenu;
                         }
-                    })
+                    });
+                calc.clone()
+                    .absolute_pos2(ui.available_size().to_pos2())
+                    .snap(view::Rounding::Floor)
+                    .mark()
+                    .relative(-8, -1)
+                    .relative(-13, -1)
+                    .show(ui, |ui| {
+                        let button = egui::Button::new(
+                            egui::RichText::new(" Камера ")
+                                .font(style::FONT_REGULAR)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::BLUE)
+                        .stroke(egui::Stroke::NONE)
+                        .frame(false);
+
+                        if ui.add(button).clicked() {
+                            action = Action::ToggleCamera;
+                        }
+                    });
             });
+
+        match action {
+            Action::GotoMenu => navigator.goto(menu::Menu),
+            Action::ToggleCamera => self.toggle_webcam(ui.ctx()),
+            Action::None => {}
+        }
+    }
+
+    fn toggle_webcam(&mut self, ctx: &egui::Context) {
+        match self.webcam.take() {
+            Some(_) => {
+                log::info!("webcam stopped");
+            }
+            None => {
+                let ctx = ctx.clone();
+                self.webcam = crate::driver::webcam::Webcam::start(move || ctx.request_repaint());
+                log::info!("webcam started");
+            }
+        }
     }
 }
 

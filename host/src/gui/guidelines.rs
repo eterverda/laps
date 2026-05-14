@@ -1,7 +1,8 @@
 pub const ENABLED: bool = true;
 
 #[inline]
-pub fn marker_grid(ui: &mut egui::Ui, step: egui::Vec2) {
+pub fn marker_grid(ui: &mut egui::Ui, step: impl Into<egui::Vec2>) {
+    let step = step.into();
     let size = ui.available_size();
     let x_count = (size.x / step.x).floor() as i32;
     let y_count = (size.y / step.y).floor() as i32;

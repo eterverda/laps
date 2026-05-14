@@ -1,5 +1,4 @@
-use crate::gui::live::Live;
-
+mod grid;
 mod guidelines;
 mod live;
 mod menu;
@@ -27,7 +26,7 @@ struct App {
 impl App {
     fn new() -> Self {
         Self {
-            state: State::Live(Live::new()),
+            state: State::Live(live::Live::new()),
         }
     }
 }

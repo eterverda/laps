@@ -9,14 +9,20 @@ const QUADRANT_UVS: [egui::Rect; 4] = [
 ];
 
 struct Res {
-    symbol_size: egui::Vec2,
     testcard: egui::TextureHandle,
 }
 
 impl Res {
     fn new(ctx: &egui::Context) -> Self {
+        let symbol_size = measure_text(ctx, style::FONT_REGULAR, "M");
+        assert!(
+            symbol_size == grid::CELL_SIZE,
+            "Font size mismatch: expected {:?}, got {:?}. Update grid::CELL_SIZE or check font assets.",
+            grid::CELL_SIZE,
+            symbol_size,
+        );
+
         Self {
-            symbol_size: measure_text(ctx, style::FONT_REGULAR, "M"),
             testcard: ctx.load_texture("testcard", load_testcard(), egui::TextureOptions::NEAREST),
         }
     }
@@ -57,17 +63,15 @@ impl Live {
         let res = self.res.get_or_insert_with(|| Res::new(ctx));
         let webcam_texture = self.webcam.as_mut().and_then(|it| it.update(ui.ctx()));
 
-        let calc = view::GridCalc::new(res.symbol_size.x, res.symbol_size.y);
-
-        view::Letterbox::new(calc.size_of(160, 45))
-            .max_virtual_height(calc.height_of(50))
+        view::Letterbox::new(grid::cell(160, 45))
+            .max_virtual_height(grid::cell_y(50))
             .outline(true)
             .show(ui, |ui| {
                 if guidelines::ENABLED {
-                    guidelines::marker_grid(ui, calc.size_of(10, 5));
+                    guidelines::marker_grid(ui, grid::cell(10, 5));
 
-                    let xs = [calc.width_of(40), calc.width_of(80), calc.width_of(120)];
-                    let ys = [calc.height_of(2)];
+                    let xs = [grid::cell_x(40), grid::cell_x(80), grid::cell_x(120)];
+                    let ys = [grid::cell_y(2)];
 
                     for x in xs {
                         guidelines::dashed_line(ui, egui::Direction::TopDown, x);
@@ -85,79 +89,52 @@ impl Live {
                     };
                     ui.painter().image(
                         t,
-                        calc.clone()
-                            .absolute(4, 3)
-                            .relative(40 * i as isize, 0)
-                            .mark()
-                            .relative(32, 9)
-                            .rect(),
+                        grid::cell(4, 3)
+                            .translate(40 * i as isize, 0)
+                            .extrude(32, 9),
                         uv,
                         egui::Color32::WHITE,
                     );
                 }
 
-                calc.clone()
-                    .absolute_y(ui.available_height())
-                    .snap(view::Rounding::Floor)
-                    .relative(2, -2)
-                    .mark()
-                    .relative(100, 1)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(
-                                        "The quick brown fox jumps over the lazy dog да выпей чаю!",
-                                    )
-                                    .font(style::FONT_REGULAR)
-                                    .color(egui::Color32::WHITE),
-                                )
-                                .selectable(false)
-                                .wrap_mode(egui::TextWrapMode::Truncate)
-                                .halign(egui::Align::Min),
-                            );
-                        });
-                    });
-                calc.clone()
-                    .absolute_pos2(ui.available_size().to_pos2())
-                    .snap(view::Rounding::Floor)
-                    .mark()
-                    .relative(-10, -1)
-                    .relative(-2, -1)
-                    .show(ui, |ui| {
-                        let button = egui::Button::new(
-                            egui::RichText::new(" Выход ⌘W ")
-                                .font(style::FONT_REGULAR)
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::BLUE)
-                        .stroke(egui::Stroke::NONE)
-                        .frame(false);
+                let bottom_right = grid::cell_at(ui.max_rect().max);
 
-                        if ui.add(button).clicked() {
-                            action = Action::GotoMenu;
-                        }
-                    });
-                calc.clone()
-                    .absolute_pos2(ui.available_size().to_pos2())
-                    .snap(view::Rounding::Floor)
-                    .mark()
-                    .relative(-8, -1)
-                    .relative(-13, -1)
-                    .show(ui, |ui| {
-                        let button = egui::Button::new(
-                            egui::RichText::new(" Камера ")
-                                .font(style::FONT_REGULAR)
-                                .color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::BLUE)
-                        .stroke(egui::Stroke::NONE)
-                        .frame(false);
+                {
+                    let button = egui::Button::new(
+                        egui::RichText::new(" Выход ⌘W ")
+                            .font(style::FONT_REGULAR)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::BLUE)
+                    .stroke(egui::Stroke::NONE)
+                    .frame(false);
 
-                        if ui.add(button).clicked() {
-                            action = Action::ToggleCamera;
-                        }
-                    });
+                    let button_rect = bottom_right.translate(-2, -1).extrude(-10, -1);
+
+                    if ui.put(button_rect, button).clicked() {
+                        action = Action::GotoMenu;
+                    }
+                }
+
+                {
+                    let button = egui::Button::new(
+                        egui::RichText::new(" Камера ")
+                            .font(style::FONT_REGULAR)
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::BLUE)
+                    .stroke(egui::Stroke::NONE)
+                    .frame(false);
+
+                    let button_rect = bottom_right
+                        .translate(-2, -1)
+                        .translate(-11, 0)
+                        .extrude(-10, -1);
+
+                    if ui.put(button_rect, button).clicked() {
+                        action = Action::ToggleCamera;
+                    }
+                }
             });
 
         match action {

@@ -36,8 +36,7 @@ impl Webcam {
         let running_clone = Arc::clone(&running);
 
         let thread = thread::spawn(move || {
-            let format =
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+            let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
             let mut camera = match Camera::new(index, format) {
                 Ok(cam) => cam,
                 Err(e) => {

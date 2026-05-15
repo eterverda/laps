@@ -4,6 +4,7 @@ mod live;
 mod menu;
 mod style;
 mod view;
+mod viewfinder;
 
 enum State {
     Menu(menu::Menu),

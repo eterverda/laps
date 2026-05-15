@@ -67,6 +67,42 @@ pub fn solid_line(ui: &mut egui::Ui, axis: egui::Direction, coordinate: f32) {
 }
 
 #[inline]
+pub fn dashed_rect(ui: &mut egui::Ui, rect: egui::Rect) {
+    let stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x0f));
+    let dash_length = 8.0;
+    let gap_length = 4.0;
+
+    // Top
+    ui.painter().add(egui::epaint::Shape::dashed_line(
+        &[rect.left_top(), rect.right_top()],
+        stroke,
+        dash_length,
+        gap_length,
+    ));
+    // Bottom
+    ui.painter().add(egui::epaint::Shape::dashed_line(
+        &[rect.left_bottom(), rect.right_bottom()],
+        stroke,
+        dash_length,
+        gap_length,
+    ));
+    // Left
+    ui.painter().add(egui::epaint::Shape::dashed_line(
+        &[rect.left_top(), rect.left_bottom()],
+        stroke,
+        dash_length,
+        gap_length,
+    ));
+    // Right
+    ui.painter().add(egui::epaint::Shape::dashed_line(
+        &[rect.right_top(), rect.right_bottom()],
+        stroke,
+        dash_length,
+        gap_length,
+    ));
+}
+
+#[inline]
 pub fn hatch_rect(ui: &mut egui::Ui, rect: egui::Rect) {
     let stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x07));
     let step = 12.0;

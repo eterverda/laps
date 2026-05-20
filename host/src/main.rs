@@ -1,4 +1,5 @@
 mod assets;
+mod config;
 mod driver;
 mod gui;
 
@@ -43,20 +44,16 @@ fn main() {
             log::info!("Hello Laps!");
             println!("Hello Laps!");
         }
-        Some(Commands::ListCameras) => {
-            log::info!("list-cameras command invoked");
-            println!("Cameras:");
-            match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
-                Ok(cameras) => {
-                    for cam in cameras {
-                        println!("  [{}] {}", cam.index(), cam.human_name());
-                    }
-                }
-                Err(e) => {
-                    println!("  Error: {}", e);
+        Some(Commands::ListCameras) => match driver::webcam::list_cameras() {
+            Ok(descriptions) => {
+                for desc in descriptions {
+                    println!("{}", desc);
                 }
             }
-        }
+            Err(e) => {
+                println!("Error: {}", e);
+            }
+        },
         None => {
             gui::run();
         }

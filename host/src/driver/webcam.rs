@@ -1,12 +1,69 @@
+use crate::config::CameraDescription;
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{RequestedFormat, RequestedFormatType};
+use nokhwa::utils::{CameraFormat, CameraInfo, RequestedFormat, RequestedFormatType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 type ImageSlot = Arc<Mutex<Option<egui::ColorImage>>>;
+
+fn sort_and_dedup(formats: &mut Vec<CameraFormat>) {
+    formats.sort_by(|a, b| {
+        a.resolution()
+            .width()
+            .cmp(&b.resolution().width())
+            .then_with(|| a.resolution().height().cmp(&b.resolution().height()))
+            .then_with(|| a.frame_rate().cmp(&b.frame_rate()))
+    });
+    formats.dedup_by(|a, b| {
+        a.resolution().width() == b.resolution().width()
+            && a.resolution().height() == b.resolution().height()
+            && a.frame_rate() == b.frame_rate()
+            && a.format() == b.format()
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
+    use nokhwa_bindings_macos::AVCaptureDevice;
+    let index = cam.index().clone();
+    let device = AVCaptureDevice::new(&index).map_err(|e| e.to_string())?;
+    let mut formats = device.supported_formats().map_err(|e| e.to_string())?;
+    sort_and_dedup(&mut formats);
+    Ok(formats)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
+    let index = cam.index().clone();
+    let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
+    let mut camera = Camera::new(index, format).map_err(|e| e.to_string())?;
+    let mut formats = camera
+        .compatible_camera_formats()
+        .map_err(|e| e.to_string())?;
+    sort_and_dedup(&mut formats);
+    Ok(formats)
+}
+
+pub fn list_cameras() -> Result<Vec<crate::config::CameraDescription>, String> {
+    let mut cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(|e| e.to_string())?;
+    cameras.sort_by(|a, b| a.human_name().cmp(&b.human_name()));
+    let mut descriptions = Vec::new();
+    for cam in cameras {
+        let formats = list_formats_for_cam(&cam).unwrap_or_default();
+        for fmt in formats {
+            descriptions.push(crate::config::CameraDescription::new(
+                &cam.human_name(),
+                fmt.resolution().width(),
+                fmt.resolution().height(),
+                fmt.frame_rate(),
+            ));
+        }
+    }
+    Ok(descriptions)
+}
 
 pub struct Webcam {
     slot: ImageSlot,
@@ -16,7 +73,10 @@ pub struct Webcam {
 }
 
 impl Webcam {
-    pub fn start(on_frame: impl Fn() + Send + Sync + 'static) -> Option<Self> {
+    pub fn start(
+        desc: &CameraDescription,
+        on_frame: impl Fn() + Send + Sync + 'static,
+    ) -> Option<Self> {
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
             Ok(c) => c,
             Err(e) => {
@@ -25,10 +85,31 @@ impl Webcam {
             }
         };
 
-        let info = cameras.first()?;
+        let (info, matched_fmt) = cameras.into_iter().find_map(|cam| {
+            let fmt = match list_formats_for_cam(&cam) {
+                Ok(f) => f,
+                Err(_) => return None,
+            };
+            fmt.into_iter()
+                .find(|f| {
+                    desc.matches(
+                        &cam.human_name(),
+                        f.resolution().width(),
+                        f.resolution().height(),
+                        f.frame_rate(),
+                    )
+                })
+                .map(|f| (cam, f))
+        })?;
+
         let index = info.index().clone();
         let name = info.human_name();
-        log::info!("starting capture from [{}] {}", index, name);
+        log::info!(
+            "starting capture from [{}] {} at {:?}",
+            index,
+            name,
+            matched_fmt
+        );
 
         let slot: ImageSlot = Arc::default();
         let slot_clone = Arc::clone(&slot);
@@ -36,7 +117,14 @@ impl Webcam {
         let running_clone = Arc::clone(&running);
 
         let thread = thread::spawn(move || {
-            let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+            let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
+                nokhwa::utils::CameraFormat::new_from(
+                    matched_fmt.resolution().width(),
+                    matched_fmt.resolution().height(),
+                    matched_fmt.format(),
+                    matched_fmt.frame_rate(),
+                ),
+            ));
             let mut camera = match Camera::new(index, format) {
                 Ok(cam) => cam,
                 Err(e) => {

@@ -33,10 +33,10 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+            .show(ui, |ui| {
                 let mut navigator = Navigator::default();
 
                 match self.state {
@@ -56,11 +56,11 @@ fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "fira_regular".to_owned(),
-        egui::FontData::from_static(crate::assets::FIRA_REGULAR),
+        egui::FontData::from_static(crate::assets::FIRA_REGULAR).into(),
     );
     fonts.font_data.insert(
         "fira_bold".to_owned(),
-        egui::FontData::from_static(crate::assets::FIRA_BOLD),
+        egui::FontData::from_static(crate::assets::FIRA_BOLD).into(),
     );
     fonts.families.insert(
         egui::FontFamily::Monospace,
@@ -98,6 +98,6 @@ fn measure_text(ctx: &egui::Context, font: egui::FontId, text: impl Into<String>
         text.into(),
         egui::TextFormat::simple(font, egui::Color32::WHITE),
     );
-    let galley = ctx.fonts(|f| f.layout_job(layout_job));
+    let galley = ctx.fonts_mut(|f| f.layout_job(layout_job));
     galley.rect.size()
 }

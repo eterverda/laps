@@ -57,10 +57,7 @@ fn testcard_texture_id(ui: &mut egui::Ui) -> egui::TextureId {
 
             ui.ctx().load_texture(
                 "stripes",
-                egui::ColorImage {
-                    size: [w as usize, h as usize],
-                    pixels,
-                },
+                egui::ColorImage::new([w as usize, h as usize], pixels),
                 egui::TextureOptions::NEAREST,
             )
         })

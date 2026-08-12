@@ -11,9 +11,6 @@ bench = false
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = { version = "0.7", default-features = false }
-panic-halt = "0.2"
-rp2040-hal = "0.9"
+panic-halt = "1.0"
+rp2040-hal = "0.12"
 rp2040-boot2 = "0.3"
-
-[profile.release]
-panic = "abort"

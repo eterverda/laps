@@ -158,7 +158,7 @@ impl Webcam {
                     }
                 };
 
-                let mut image = egui::ColorImage::new(
+                let mut image = egui::ColorImage::filled(
                     [width as usize, height as usize],
                     egui::Color32::TRANSPARENT,
                 );

@@ -1,3 +1,6 @@
 [workspace]
 members = ["common", "rssi", "rssi/rp2040"]
 resolver = "3"
+
+[profile.release]
+panic = "abort"

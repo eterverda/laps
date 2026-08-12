@@ -120,6 +120,7 @@ impl Live {
                         viewfinder_rect,
                         0.0,
                         egui::Stroke::new(border_width, BORDER_COLORS[i]),
+                        egui::StrokeKind::Inside,
                     );
                     viewfinder::Viewfinder::new(uv).show(ui, webcam_contents, viewfinder_rect);
 

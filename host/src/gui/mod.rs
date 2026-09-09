@@ -33,6 +33,10 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn persist_egui_memory(&self) -> bool {
+        false // this app has no egui state worth persisting between runs
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
@@ -71,6 +75,7 @@ fn setup_fonts(ctx: &egui::Context) {
 
 pub fn run() {
     let options = eframe::NativeOptions {
+        persist_window: false,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size((1280.0, 720.0))
             .with_min_inner_size((960.0, 540.0))
@@ -86,6 +91,13 @@ pub fn run() {
         "Laps",
         options,
         Box::new(|cc| {
+            // We do our own zooming and theming; neutralize egui's automatics.
+            cc.egui_ctx.options_mut(|o| {
+                o.zoom_with_keyboard = false; // no Ctrl+/-/0 zoom
+                o.quit_shortcuts.clear(); // no Ctrl+Q
+                o.theme_preference = egui::ThemePreference::Dark;
+                o.sync_window_theme = false; // don't touch native window decorations
+            });
             setup_fonts(&cc.egui_ctx);
             Ok(Box::new(App::new()))
         }),

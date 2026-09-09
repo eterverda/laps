@@ -18,10 +18,10 @@ enum Commands {
 
 fn setup_logging() {
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .filter_module("naga", log::LevelFilter::Warn)
-        .filter_module("wgpu", log::LevelFilter::Warn)
+        .filter_level(log::LevelFilter::Info)
+        .filter_module("laps", log::LevelFilter::Debug)
         .format_timestamp_millis()
+        .parse_default_env() // RUST_LOG overrides, e.g. RUST_LOG=laps=trace,eframe=debug
         .init();
 }
 

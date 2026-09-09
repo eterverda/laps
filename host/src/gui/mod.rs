@@ -106,10 +106,13 @@ pub fn run() {
 }
 
 fn measure_text(ctx: &egui::Context, font: egui::FontId, text: impl Into<String>) -> egui::Vec2 {
-    let layout_job = egui::text::LayoutJob::single_section(
-        text.into(),
-        egui::TextFormat::simple(font, egui::Color32::WHITE),
-    );
-    let galley = ctx.fonts_mut(|f| f.layout_job(layout_job));
-    galley.rect.size()
+    // Use raw font metrics, not galley layout: layout snaps row heights
+    // to whole physical pixels, which drifts at fractional pixels_per_point.
+    // glyph_width/row_height are scale-independent and deterministic.
+    // Note: kerning and ligatures are ignored, single-line text only.
+    let text = text.into();
+    ctx.fonts_mut(|fonts| {
+        let width: f32 = text.chars().map(|c| fonts.glyph_width(&font, c)).sum();
+        egui::vec2(width, fonts.row_height(&font))
+    })
 }

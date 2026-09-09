@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="ru">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Настроечная таблица</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            html,
+            body {
+                width: 100%;
+                height: 100%;
+                background: #000;
+                overflow: hidden;
+                font-family: "SF Mono", "Menlo", "Consolas", "Liberation Mono", "DejaVu Sans Mono", monospace;
+            }
+            #container {
+                width: 100%;
+                height: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            #aspect-box {
+                width: 100vw;
+                height: calc(100vw * 9 / 16);
+                max-height: 100vh;
+                max-width: calc(100vh * 16 / 9);
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                grid-template-rows: 1fr 1fr;
+                gap: 0;
+            }
+            .cell {
+                position: relative;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: hidden;
+            }
+
+            .dashed-16 {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+            }
+            .dashed-16.red {
+                border: 4px dashed #ff0000;
+            }
+            .dashed-16.blue {
+                border: 4px dashed #3333ff;
+            }
+            .dashed-16.green {
+                border: 4px dashed #00cc00;
+            }
+            .dashed-16.yellow {
+                border: 4px dashed #ffff00;
+            }
+
+            .solid-43 {
+                position: absolute;
+                top: 0;
+                bottom: 0;
+                left: 50%;
+                transform: translateX(-50%);
+                width: auto;
+                aspect-ratio: 4 / 3;
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                text-align: center;
+                z-index: 1;
+            }
+            .solid-43.red {
+                border: 4px solid #ff0000;
+            }
+            .solid-43.blue {
+                border: 4px solid #3333ff;
+            }
+            .solid-43.green {
+                border: 4px solid #00cc00;
+            }
+            .solid-43.yellow {
+                border: 4px solid #ffff00;
+            }
+
+            .label {
+                font-size: 8vw;
+                font-weight: bold;
+                line-height: 1;
+            }
+            .label.red {
+                color: #ff0000;
+            }
+            .label.blue {
+                color: #3333ff;
+            }
+            .label.green {
+                color: #00cc00;
+            }
+            .label.yellow {
+                color: #ffff00;
+            }
+
+            .ticker-wrap {
+                width: 100%;
+                overflow: hidden;
+                white-space: nowrap;
+                margin-top: 1vh;
+                text-align: center;
+            }
+            .ticker {
+                display: inline-block;
+                font-size: 1.8vw;
+                color: #fff;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="container">
+            <div id="aspect-box">
+                <div class="cell">
+                    <div class="dashed-16 red"></div>
+                    <div class="solid-43 red">
+                        <div class="label red">R1</div>
+                        <div class="ticker-wrap">
+                            <div class="ticker" id="ticker-r1"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="cell">
+                    <div class="dashed-16 blue"></div>
+                    <div class="solid-43 blue">
+                        <div class="label blue">R3</div>
+                        <div class="ticker-wrap">
+                            <div class="ticker" id="ticker-r3"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="cell">
+                    <div class="dashed-16 green"></div>
+                    <div class="solid-43 green">
+                        <div class="label green">R4</div>
+                        <div class="ticker-wrap">
+                            <div class="ticker" id="ticker-r4"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="cell">
+                    <div class="dashed-16 yellow"></div>
+                    <div class="solid-43 yellow">
+                        <div class="label yellow">R6</div>
+                        <div class="ticker-wrap">
+                            <div class="ticker" id="ticker-r6"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script>
+            function pad(n, len) {
+                return String(n).padStart(len, "0");
+            }
+            function formatRFC(d) {
+                const y = d.getFullYear();
+                const mo = pad(d.getMonth() + 1, 2);
+                const da = pad(d.getDate(), 2);
+                const h = pad(d.getHours(), 2);
+                const mi = pad(d.getMinutes(), 2);
+                const s = pad(d.getSeconds(), 2);
+                const ms = pad(d.getMilliseconds(), 3);
+                return `${y}-${mo}-${da} ${h}:${mi}:${s}.${ms}`;
+            }
+            function update() {
+                const now = new Date();
+                const text = formatRFC(now);
+                ["r1", "r3", "r4", "r6"].forEach((id) => {
+                    const el = document.getElementById("ticker-" + id);
+                    if (el) el.textContent = text;
+                });
+                requestAnimationFrame(update);
+            }
+            update();
+        </script>
+    </body>
+</html>

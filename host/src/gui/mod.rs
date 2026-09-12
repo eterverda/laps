@@ -38,6 +38,11 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        if fullscreen_pressed(&ctx) {
+            let fullscreen = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ui, |ui| {
@@ -54,6 +59,25 @@ impl eframe::App for App {
                 }
             });
     }
+}
+
+fn fullscreen_shortcuts() -> Vec<egui::KeyboardShortcut> {
+    let mut shortcuts = vec![egui::KeyboardShortcut::new(
+        egui::Modifiers::NONE,
+        egui::Key::F11,
+    )];
+    if cfg!(target_os = "macos") {
+        shortcuts.push(egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::CTRL,
+            egui::Key::F,
+        ));
+    }
+    shortcuts
+}
+
+fn fullscreen_pressed(ctx: &egui::Context) -> bool {
+    let shortcuts = fullscreen_shortcuts();
+    ctx.input_mut(|i| shortcuts.iter().any(|s| i.consume_shortcut(s)))
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -94,7 +118,6 @@ pub fn run() {
             // We do our own zooming and theming; neutralize egui's automatics.
             cc.egui_ctx.options_mut(|o| {
                 o.zoom_with_keyboard = false; // no Ctrl+/-/0 zoom
-                o.quit_shortcuts.clear(); // no Ctrl+Q
                 o.theme_preference = egui::ThemePreference::Dark;
                 o.sync_window_theme = false; // don't touch native window decorations
             });

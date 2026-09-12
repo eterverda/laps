@@ -261,7 +261,8 @@ impl Live {
             }
             None => {
                 let ctx = ctx.clone();
-                let desc = crate::config::CameraDescription::new("C7-1", 1920, 1080, 30);
+                let name = "C7-1";
+                let desc = crate::config::CameraDescription::new(name, 1920, 1080, 30);
                 self.webcam =
                     crate::driver::webcam::Webcam::start(&desc, move || ctx.request_repaint());
                 log::info!("webcam started");

@@ -101,6 +101,7 @@ pub fn run() {
     let options = eframe::NativeOptions {
         persist_window: false,
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("ru.fpvladder.laps")
             .with_inner_size((1280.0, 720.0))
             .with_min_inner_size((960.0, 540.0))
             .with_icon(egui::IconData::default())
@@ -112,7 +113,7 @@ pub fn run() {
     };
 
     eframe::run_native(
-        "Laps",
+        "LAPS",
         options,
         Box::new(|cc| {
             // We do our own zooming and theming; neutralize egui's automatics.

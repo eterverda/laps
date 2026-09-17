@@ -54,11 +54,18 @@ pub fn list_cameras() -> Result<Vec<crate::config::CameraDescription>, String> {
     for cam in cameras {
         let formats = list_formats_for_cam(&cam).unwrap_or_default();
         for fmt in formats {
+            // Other formats (GRAY, RGB, ...) are not offered in descriptions.
+            let pixel_format = match fmt.format() {
+                nokhwa::utils::FrameFormat::YUYV => crate::config::PixelFormat::Yuyv,
+                nokhwa::utils::FrameFormat::MJPEG => crate::config::PixelFormat::Mjpeg,
+                _ => continue,
+            };
             descriptions.push(crate::config::CameraDescription::new(
                 &cam.human_name(),
                 fmt.resolution().width(),
                 fmt.resolution().height(),
                 fmt.frame_rate(),
+                pixel_format,
             ));
         }
     }
@@ -97,6 +104,7 @@ impl Webcam {
                         f.resolution().width(),
                         f.resolution().height(),
                         f.frame_rate(),
+                        &f.format().to_string(),
                     )
                 })
                 .map(|f| (cam, f))

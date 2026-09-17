@@ -34,6 +34,7 @@ impl Res {
 pub struct Live {
     res: Option<Res>,
     webcam: Option<crate::driver::webcam::Webcam>,
+    clock: clock::Clock,
 }
 
 impl Into<State> for Live {
@@ -47,6 +48,7 @@ impl Live {
         Self {
             res: None,
             webcam: None,
+            clock: clock::Clock::new(),
         }
     }
 
@@ -64,7 +66,7 @@ impl Live {
         }
 
         let ctx = ui.ctx();
-        ctx.request_repaint(); // TODO concider remove
+        // ctx.request_repaint(); // TODO concider remove (commented out to test frame-drop logging)
 
         self.res.get_or_insert_with(|| Res::new(ctx));
         let webcam_contents = match self.webcam {
@@ -193,22 +195,10 @@ impl Live {
                     grid::cell_y(14 + VIEWFINDER_ROWS),
                 );
 
-                let timestamp = format_timestamp(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as i128,
-                );
                 let text_rect = grid::cell(11, bottom_right.row)
                     .translate(0, -1)
                     .extrude(23, -1);
-                ui.painter().text(
-                    text_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    timestamp,
-                    style::FONT_REGULAR,
-                    egui::Color32::WHITE,
-                );
+                self.clock.show(ui, text_rect);
                 {
                     let button = egui::Button::new(
                         egui::RichText::new(" Выход ⌘W ")
@@ -261,28 +251,17 @@ impl Live {
             }
             None => {
                 let ctx = ctx.clone();
-                let desc = "C7-1 1920x1080 @ 30fps [YUYV]";
+                let desc = "C7-1 1920x1080 @ 30fps [MJPEG]";
                 let desc = desc.parse().unwrap();
-                self.webcam =
-                    crate::driver::webcam::Webcam::start(&desc, move || ctx.request_repaint());
+                // A 1ms delay instead of an immediate repaint: egui renders
+                // twice per `request_repaint` (outstanding = 1), and the
+                // second pass always finds an empty slot. A tiny delay gives
+                // a single pass per camera frame.
+                self.webcam = crate::driver::webcam::Webcam::start(&desc, move || {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(1));
+                });
                 log::info!("webcam started");
             }
         }
     }
-}
-
-fn format_timestamp(unix_time: i128) -> String {
-    let dt = time::OffsetDateTime::from_unix_timestamp_nanos(unix_time)
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
-        .to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        dt.year(),
-        dt.month() as u8,
-        dt.day(),
-        dt.hour(),
-        dt.minute(),
-        dt.second(),
-        dt.millisecond(),
-    )
 }

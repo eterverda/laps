@@ -210,7 +210,7 @@ mod tests {
         let desc = CameraDescription::new("C7-1 USB3 Video", 3840, 2160, 18, PixelFormat::Mjpeg);
         assert_eq!(
             desc.to_string(),
-            "C7-1 USB3 Video 3840x2160 @ 18fps [MJPEG]"
+            "C7-1 USB3 Video 3840x2160 @ 18fps [MJPEG]",
         );
     }
 

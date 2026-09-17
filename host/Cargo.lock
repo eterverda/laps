@@ -2164,6 +2164,7 @@ dependencies = [
  "serde_yaml",
  "time",
  "yuv",
+ "zune-jpeg",
 ]
 
 [[package]]

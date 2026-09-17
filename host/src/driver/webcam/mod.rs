@@ -1,3 +1,6 @@
+use self::decode::Error as DecodeError;
+pub mod decode;
+
 use crate::config::CameraDescription;
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
@@ -147,9 +150,11 @@ impl Webcam {
             }
 
             let fmt = camera.camera_format();
+            log::info!("capture stream opened, format: {:?}", fmt);
+
             let width = fmt.resolution().width();
             let height = fmt.resolution().height();
-            log::info!("capture stream opened, format: {:?}", fmt);
+            let frame_format = fmt.format();
 
             loop {
                 if !running_clone.load(Ordering::Relaxed) {
@@ -166,25 +171,17 @@ impl Webcam {
                     }
                 };
 
-                let mut image = egui::ColorImage::filled(
-                    [width as usize, height as usize],
-                    egui::Color32::TRANSPARENT,
-                );
-
-                let packed = yuv::YuvPackedImage {
-                    yuy: &raw,
-                    yuy_stride: width * 2,
-                    width,
-                    height,
+                let image = match decode::decode_frame(frame_format, raw.as_ref(), width, height) {
+                    Ok(image) => image,
+                    Err(DecodeError::Recoverable(e)) => {
+                        log::warn!("frame skipped: {}", e);
+                        continue;
+                    }
+                    Err(DecodeError::Unrecoverable(e)) => {
+                        log::error!("capture stopping: {}", e);
+                        break;
+                    }
                 };
-                yuv::yuyv422_to_rgba(
-                    &packed,
-                    bytemuck::cast_slice_mut(&mut image.pixels),
-                    width * 4,
-                    yuv::YuvRange::Full,
-                    yuv::YuvStandardMatrix::Bt601,
-                )
-                .unwrap();
 
                 *slot_clone.lock().unwrap() = Some(image);
 

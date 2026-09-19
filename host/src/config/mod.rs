@@ -224,11 +224,11 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_yaml() {
+    fn test_serde_yml() {
         let desc = CameraDescription::new("Test Cam", 1920, 1080, 30, PixelFormat::Yuyv);
-        let yaml = serde_yaml::to_string(&desc).unwrap();
+        let yaml = serde_yml::to_string(&desc).unwrap();
         assert!(yaml.contains("Test Cam 1920x1080 @ 30fps [YUYV]"));
-        let parsed: CameraDescription = serde_yaml::from_str(&yaml).unwrap();
+        let parsed: CameraDescription = serde_yml::from_str(&yaml).unwrap();
         assert_eq!(parsed, desc);
     }
 

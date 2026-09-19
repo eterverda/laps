@@ -114,7 +114,7 @@ Not all screens use camera or playback:
 - If no CLI args: launch GUI mode. If args present: execute CLI command and exit
 
 ### Configuration
-- **serde** + **serde_yaml** — settings storage in YAML files
+- **serde** + **serde_yml** — settings storage in YAML files (serde_yaml is deprecated/archived; serde_yml is the maintained fork)
 
 ## Build
 

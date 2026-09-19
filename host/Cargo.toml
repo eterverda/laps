@@ -9,6 +9,7 @@ bytemuck = { version = "1.25", features = ["extern_crate_alloc"] }
 clap = { version = "4.6", features = ["derive"] }
 resvg = "0.48"
 crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
 eframe = "0.36"
 egui = "0.36"
 log = "0.4"
@@ -20,6 +21,7 @@ time = { version = "0.3", features = ["macros", "local-offset"] }
 yuv = "0.8.17"
 env_logger = "0.11.11"
 lazy-regex = "3.6.1"
+memchr = "2"
 zune-jpeg = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -39,6 +41,9 @@ opt-level = 2
 opt-level = 3
 
 [profile.dev.package.zune-core]
+
+[profile.dev.package.memchr]
+opt-level = 3
 [profile.dev.package.epaint]
 opt-level = 2
 

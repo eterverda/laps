@@ -1,3 +1,4 @@
 /target
+/captures
 *.rs.bk
 *.pdb

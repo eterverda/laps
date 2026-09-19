@@ -32,6 +32,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 ## Libraries by Concern
 
 ### UI
+
 - **egui** + **eframe** — immediate mode GUI, cross-platform
 - **epaint** — 2D rendering primitives (comes with egui)
 - Custom scalable grid layout (monospace cell-based, like older Gio version)
@@ -45,10 +46,12 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Styling: fixed built-in theme (dark), not user-editable. Color palette defined in code
 
 ### Video Capture
+
 - **nokhwa** — cross-platform webcam capture (AVFoundation/V4L2/MSMF)
 - Capture → RGBA frame → egui texture
 
 ### Video Recording
+
 - **video-rs** — encode raw frames from camera and write to container file (Encoder API available since 0.11)
 - Recording pipeline:
   1. Capture → encode H.264 → write MPEG-TS segments (segmentation manual if needed)
@@ -57,6 +60,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Texture sharing: one `TextureHandle` uploaded once, displayed in N viewfinders via UV cropping (negligible per-viewfinder cost)
 
 ### Video Playback
+
 - **video-rs** — decode from file, seek, scrub
 - Frame-accurate seeking for review workflow
 
@@ -72,48 +76,58 @@ Not all screens use camera or playback:
 - **Settings** — configuration
 
 ### Keyboard Input
+
 - **global-hotkey** — global shortcuts (Cmd+J, etc.), polled via `try_recv()` in `App::update()`
 - egui native — local shortcuts within window
 - Text input: forms with text fields, buttons, dynamic validation (egui `TextEdit`, `Button` widgets)
 - State management: non-trivial screen states within a window (live, playback, planning, stats, settings, etc.), including nested substates and modal overlays — fully app-managed, egui is rendering-only
 
 ### USB/HID Devices
+
 - **hidapi** — HID-class USB devices (works through kernel driver, simple read/write API)
 - Only if custom non-HID protocol: **nusb** (pure Rust, but requires kernel driver detachment and manual protocol implementation)
 
 ### Concurrency
+
 - **crossbeam** — channels and sync primitives
 - **parking_lot** — faster mutexes
 - Async (tokio) only if needed for specific I/O, not for the whole application
 
 ### Scripting
+
 - **mlua** — Lua 5.1-5.4 / LuaJIT embeddable scripting
 - Competition formats (Swiss, qualifiers, double elimination, etc.) described in Lua scripts
 - No in-app editor; scripts loaded from files or embedded as defaults
 
 ### Logging
+
 - **tklog** — singleton logger, levels, console + file output, optional rotation
 - Set up once at startup, use macros everywhere
 
 ### Internationalization
+
 - **fluent-zero** — zero-allocation `&'static str` for static text, compile-time PHF cache
 - `t!()` macro, `set_lang()` for runtime locale switch
 - Translation files in `locales/` (Fluent .ftl format)
 - Dynamic text (with variables) returns `Cow<'static, str>` — allocates only on interpolation
 
 ### Assets
+
 - **resvg** + **usvg** + **tiny-skia** — render SVG to bitmap for embedded icons/graphics
 - Fonts: embedded Fira Code Nerd Font (2:1 aspect ratio, excellent for grid)
 
 ### Time
+
 - **chrono** — date/time handling
 - For race timing: millisecond accuracy is critical; may need PTP, hardware timestamping, or dedicated timing source beyond wall clock
 
 ### CLI
+
 - **clap** — argument parsing via derive macro. Standard Rust ecosystem choice, auto-generates `--help`, completions, subcommands. Example pattern: `#[derive(Parser)] struct Cli { ... }` then `Cli::parse()`
 - If no CLI args: launch GUI mode. If args present: execute CLI command and exit
 
 ### Configuration
+
 - **serde** + **serde_yml** — settings storage in YAML files (serde_yaml is deprecated/archived; serde_yml is the maintained fork)
 
 ## Build
@@ -125,11 +139,11 @@ cargo run
 
 ## Application Identity
 
-| Context | Value | Notes |
-|---------|-------|-------|
-| Bundle ID / App ID | `ru.fpvladder.laps` | Hierarchical, Java-style. Used in macOS `CFBundleIdentifier`, Flatpak `app-id`, D-Bus name, etc. |
-| Binary name | `laps` | Short, lowercase, no translation |
-| Display name / Label | `Laps` | Proper noun, no translation, used in UI titles, `.desktop` `Name=`, macOS `CFBundleName` |
+| Context              | Value               | Notes                                                                                            |
+| -------------------- | ------------------- | ------------------------------------------------------------------------------------------------ |
+| Bundle ID / App ID   | `ru.fpvladder.laps` | Hierarchical, Java-style. Used in macOS `CFBundleIdentifier`, Flatpak `app-id`, D-Bus name, etc. |
+| Binary name          | `laps`              | Short, lowercase, no translation                                                                 |
+| Display name / Label | `Laps`              | Proper noun, no translation, used in UI titles, `.desktop` `Name=`, macOS `CFBundleName`         |
 
 ## Packaging
 
@@ -145,3 +159,7 @@ cargo run
 - `fluent-zero` is young (v0.1.4). If it becomes unmaintained, fallback is `fluent` (Mozilla, mature but allocates) or `rust-i18n` (compile-time, more popular). For personal use the risk is acceptable
 - Performance target: FullHD 60fps. GPU path not excluded by library choices
 - Audio: out of scope for now
+
+## Known Optimizations (not done yet)
+
+- **Per-frame buffer reuse (pool)** — capture allocates ~8 MB RGBA (`zeroed_vec`) + ~125 KB JPEG copy per frame (~240 MB/s churn per camera). Plan: small generic `Pool` (40 lines, no new deps); DVR channel carries pooled buffers recycled by writer; pixel pool per webcam (2-3 buffers), `decode_frame` takes `&mut [u8]`, UI returns buffer to pool after `texture.set`; drop `zeroed_vec` (decode_into overwrites fully). Expected: -1..3 ms CPU per frame (memset + mmap/page-fault churn), no latency change. Do this when scaling to 2+ cameras; measure with a counting global allocator before/after

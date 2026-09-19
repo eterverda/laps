@@ -123,6 +123,11 @@ fn setup_fonts(ctx: &egui::Context) {
         egui::FontFamily::Monospace,
         vec!["fira_regular".to_owned(), "fira_bold".to_owned()],
     );
+    // Жирная семья отдельно: у egui::FontId нет флага bold, только семья.
+    fonts.families.insert(
+        egui::FontFamily::Name("bold".into()),
+        vec!["fira_bold".to_owned(), "fira_regular".to_owned()],
+    );
     ctx.set_fonts(fonts);
 }
 

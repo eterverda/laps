@@ -1,0 +1,11 @@
+{
+  "lsp": {
+    "yaml-language-server": {
+      "settings": {
+        "yaml": {
+          "customTags": ["!laps-setup-1 mapping"]
+        }
+      }
+    }
+  }
+}

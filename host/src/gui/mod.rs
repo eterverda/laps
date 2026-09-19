@@ -1,3 +1,6 @@
+use crate::config::pilot::Pilot;
+use crate::config::setup::Setup;
+
 mod clock;
 mod grid;
 mod guidelines;
@@ -23,12 +26,31 @@ impl Navigator {
 
 struct App {
     state: State,
+    setup: Setup,
+    assignments: std::collections::HashMap<String, Pilot>,
+}
+
+fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
+    [
+        ("pad-1", "Скорострельников Генадий"),
+        ("pad-2", "Поэт Бездомный"),
+        ("pad-3", "Иванов Иван Иваныч"),
+        ("pad-4", "Цой Жив"),
+    ]
+    .into_iter()
+    .map(|(pad_id, name)| (pad_id.to_owned(), Pilot::new(name)))
+    .collect()
 }
 
 impl App {
     fn new() -> Self {
+        let setup: Setup = serde_yml::from_str(crate::assets::SETUP_YAML)
+            .expect("embedded setup.yaml failed to parse");
+        let assignments = hardcoded_assignments();
         Self {
-            state: State::Live(live::Live::new()),
+            state: State::Live(live::Live::new(setup.clone(), assignments.clone())),
+            setup,
+            assignments,
         }
     }
 }
@@ -50,7 +72,13 @@ impl eframe::App for App {
                 let mut navigator = Navigator::default();
 
                 match self.state {
-                    State::Menu(ref mut menu) => menu.update(ui, &mut navigator),
+                    State::Menu(ref mut menu) => match menu.update(ui) {
+                        menu::Action::Start => navigator.goto(live::Live::new(
+                            self.setup.clone(),
+                            self.assignments.clone(),
+                        )),
+                        menu::Action::None => {}
+                    },
                     State::Live(ref mut live) => live.update(ui, &mut navigator),
                 }
 

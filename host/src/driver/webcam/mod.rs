@@ -1,8 +1,7 @@
 use self::decode::Error as DecodeError;
 pub mod decode;
 
-use crate::config::CameraDescription;
-use nokhwa::Camera;
+use crate::config::camera::{Camera, PixelFormat};
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraInfo, RequestedFormat, RequestedFormatType};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,7 +41,7 @@ fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
 fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
     let index = cam.index().clone();
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
-    let mut camera = Camera::new(index, format).map_err(|e| e.to_string())?;
+    let mut camera = nokhwa::Camera::new(index, format).map_err(|e| e.to_string())?;
     let mut formats = camera
         .compatible_camera_formats()
         .map_err(|e| e.to_string())?;
@@ -50,7 +49,7 @@ fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
     Ok(formats)
 }
 
-pub fn list_cameras() -> Result<Vec<crate::config::CameraDescription>, String> {
+pub fn list_cameras() -> Result<Vec<Camera>, String> {
     let mut cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(|e| e.to_string())?;
     cameras.sort_by(|a, b| a.human_name().cmp(&b.human_name()));
     let mut descriptions = Vec::new();
@@ -59,11 +58,11 @@ pub fn list_cameras() -> Result<Vec<crate::config::CameraDescription>, String> {
         for fmt in formats {
             // Other formats (GRAY, RGB, ...) are not offered in descriptions.
             let pixel_format = match fmt.format() {
-                nokhwa::utils::FrameFormat::YUYV => crate::config::PixelFormat::Yuyv,
-                nokhwa::utils::FrameFormat::MJPEG => crate::config::PixelFormat::Mjpeg,
+                nokhwa::utils::FrameFormat::YUYV => PixelFormat::Yuyv,
+                nokhwa::utils::FrameFormat::MJPEG => PixelFormat::Mjpeg,
                 _ => continue,
             };
-            descriptions.push(crate::config::CameraDescription::new(
+            descriptions.push(Camera::new(
                 &cam.human_name(),
                 fmt.resolution().width(),
                 fmt.resolution().height(),
@@ -83,10 +82,7 @@ pub struct Webcam {
 }
 
 impl Webcam {
-    pub fn start(
-        desc: &CameraDescription,
-        on_frame: impl Fn() + Send + Sync + 'static,
-    ) -> Option<Self> {
+    pub fn start(desc: &Camera, on_frame: impl Fn() + Send + Sync + 'static) -> Option<Self> {
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
             Ok(c) => c,
             Err(e) => {
@@ -136,7 +132,7 @@ impl Webcam {
                     matched_fmt.frame_rate(),
                 ),
             ));
-            let mut camera = match Camera::new(index, format) {
+            let mut camera = match nokhwa::Camera::new(index, format) {
                 Ok(cam) => cam,
                 Err(e) => {
                     log::error!("failed to open camera: {}", e);

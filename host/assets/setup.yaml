@@ -1,0 +1,32 @@
+!laps-setup-1
+cameras:
+  camera-1:
+    name: C7-1
+    resolution: 1920x1080
+    frame-rate: 30fps
+    format: mjpeg
+pads:
+  pad-1:
+    label: R1
+    color: red
+    fpv:
+      camera-id: camera-1
+      viewport: 2x2-r1c1-narrow
+  pad-2:
+    label: R3
+    color: blue
+    fpv:
+      camera-id: camera-1
+      viewport: 2x2-r1c2-narrow
+  pad-3:
+    label: R4
+    color: green
+    fpv:
+      camera-id: camera-1
+      viewport: 2x2-r2c1-narrow
+  pad-4:
+    label: R6
+    color: yellow
+    fpv:
+      camera-id: camera-1
+      viewport: 2x2-r2c2-narrow

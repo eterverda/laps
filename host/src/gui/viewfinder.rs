@@ -30,7 +30,8 @@ pub enum ViewfinderContents {
     Off,
 }
 
-const FULL_UV: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+pub const FULL_UV: egui::Rect =
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 static TESTCARD_TEXTURE: OnceLock<egui::TextureHandle> = OnceLock::new();
 
 fn testcard_texture_id(ui: &mut egui::Ui) -> egui::TextureId {

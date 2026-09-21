@@ -4,9 +4,9 @@ pub mod webcam;
 use crossbeam_utils::atomic::AtomicCell;
 use std::sync::Arc;
 
-/// Состояние capture-потока.
+/// Состояние камеры (capture-потока).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaptureState {
+pub enum CameraState {
     /// Поток жив, идёт инициализация (перебор устройств, открытие стрима).
     Starting,
     /// Стрим открыт, кадры идут.
@@ -23,8 +23,8 @@ pub struct RecordState {
     pub fps: f32,
 }
 
-/// Общий для потока и UI хэндл состояния захвата.
-pub type SharedCaptureState = Arc<AtomicCell<CaptureState>>;
+/// Общий для потока и UI хэндл состояния камеры.
+pub type SharedCameraState = Arc<AtomicCell<CameraState>>;
 
 /// Общий для потока и UI хэндл состояния записи.
 pub type SharedRecordState = Arc<AtomicCell<RecordState>>;

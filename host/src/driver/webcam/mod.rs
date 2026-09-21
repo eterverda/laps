@@ -2,7 +2,7 @@ use self::decode::Error as DecodeError;
 pub mod decode;
 
 use crate::config::camera::{Camera, PixelFormat};
-use crate::driver::{CaptureState, RecordState, SharedCaptureState, SharedRecordState};
+use crate::driver::{CameraState, RecordState, SharedCameraState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraInfo, RequestedFormat, RequestedFormatType};
@@ -38,7 +38,7 @@ enum Command {
 }
 
 /// Recorder живёт внутри capture-потока, но создаётся по команде, а не
-/// при старте захвата: так LIVE и REC можно включать независимо.
+/// при старте захвата: так CAM и REC можно включать независимо.
 fn start_recorder(
     options: &crate::driver::dvr::Options,
     width: u32,
@@ -129,21 +129,21 @@ pub struct Webcam {
     texture: Option<egui::TextureHandle>,
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
-    capture: SharedCaptureState,
+    camera: SharedCameraState,
     record: SharedRecordState,
     commands: crossbeam_channel::Sender<Command>,
     /// Сайдкар показанных кадров (формат как у rec). None — файл не
-    /// создался, live продолжается без лога.
+    /// создался, показ продолжается без лога.
     frames_file: Option<std::io::BufWriter<std::fs::File>>,
-    // ts предыдущего показанного кадра (старт — момент запроса на live).
+    // ts предыдущего показанного кадра (старт — момент запроса на cam).
     frames_prev_ts: u64,
     frames_next: u64,
 }
 
 impl Webcam {
-    /// Стрим открыт и capture-поток жив.
-    pub fn capture_state(&self) -> CaptureState {
-        self.capture.load()
+    /// Стрим открыт, поток камеры жив.
+    pub fn camera_state(&self) -> CameraState {
+        self.camera.load()
     }
 
     /// Writer жив и пишет на диск.
@@ -176,12 +176,12 @@ impl Webcam {
         desc: Camera,
         on_frame: impl Fn() + Send + Sync + 'static,
     ) -> Self {
-        // Момент запроса на live: первый кадр сайдкара считаем от него.
+        // Момент запроса на cam: первый кадр сайдкара считаем от него.
         let start_request_ms = crate::driver::dvr::epoch_millis();
         let (frames_file, frames_prev_ts) = match Self::create_frames_log(camera_id, &desc) {
             Ok(file) => (Some(file), start_request_ms),
             Err(e) => {
-                log::error!("live frames log unavailable: {}", e);
+                log::error!("cam frames log unavailable: {}", e);
                 (None, start_request_ms)
             }
         };
@@ -189,8 +189,8 @@ impl Webcam {
         let slot_clone = Arc::clone(&slot);
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
-        let capture: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
-        let capture_clone = Arc::clone(&capture);
+        let state: SharedCameraState = Arc::new(AtomicCell::new(CameraState::Starting));
+        let state_clone = Arc::clone(&state);
         let record: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
             ok: false,
             fps: 0.0,
@@ -259,7 +259,7 @@ impl Webcam {
                 log::error!("failed to open stream: {}", e);
                 return;
             }
-            capture_clone.store(CaptureState::Live);
+            state_clone.store(CameraState::Live);
 
             let fmt = camera.camera_format();
             log::info!("capture stream opened, format: {:?}", fmt);
@@ -377,9 +377,9 @@ impl Webcam {
             }
 
             // Поток умирает (штатный стоп или потеря камеры) — гасим
-            // индикаторы, иначе LIVE/REC висят белым/красным на мёртвой
+            // индикаторы, иначе CAM/REC висят белым/красным на мёртвой
             // картинке.
-            capture_clone.store(CaptureState::Dead);
+            state_clone.store(CameraState::Dead);
             record_clone.store(RecordState {
                 ok: false,
                 fps: 0.0,
@@ -397,7 +397,7 @@ impl Webcam {
             texture: None,
             running,
             thread: Some(thread),
-            capture,
+            camera: state,
             record,
             commands: commands_tx,
             frames_file,
@@ -415,17 +415,17 @@ impl Webcam {
         let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!(
-            "{}-live-{}-frames.yaml",
+            "{}-cam-{}-frames.yaml",
             crate::driver::dvr::timestamp_prefix(),
             camera_id
         ));
-        log::info!("live frames log: {:?}", path);
+        log::info!("cam frames log: {:?}", path);
         let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
         // Шапка — для читающего файл глазами: спека камеры, семантика полей.
         writeln!(file, "# camera: {}", camera)?;
         writeln!(
             file,
-            "# i — порядковый номер кадра, ms — время с предыдущего кадра в мс (у i=0 — от запроса на live)"
+            "# i — порядковый номер кадра, ms — время с предыдущего кадра в мс (у i=0 — от запроса на cam)"
         )?;
         Ok(file)
     }
@@ -437,14 +437,14 @@ impl Webcam {
             return;
         };
         // ms — время с предыдущего показанного кадра (у первого — с
-        // запроса на live).
+        // запроса на cam).
         if let Err(e) = writeln!(
             file,
             "--- {{i: {}, ms: {}}}",
             self.frames_next,
             ts.saturating_sub(self.frames_prev_ts)
         ) {
-            log::error!("live frames log failed: {}", e);
+            log::error!("cam frames log failed: {}", e);
             self.frames_file = None;
             return;
         }
@@ -492,12 +492,12 @@ impl Drop for Webcam {
                 log::error!("capture thread panicked");
             }
         }
-        // Финализируем сайдкар live: все кадры задокументированы,
+        // Финализируем сайдкар cam: все кадры задокументированы,
         // закрываем поток YAML-документов.
         if let Some(file) = &mut self.frames_file {
             let _ = writeln!(file, "...");
             if let Err(e) = file.flush() {
-                log::error!("live frames log flush failed: {}", e);
+                log::error!("cam frames log flush failed: {}", e);
             }
         }
     }

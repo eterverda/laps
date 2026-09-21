@@ -7,25 +7,25 @@ cameras:
     format: mjpeg
 pads:
   pad-1:
-    label: R1
+    label: CH1
     color: red
     fpv:
       camera-id: camera-1
       viewport: 2x2-r1c1-narrow
   pad-2:
-    label: R3
+    label: CH2
     color: blue
     fpv:
       camera-id: camera-1
       viewport: 2x2-r1c2-narrow
   pad-3:
-    label: R4
+    label: CH3
     color: green
     fpv:
       camera-id: camera-1
       viewport: 2x2-r2c1-narrow
   pad-4:
-    label: R6
+    label: CH4
     color: yellow
     fpv:
       camera-id: camera-1

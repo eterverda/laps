@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 const MAX_PADS: usize = 4;
 const GRID_WIDTH: isize = 160;
-const LEFT_MARGIN: isize = 4;
-const RIGHT_MARGIN: isize = 4;
+const LEFT_MARGIN: isize = 2;
+const RIGHT_MARGIN: isize = 2;
 // Вьюфайндер фиксированный, высота задаёт ширину. Ячейки 8x16 pt,
 // поэтому физический 4:3 — это 32x12 клеток (256x192 pt).
 const VIEWFINDER_ROWS: isize = 12;
@@ -203,8 +203,9 @@ impl Live {
                             viewfinder_rect,
                         );
 
+                        let label_len = pad.label.len() as isize;
                         let label_rect = grid::cell(col, 1)
-                            .extrude(4, 2)
+                            .extrude(label_len * 2, 2)
                             .expand2(egui::vec2(grid::cell_x(1) / 2.0, 0.0));
                         ui.painter().rect_filled(label_rect, 0.0, color);
                         ui.painter().text(
@@ -219,7 +220,7 @@ impl Live {
                             .assignments
                             .get(pad_id)
                             .map_or("", |pilot| pilot.name.as_str());
-                        let pilot_rect = grid::cell(col + 6, 1).extrude(0, 1);
+                        let pilot_rect = grid::cell(col + label_len * 2 + 2, 1).extrude(0, 1);
                         ui.painter().text(
                             pilot_rect.center(),
                             egui::Align2::LEFT_CENTER,
@@ -362,11 +363,11 @@ impl Live {
                     cam_color,
                 );
 
-                let text_rect = grid::cell(LEFT_MARGIN + 3, 14 + VIEWFINDER_ROWS).extrude(25, 1);
+                let text_rect = grid::cell(LEFT_MARGIN, 14 + VIEWFINDER_ROWS).extrude(25, 1);
                 ui.painter().text(
                     text_rect.right_top(),
                     egui::Align2::RIGHT_TOP,
-                    "01) 2:34:56.789 \u{f0537} \u{f00d} \u{f00d} \u{ea72} \u{f4aa}",
+                    "1) 4:56.789 \u{f0537} \u{f00d} \u{f00d} \u{ea72} \u{f4aa}",
                     style::FONT_REGULAR,
                     egui::Color32::WHITE,
                 );

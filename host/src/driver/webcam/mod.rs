@@ -6,6 +6,7 @@ use crate::driver::{CaptureState, RecordState, SharedCaptureState, SharedRecordS
 use crossbeam_utils::atomic::AtomicCell;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraInfo, RequestedFormat, RequestedFormatType};
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,6 +30,36 @@ fn trim_mjpeg(frame: &[u8]) -> Option<&[u8]> {
 }
 
 type ImageSlot = Arc<Mutex<Option<egui::ColorImage>>>;
+
+/// Команды из UI-потока в capture-поток (управление записью).
+enum Command {
+    StartRecording(crate::driver::dvr::Options),
+    StopRecording,
+}
+
+/// Recorder живёт внутри capture-потока, но создаётся по команде, а не
+/// при старте захвата: так LIVE и REC можно включать независимо.
+fn start_recorder(
+    options: &crate::driver::dvr::Options,
+    width: u32,
+    height: u32,
+    fps: u32,
+    frame_format: nokhwa::utils::FrameFormat,
+    state: &SharedRecordState,
+) -> Option<crate::driver::dvr::Recorder> {
+    if frame_format != nokhwa::utils::FrameFormat::MJPEG {
+        // Запись — пасsthrough MJPEG; YUYV требовал бы JPEG-кодирования.
+        log::warn!("dvr: {} is not MJPEG, recording disabled", frame_format);
+        return None;
+    }
+    match crate::driver::dvr::Recorder::start(options, width, height, fps, state) {
+        Ok(recorder) => Some(recorder),
+        Err(e) => {
+            log::error!("dvr: recording unavailable: {}", e);
+            None
+        }
+    }
+}
 
 fn sort_and_dedup(formats: &mut Vec<CameraFormat>) {
     formats.sort_by(|a, b| {
@@ -100,6 +131,13 @@ pub struct Webcam {
     thread: Option<thread::JoinHandle<()>>,
     capture: SharedCaptureState,
     record: SharedRecordState,
+    commands: crossbeam_channel::Sender<Command>,
+    /// Сайдкар показанных кадров (формат как у rec). None — файл не
+    /// создался, live продолжается без лога.
+    frames_file: Option<std::io::BufWriter<std::fs::File>>,
+    // ts предыдущего показанного кадра (старт — момент запроса на live).
+    frames_prev_ts: u64,
+    frames_next: u64,
 }
 
 impl Webcam {
@@ -113,19 +151,52 @@ impl Webcam {
         self.record.load()
     }
 
+    /// Запустить запись. Команда применится перед следующим кадром;
+    /// ошибка создания файла уйдёт в лог, RecordState останется false.
+    pub fn start_recording(&self, options: crate::driver::dvr::Options) {
+        if self
+            .commands
+            .try_send(Command::StartRecording(options))
+            .is_err()
+        {
+            log::warn!("dvr: start_recording ignored (capture thread gone)");
+        }
+    }
+
+    /// Остановить запись; файл финализируется в фоне. Команда
+    /// применится между кадрами, затем — drop recorder'а.
+    pub fn stop_recording(&self) {
+        if self.commands.try_send(Command::StopRecording).is_err() {
+            log::warn!("dvr: stop_recording ignored (capture thread gone)");
+        }
+    }
+
     pub fn start(
+        camera_id: &str,
         desc: Camera,
-        dvr_options: crate::driver::dvr::Options,
         on_frame: impl Fn() + Send + Sync + 'static,
     ) -> Self {
+        // Момент запроса на live: первый кадр сайдкара считаем от него.
+        let start_request_ms = crate::driver::dvr::epoch_millis();
+        let (frames_file, frames_prev_ts) = match Self::create_frames_log(camera_id, &desc) {
+            Ok(file) => (Some(file), start_request_ms),
+            Err(e) => {
+                log::error!("live frames log unavailable: {}", e);
+                (None, start_request_ms)
+            }
+        };
         let slot: ImageSlot = Arc::default();
         let slot_clone = Arc::clone(&slot);
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
-        let capture: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState { ok: false }));
+        let capture: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
         let capture_clone = Arc::clone(&capture);
-        let record: SharedRecordState = Arc::new(AtomicCell::new(RecordState { ok: false }));
+        let record: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
+            ok: false,
+            fps: 0.0,
+        }));
         let record_clone = Arc::clone(&record);
+        let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
 
         let thread = thread::spawn(move || {
             // Перебор устройств и форматов — io, не должно висеть на UI-потоке.
@@ -188,7 +259,7 @@ impl Webcam {
                 log::error!("failed to open stream: {}", e);
                 return;
             }
-            capture_clone.store(CaptureState { ok: true });
+            capture_clone.store(CaptureState::Live);
 
             let fmt = camera.camera_format();
             log::info!("capture stream opened, format: {:?}", fmt);
@@ -196,30 +267,14 @@ impl Webcam {
             let width = fmt.resolution().width();
             let height = fmt.resolution().height();
             let frame_format = fmt.format();
+            let fps = fmt.frame_rate();
 
-            // DVR записывает сырой MJPEG-поток (до декода) в AVI. YUYV
-            // требовал бы JPEG-кодирования — пока не поддерживается.
-            let recorder = match frame_format {
-                nokhwa::utils::FrameFormat::MJPEG => {
-                    match crate::driver::dvr::Recorder::start(
-                        &dvr_options,
-                        width,
-                        height,
-                        fmt.frame_rate(),
-                        &record_clone,
-                    ) {
-                        Ok(recorder) => Some(recorder),
-                        Err(e) => {
-                            log::error!("dvr: recording unavailable: {}", e);
-                            None
-                        }
-                    }
-                }
-                other => {
-                    log::warn!("dvr: {} is not MJPEG, recording disabled", other);
-                    None
-                }
-            };
+            // Recorder появляется и исчезает по командам из UI.
+            let mut recorder: Option<crate::driver::dvr::Recorder> = None;
+
+            // Счётчик пишущихся кадров: fps показываем в UI (окно ~0.5 с).
+            let mut rec_frames = 0u32;
+            let mut rec_window = std::time::Instant::now();
 
             // Счётчик непрерывных ошибок захвата: nokhwa не отличает
             // транзиентный сбой от отвала устройства (всё — ReadFrameError),
@@ -230,6 +285,35 @@ impl Webcam {
                 if !running_clone.load(Ordering::Relaxed) {
                     log::info!("capture thread stopping");
                     break;
+                }
+
+                // Команды записи применяем между кадрами: dequeue
+                // блокирует до ~периода кадра, задержка незаметна.
+                for cmd in commands_rx.try_iter() {
+                    match cmd {
+                        Command::StartRecording(options) => {
+                            recorder = start_recorder(
+                                &options,
+                                width,
+                                height,
+                                fps,
+                                frame_format,
+                                &record_clone,
+                            );
+                            // Окно замера сбрасываем: fps считаем от старта
+                            // записи, иначе первое окно тянет elapsed со
+                            // старта потока и даёт мгновенный "0 fps".
+                            rec_frames = 0;
+                            rec_window = std::time::Instant::now();
+                        }
+                        Command::StopRecording => {
+                            recorder = None; // drop: writer finalize'ит в фоне
+                            record_clone.store(RecordState {
+                                ok: false,
+                                fps: 0.0,
+                            });
+                        }
+                    }
                 }
 
                 let raw = match camera.frame_raw() {
@@ -257,7 +341,20 @@ impl Webcam {
                 if let Some(recorder) = &recorder {
                     match trim_mjpeg(&raw) {
                         Some(frame) => {
-                            recorder.push_frame(frame.to_vec(), std::time::Instant::now())
+                            recorder.push_frame(frame.to_vec(), crate::driver::dvr::epoch_millis());
+                            rec_frames += 1;
+                            if rec_window.elapsed() >= Duration::from_millis(500) {
+                                // Пустое окно (старт, пауза кадров) не
+                                // затирает последнее известное значение.
+                                if rec_frames > 0 {
+                                    record_clone.store(RecordState {
+                                        ok: true,
+                                        fps: rec_frames as f32 / rec_window.elapsed().as_secs_f32(),
+                                    });
+                                }
+                                rec_frames = 0;
+                                rec_window = std::time::Instant::now();
+                            }
                         }
                         None => log::warn!("dvr: frame without EOI, skipped"),
                     }
@@ -282,8 +379,11 @@ impl Webcam {
             // Поток умирает (штатный стоп или потеря камеры) — гасим
             // индикаторы, иначе LIVE/REC висят белым/красным на мёртвой
             // картинке.
-            capture_clone.store(CaptureState { ok: false });
-            record_clone.store(RecordState { ok: false });
+            capture_clone.store(CaptureState::Dead);
+            record_clone.store(RecordState {
+                ok: false,
+                fps: 0.0,
+            });
 
             if let Err(e) = camera.stop_stream() {
                 log::error!("failed to stop stream: {}", e);
@@ -299,14 +399,71 @@ impl Webcam {
             thread: Some(thread),
             capture,
             record,
+            commands: commands_tx,
+            frames_file,
+            frames_prev_ts,
+            frames_next: 0,
         }
     }
 
-    pub fn update(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
+    /// Создать сайдкар показанных кадров, формат как у rec: каждый кадр
+    /// документом `{i, ms}` (время с предыдущего показанного).
+    fn create_frames_log(
+        camera_id: &str,
+        camera: &Camera,
+    ) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
+        let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!(
+            "{}-live-{}-frames.yaml",
+            crate::driver::dvr::timestamp_prefix(),
+            camera_id
+        ));
+        log::info!("live frames log: {:?}", path);
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        // Шапка — для читающего файл глазами: спека камеры, семантика полей.
+        writeln!(file, "# camera: {}", camera)?;
+        writeln!(
+            file,
+            "# i — порядковый номер кадра, ms — время с предыдущего кадра в мс (у i=0 — от запроса на live)"
+        )?;
+        Ok(file)
+    }
+
+    /// Записать интервал показа. Вызывается из UI-потока ровно на
+    /// показанных кадрах (той же выборкой считается shown fps).
+    fn log_shown_frame(&mut self, ts: u64) {
+        let Some(file) = &mut self.frames_file else {
+            return;
+        };
+        // ms — время с предыдущего показанного кадра (у первого — с
+        // запроса на live).
+        if let Err(e) = writeln!(
+            file,
+            "--- {{i: {}, ms: {}}}",
+            self.frames_next,
+            ts.saturating_sub(self.frames_prev_ts)
+        ) {
+            log::error!("live frames log failed: {}", e);
+            self.frames_file = None;
+            return;
+        }
+        self.frames_prev_ts = ts;
+        self.frames_next += 1;
+    }
+
+    /// Забрать новый кадр из слота, если есть, и обновить текстуру.
+    /// Второй элемент tuple — true, если кадр реально забран (один за
+    /// коллбэк): UI по нему считает показываемый fps.
+    pub fn update(&mut self, ctx: &egui::Context) -> (Option<&egui::TextureHandle>, bool) {
         let image = {
             let mut guard = self.slot.lock().unwrap();
             guard.take()
         };
+        let new_frame = image.is_some();
+        if new_frame {
+            self.log_shown_frame(crate::driver::dvr::epoch_millis());
+        }
 
         if let Some(image) = image {
             match &mut self.texture {
@@ -320,7 +477,7 @@ impl Webcam {
             }
         }
 
-        self.texture.as_ref()
+        (self.texture.as_ref(), new_frame)
     }
 }
 
@@ -333,6 +490,14 @@ impl Drop for Webcam {
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
                 log::error!("capture thread panicked");
+            }
+        }
+        // Финализируем сайдкар live: все кадры задокументированы,
+        // закрываем поток YAML-документов.
+        if let Some(file) = &mut self.frames_file {
+            let _ = writeln!(file, "...");
+            if let Err(e) = file.flush() {
+                log::error!("live frames log flush failed: {}", e);
             }
         }
     }

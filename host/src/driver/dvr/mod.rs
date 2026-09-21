@@ -1,10 +1,13 @@
 //! DVR: запись сырого MJPEG-потока камеры на диск без перекодировки.
 //! Формат — AVI-MJPEG. Один файл на запуск камеры, финализация
-//! при остановке (по Drop).
+//! при остановке (по Drop). Рядом пишется сайдкар `<stem>-frames.yaml`:
+//! на каждый кадр — документ `{i, ms}`, где ms — время с предыдущего
+//! кадра на входе записи (для первого — с запроса на запись).
 
 mod avi;
 
 use std::io;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -15,11 +18,13 @@ use super::{RecordState, SharedRecordState};
 /// Каталог записей по умолчанию, относительно рабочей директории.
 pub const CAPTURES_DIR: &str = "captures";
 
-/// Параметры записи одной камеры. Будет расширяться (ротация, sidecar
-/// таймстемпы и т.п.).
+/// Параметры записи одной камеры.
 pub struct Options {
     pub dir: PathBuf,
     pub camera_id: String,
+    /// Справочно: для шапки сайдкара и логов. Размеры/fps для записи
+    /// авторитетны из согласованного формата, см. Recorder::start.
+    pub camera: crate::config::camera::Camera,
 }
 
 const CHANNEL_CAP: usize = 64;
@@ -33,7 +38,7 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// не держит, detach безопасен).
 pub struct Recorder {
     state: SharedRecordState,
-    sender: Option<crossbeam_channel::Sender<(Vec<u8>, Instant)>>,
+    sender: Option<crossbeam_channel::Sender<(Vec<u8>, u64)>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -45,32 +50,72 @@ impl Recorder {
         fps: u32,
         state: &SharedRecordState,
     ) -> io::Result<Self> {
+        // Момент запроса на запись: первый кадр сайдкара считаем от него.
+        let start_request_ms = epoch_millis();
         std::fs::create_dir_all(&options.dir)?;
-        let path = options
-            .dir
-            .join(format!("{}-{}.avi", epoch_secs(), options.camera_id));
+        let stem = format!("{}-rec-{}", timestamp_prefix(), options.camera_id);
+        let path = options.dir.join(format!("{}.avi", stem));
+        let frames_path = options.dir.join(format!("{}-frames.yaml", stem));
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
         let mut writer = AviWriter::create(&path, width, height, fps, *b"MJPG")?;
-        state.store(RecordState { ok: true });
+        let mut frames_file = io::BufWriter::new(std::fs::File::create(&frames_path)?);
+        // Шапка — для читающего файл глазами: спека камеры, семантика полей.
+        writeln!(frames_file, "# camera: {}", options.camera)?;
+        writeln!(
+            frames_file,
+            "# i — порядковый номер кадра, ms — время с предыдущего кадра в мс (у i=0 — от запроса на запись)"
+        )?;
+        state.store(RecordState { ok: true, fps: 0.0 });
         let writer_path = path.clone();
-        let (sender, receiver) = crossbeam_channel::bounded::<(Vec<u8>, Instant)>(CHANNEL_CAP);
+        let (sender, receiver) = crossbeam_channel::bounded::<(Vec<u8>, u64)>(CHANNEL_CAP);
         let state_clone = state.clone();
         let thread = std::thread::spawn(move || {
             let mut last_sync = Instant::now();
+            // ms кадра — время с предыдущего на входе записи (у первого —
+            // с start_request_ms), документ пишется при приходе кадра. i
+            // совпадает с порядком в AVI: сюда доходят только реально
+            // записанные кадры.
+            let mut frame_no: u64 = 0;
+            let mut prev_ts = start_request_ms;
             // Канал закрывается по Drop отправителя → finalize и выход.
-            while let Ok((jpeg, _ts)) = receiver.recv() {
+            while let Ok((jpeg, ts)) = receiver.recv() {
                 if let Err(e) = writer.write_frame(&jpeg) {
                     log::error!("dvr: write failed, recording aborted: {}", e);
-                    state_clone.store(RecordState { ok: false });
+                    state_clone.store(RecordState {
+                        ok: false,
+                        fps: 0.0,
+                    });
+                    let _ = writeln!(frames_file, "...");
                     return;
                 }
+                if let Err(e) = writeln!(
+                    frames_file,
+                    "--- {{i: {}, ms: {}}}",
+                    frame_no,
+                    ts.saturating_sub(prev_ts)
+                ) {
+                    log::error!("dvr: frames sidecar failed, recording aborted: {}", e);
+                    state_clone.store(RecordState {
+                        ok: false,
+                        fps: 0.0,
+                    });
+                    let _ = writeln!(frames_file, "...");
+                    return;
+                }
+                prev_ts = ts;
+                frame_no += 1;
                 if last_sync.elapsed() >= SYNC_INTERVAL {
                     if let Err(e) = writer.sync_data() {
                         log::error!("dvr: sync failed: {}", e);
                     }
                     last_sync = Instant::now();
                 }
+            }
+            // Канал закрыт: все кадры задокументированы, закрываем поток.
+            let _ = writeln!(frames_file, "...");
+            if let Err(e) = frames_file.flush() {
+                log::error!("dvr: frames sidecar flush failed: {}", e);
             }
             match writer.finalize() {
                 Ok(()) => log::info!("dvr: finalized {:?}", writer_path),
@@ -85,10 +130,11 @@ impl Recorder {
         })
     }
 
-    /// Из capture-потока. Writer мёртв — кадр просто выбрасывается
+    /// Из capture-потока. `ts` — момент поступления кадра на запись, мс
+    /// с Unix-эпохи. Writer мёртв — кадр просто выбрасывается
     /// (состояние уже отражено в RecordState, UI показал). Переполнение
     /// канала = дроп кадра + warn (захват важнее записи).
-    pub fn push_frame(&self, jpeg: Vec<u8>, ts: Instant) {
+    pub fn push_frame(&self, jpeg: Vec<u8>, ts: u64) {
         if !self.state.load().ok {
             return;
         }
@@ -109,9 +155,36 @@ impl Drop for Recorder {
     }
 }
 
-fn epoch_secs() -> u64 {
+pub(crate) fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Префикс имён файлов записи: `YYYY-mm-dd-HH-MM-SS.SSS` (локальное время).
+pub(crate) fn timestamp_prefix() -> String {
+    use time::macros::format_description;
+    const FMT: &[time::format_description::FormatItem<'static>] =
+        format_description!("[year]-[month]-[day]-[hour]-[minute]-[second].[subsecond digits:3]");
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
+        log::warn!("dvr: local time unavailable, falling back to UTC");
+        time::OffsetDateTime::now_utc()
+    });
+    now.format(&FMT).unwrap_or_else(|e| {
+        log::error!("dvr: timestamp format failed: {}", e);
+        epoch_millis().to_string()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn timestamp_prefix_format() {
+        let prefix = super::timestamp_prefix();
+        assert!(
+            lazy_regex::regex_is_match!(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.\d{3}$", &prefix),
+            "bad timestamp prefix: {prefix}"
+        );
+    }
 }

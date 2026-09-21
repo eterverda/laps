@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::camera::Camera;
 use crate::config::{pilot::Pilot, setup::Setup};
+use crate::driver::CaptureState;
 use std::collections::HashMap;
 
 const MAX_PADS: usize = 4;
@@ -27,13 +28,29 @@ impl Res {
     }
 }
 
+/// Состояние потока: Rec возможен только внутри Live (REC-on стартует
+/// захват и запись; LIVE-off гасит всё; REC тогглится независимо внутри
+/// захвата).
+#[derive(Clone, Copy, PartialEq)]
+enum FeedState {
+    Off,
+    Live,
+    Rec,
+}
+
 pub struct Live {
     res: Option<Res>,
     webcams: HashMap<String, crate::driver::webcam::Webcam>,
+    feed: FeedState,
     clock: clock::Clock,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
     active_cameras: HashMap<String, Camera>,
+    // Показываемый fps: считаем на UI по забранным кадрам, только по
+    // первой камере (как и остальные цифры статуса).
+    shown_frames: u32,
+    shown_window: std::time::Instant,
+    shown_fps: f32,
 }
 
 impl Into<State> for Live {
@@ -62,17 +79,23 @@ impl Live {
         Self {
             res: None,
             webcams: HashMap::new(),
+            feed: FeedState::Off,
             clock: clock::Clock::new(),
             setup,
             assignments,
             active_cameras,
+            shown_frames: 0,
+            shown_window: std::time::Instant::now(),
+            // 0.0 = замера ещё не было, UI покажет "-- fps".
+            shown_fps: 0.0,
         }
     }
 
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
         ui.ctx().viewport_id();
         enum Action {
-            ToggleCamera,
+            ToggleLive,
+            ToggleRec,
             GotoMenu,
             None,
         }
@@ -89,11 +112,18 @@ impl Live {
         // Pending while the webcam runs but produced nothing yet. A camera
         // absent from this map means Off for its viewports.
         let mut contents: HashMap<String, viewfinder::ViewfinderContents> = HashMap::new();
+        let primary_id = self.active_cameras.keys().next().cloned();
         for (id, webcam) in self.webcams.iter_mut() {
+            let capture = webcam.capture_state();
+            let (texture, new_frame) = webcam.update(ctx);
+            if new_frame && Some(id) == primary_id.as_ref() {
+                self.shown_frames += 1;
+            }
             // Поток мёртв (камера не найдена, отвалилась) — testcard вместо
             // замершей последней текстуры: состояние не отличить по ней.
-            let state = if webcam.capture_state().ok {
-                match webcam.update(ctx) {
+            // Starting тоже testcard: кадров ещё нет.
+            let state = if capture == CaptureState::Live {
+                match texture {
                     Some(tex) => viewfinder::ViewfinderContents::Texture(tex.id()),
                     None => viewfinder::ViewfinderContents::Pending,
                 }
@@ -101,6 +131,16 @@ impl Live {
                 viewfinder::ViewfinderContents::Pending
             };
             contents.insert(id.clone(), state);
+        }
+        // Пассивный замер: окно 0.5 с, считается только по поступающим
+        // кадрам; пустое окно последнее значение не затирает.
+        if self.shown_window.elapsed() >= std::time::Duration::from_millis(500) {
+            if self.shown_frames > 0 {
+                self.shown_fps =
+                    self.shown_frames as f32 / self.shown_window.elapsed().as_secs_f32();
+            }
+            self.shown_frames = 0;
+            self.shown_window = std::time::Instant::now();
         }
 
         view::Letterbox::new(grid::cell(160, 45))
@@ -201,46 +241,126 @@ impl Live {
                         );
                     }
                 }
-                // LIVE и REC — индикаторы одного общего состояния: клик по
-                // любому включает/выключает трансляцию + запись вместе.
-                // Активны: LIVE белый, REC красный; неактивны — серые.
-                let status_row = 10 + VIEWFINDER_ROWS; // на строку выше прежнего
+                // LIVE и REC — независимые виджеты: клик по LIVE тогглит
+                // захват, клик по REC — запись. Подпись под кнопкой: error
+                // при отвале, измеренный fps после замера, "-- fps" до
+                // замера, заявленный fps в покое. Кликабельна вся область.
+                let status_row = 9 + VIEWFINDER_ROWS;
                 let right_edge = GRID_WIDTH - RIGHT_MARGIN;
-                let widget_w = 8; // 12 клеток текста X2 + по клетке с боков
-                let live_active = self.webcams.values().any(|w| w.capture_state().ok);
+                let live_state = self.webcams.values().next().map(|w| w.capture_state());
+                let live_active = live_state == Some(CaptureState::Live);
+                let live_dead = live_state == Some(CaptureState::Dead);
+                // Starting: поток жив, камера инициализируется — для статуса
+                // это «active», а не отвал (error рисуем только по Dead).
+                let starting = live_state == Some(CaptureState::Starting);
+                let live_show = live_active || (self.feed != FeedState::Off && !live_dead);
                 let rec_active = self.webcams.values().any(|w| w.record_state().ok);
-                for (i, &(label, active_color, active)) in [
-                    ("LIVE", egui::Color32::WHITE, live_active),
-                    ("REC", egui::Color32::RED, rec_active),
-                ]
-                .iter()
-                .enumerate()
-                {
-                    let col = right_edge - widget_w - (widget_w + 2) * (1 - i) as isize;
-                    let rect = grid::cell(col, status_row).extrude(widget_w, 2);
-                    let response = ui
-                        .interact(
-                            rect,
-                            ui.make_persistent_id(format!("status_{label}")),
-                            egui::Sense::click(),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if response.clicked() {
-                        action = Action::ToggleCamera;
+                let cfg_fps = self
+                    .active_cameras
+                    .values()
+                    .next()
+                    .map(|camera| camera.frame_rate.0);
+                let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
+
+                let rec_rect = grid::cell(right_edge, status_row).extrude(-6, 3);
+                let rec_response = ui
+                    .interact(
+                        rec_rect,
+                        ui.make_persistent_id("status_rec"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if rec_response.clicked() {
+                    action = Action::ToggleRec;
+                }
+                let rec_color = if rec_active {
+                    egui::Color32::RED
+                } else {
+                    egui::Color32::DARK_GRAY
+                };
+                let rec_text = if self.feed == FeedState::Rec {
+                    if !rec_active && !starting {
+                        "error".to_owned()
+                    } else if rec_fps.unwrap_or_default() > 0.0 {
+                        format!("{:.0} fps", rec_fps.unwrap_or_default())
+                    } else {
+                        "-- fps".to_owned()
                     }
-                    let color = if active {
-                        active_color
+                } else if rec_active && rec_fps.unwrap_or_default() > 0.0 {
+                    format!("{:.0} fps", rec_fps.unwrap_or_default())
+                } else {
+                    format!("{} fps", cfg_fps.unwrap_or_default())
+                };
+                ui.painter().text(
+                    rec_rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    "REC",
+                    style::FONT_REGULAR_X2,
+                    if rec_active {
+                        egui::Color32::RED
                     } else {
                         egui::Color32::DARK_GRAY
-                    };
-                    ui.painter().text(
-                        rect.left_center(),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        style::FONT_REGULAR_X2,
-                        color,
-                    );
+                    },
+                );
+                ui.painter().text(
+                    grid::cell(right_edge, status_row + 2)
+                        .extrude(-6, 1)
+                        .center(),
+                    egui::Align2::CENTER_CENTER,
+                    rec_text,
+                    style::FONT_REGULAR,
+                    rec_color,
+                );
+
+                let live_rect = grid::cell(right_edge, status_row)
+                    .translate(-8, 0)
+                    .extrude(-8, 3);
+                let live_response = ui
+                    .interact(
+                        live_rect,
+                        ui.make_persistent_id("status_live"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if live_response.clicked() {
+                    action = Action::ToggleLive;
                 }
+                let (live_text, live_color) = if self.feed != FeedState::Off && live_dead {
+                    ("error".to_owned(), egui::Color32::WHITE)
+                } else if live_show {
+                    let text = if self.shown_fps > 0.0 {
+                        format!("{:.0} fps", self.shown_fps)
+                    } else {
+                        "-- fps".to_owned()
+                    };
+                    (text, egui::Color32::WHITE)
+                } else {
+                    (
+                        format!("{} fps", cfg_fps.unwrap_or_default()),
+                        egui::Color32::DARK_GRAY,
+                    )
+                };
+                ui.painter().text(
+                    live_rect.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    "LIVE",
+                    style::FONT_REGULAR_X2,
+                    if live_show {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::DARK_GRAY
+                    },
+                );
+                ui.painter().text(
+                    grid::cell(right_edge, status_row + 2)
+                        .translate(-8, 0)
+                        .extrude(-8, 1)
+                        .center(),
+                    egui::Align2::CENTER_CENTER,
+                    live_text,
+                    style::FONT_REGULAR,
+                    live_color,
+                );
 
                 let text_rect = grid::cell(LEFT_MARGIN + 3, 14 + VIEWFINDER_ROWS).extrude(25, 1);
                 ui.painter().text(
@@ -290,33 +410,81 @@ impl Live {
 
         match action {
             Action::GotoMenu => navigator.goto(menu::Menu),
-            Action::ToggleCamera => self.toggle_webcam(ui.ctx()),
+            Action::ToggleLive => self.toggle_live(ui.ctx()),
+            Action::ToggleRec => self.toggle_rec(ui.ctx()),
             Action::None => {}
         }
     }
 
-    fn toggle_webcam(&mut self, ctx: &egui::Context) {
-        if !self.webcams.is_empty() {
-            self.webcams.clear();
-            log::info!("webcams stopped");
-            return;
-        }
+    fn start_captures(&mut self, ctx: &egui::Context) {
         for (id, camera) in &self.active_cameras {
             let ctx = ctx.clone();
-            let dvr_options = crate::driver::dvr::Options {
-                dir: crate::driver::dvr::CAPTURES_DIR.into(),
-                camera_id: id.clone(),
-            };
             // A 1ms delay instead of an immediate repaint: egui renders twice
             // per `request_repaint` (outstanding = 1), and the second pass
             // always finds an empty slot. A tiny delay gives a single pass
             // per camera frame.
-            let webcam =
-                crate::driver::webcam::Webcam::start(camera.clone(), dvr_options, move || {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(1));
-                });
+            let webcam = crate::driver::webcam::Webcam::start(id, camera.clone(), move || {
+                ctx.request_repaint_after(std::time::Duration::from_millis(1));
+            });
             self.webcams.insert(id.clone(), webcam);
         }
         log::info!("webcams starting: {}", self.webcams.len());
+    }
+
+    fn start_recording_all(&mut self) {
+        for (id, camera) in &self.active_cameras {
+            if let Some(webcam) = self.webcams.get(id) {
+                webcam.start_recording(crate::driver::dvr::Options {
+                    dir: crate::driver::dvr::CAPTURES_DIR.into(),
+                    camera_id: id.clone(),
+                    camera: camera.clone(),
+                });
+            }
+        }
+    }
+
+    // Сброс окна замера показа: fps считаем от старта захвата, иначе
+    // первое окно тянет elapsed с момента создания экрана и даёт
+    // мгновенный "0 fps". Пока замера нет — "-- fps".
+    fn reset_shown_fps(&mut self) {
+        self.shown_frames = 0;
+        self.shown_window = std::time::Instant::now();
+        self.shown_fps = 0.0;
+    }
+
+    fn toggle_live(&mut self, ctx: &egui::Context) {
+        match self.feed {
+            FeedState::Off => {
+                self.start_captures(ctx);
+                self.reset_shown_fps();
+                self.feed = FeedState::Live;
+            }
+            FeedState::Live | FeedState::Rec => {
+                self.webcams.clear();
+                log::info!("webcams stopped");
+                self.feed = FeedState::Off;
+            }
+        }
+    }
+
+    fn toggle_rec(&mut self, ctx: &egui::Context) {
+        match self.feed {
+            FeedState::Off => {
+                self.start_captures(ctx);
+                self.start_recording_all();
+                self.reset_shown_fps();
+                self.feed = FeedState::Rec;
+            }
+            FeedState::Live => {
+                self.start_recording_all();
+                self.feed = FeedState::Rec;
+            }
+            FeedState::Rec => {
+                for webcam in self.webcams.values() {
+                    webcam.stop_recording();
+                }
+                self.feed = FeedState::Live;
+            }
+        }
     }
 }

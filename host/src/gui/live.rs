@@ -232,13 +232,22 @@ impl Live {
                             grid::cell(col, VIEWFINDER_ROWS + 4).extrude(VIEWFINDER_COLS, 4),
                             0.0,
                             egui::Color32::TRANSPARENT,
-                            egui::Stroke::new(1.0, egui::Color32::GRAY),
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(48)),
                             egui::StrokeKind::Inside,
                         );
                         guidelines::dashed_rect(
                             ui,
                             grid::cell(col, 14 + VIEWFINDER_ROWS)
                                 .extrude(VIEWFINDER_COLS, bottom_right.row - 18 - VIEWFINDER_ROWS),
+                        );
+
+                        let text_rect = grid::cell(col, 14 + VIEWFINDER_ROWS).to_pos2();
+                        ui.painter().text(
+                            text_rect,
+                            egui::Align2::LEFT_TOP,
+                            "1) 4:56.789 \u{f0537} \u{f00d} \u{f00d} \u{ea72} \u{f4aa}",
+                            style::FONT_REGULAR,
+                            egui::Color32::WHITE,
                         );
                     }
                 }
@@ -363,14 +372,6 @@ impl Live {
                     cam_color,
                 );
 
-                let text_rect = grid::cell(LEFT_MARGIN, 14 + VIEWFINDER_ROWS).extrude(25, 1);
-                ui.painter().text(
-                    text_rect.right_top(),
-                    egui::Align2::RIGHT_TOP,
-                    "1) 4:56.789 \u{f0537} \u{f00d} \u{f00d} \u{ea72} \u{f4aa}",
-                    style::FONT_REGULAR,
-                    egui::Color32::WHITE,
-                );
                 guidelines::dashed_line(
                     ui,
                     egui::Direction::RightToLeft,

@@ -26,6 +26,10 @@ impl Cell {
         };
         return egui::Rect::from_min_max(cell_pos2(left, top), cell_pos2(right, bottom));
     }
+
+    pub const fn to_pos2(&self) -> egui::Pos2 {
+        return cell_pos2(self.col, self.row);
+    }
 }
 
 impl Into<egui::Pos2> for Cell {

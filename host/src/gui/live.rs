@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 const MAX_PADS: usize = 4;
 const GRID_WIDTH: isize = 160;
-const LEFT_MARGIN: isize = 2;
-const RIGHT_MARGIN: isize = 2;
+const LEFT_MARGIN: isize = 4;
+const RIGHT_MARGIN: isize = 4;
 // Вьюфайндер фиксированный, высота задаёт ширину. Ячейки 8x16 pt,
 // поэтому физический 4:3 — это 32x12 клеток (256x192 pt).
 const VIEWFINDER_ROWS: isize = 12;

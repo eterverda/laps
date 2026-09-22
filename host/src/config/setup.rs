@@ -54,9 +54,13 @@ mod tests {
 
         assert_eq!(setup.cameras.len(), 1);
         assert_eq!(setup.cameras["camera-1"].name, "C7-1");
+        assert_eq!(
+            setup.cameras["camera-1"].dvr.container,
+            super::super::camera::Container::Avi
+        );
         assert_eq!(setup.pads.len(), 4);
 
-        assert_eq!(setup.pads["pad-1"].label, "R1");
+        assert_eq!(setup.pads["pad-1"].label, "CH1");
         assert_eq!(setup.pads["pad-1"].color, Color::Red);
         assert_eq!(
             setup.pads["pad-1"].fpv.viewport,

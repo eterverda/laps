@@ -65,6 +65,23 @@ pub struct Camera {
     #[serde(rename = "frame-rate")]
     pub frame_rate: Fps,
     pub format: PixelFormat,
+    #[serde(default)]
+    pub dvr: Dvr,
+}
+
+/// Настройки записи камеры. Отсутствие блока в yaml = значения по умолчанию.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct Dvr {
+    #[serde(default)]
+    pub container: Container,
+}
+
+/// Контейнер DVR-записи. Пока единственный вариант.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Container {
+    #[default]
+    Avi,
 }
 
 impl Camera {
@@ -80,6 +97,7 @@ impl Camera {
             resolution: Resolution { width, height },
             frame_rate: Fps(fps),
             format,
+            dvr: Dvr::default(),
         }
     }
 
@@ -272,6 +290,22 @@ mod tests {
         );
         assert_eq!(cam.frame_rate, Fps(30));
         assert_eq!(cam.format, PixelFormat::Mjpeg);
+        // dvr в yaml отсутствует — дефолт.
+        assert_eq!(cam.dvr.container, Container::Avi);
+    }
+
+    #[test]
+    fn test_camera_dvr_container() {
+        let cam: Camera = serde_yml::from_str(
+            "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: avi\n",
+        )
+        .unwrap();
+        assert_eq!(cam.dvr.container, Container::Avi);
+
+        assert!(serde_yml::from_str::<Camera>(
+            "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mkv\n",
+        )
+        .is_err());
     }
 
     #[test]

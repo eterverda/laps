@@ -5,6 +5,8 @@ cameras:
     resolution: 1920x1080
     frame-rate: 30fps
     format: mjpeg
+    dvr:
+      container: avi
 pads:
   pad-1:
     label: CH1

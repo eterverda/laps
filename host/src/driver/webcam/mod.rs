@@ -49,10 +49,17 @@ fn start_recorder(
 ) -> Option<crate::driver::dvr::Recorder> {
     if frame_format != nokhwa::utils::FrameFormat::MJPEG {
         // Запись — пасsthrough MJPEG; YUYV требовал бы JPEG-кодирования.
-        log::warn!("dvr: {} is not MJPEG, recording disabled", frame_format);
+        log::error!("dvr: unsupported frame format {frame_format}, recording needs MJPEG");
         return None;
     }
-    match crate::driver::dvr::Recorder::start(options, width, height, fps, state) {
+    // Контейнер из настроек камеры. Других вариантов в config пока нет —
+    // новый контейнер добавляется рукой сюда, иначе не скомпилируется.
+    let result = match options.camera.dvr.container {
+        crate::config::camera::Container::Avi => {
+            crate::driver::dvr::Recorder::start(options, width, height, fps, state)
+        }
+    };
+    match result {
         Ok(recorder) => Some(recorder),
         Err(e) => {
             log::error!("dvr: recording unavailable: {}", e);

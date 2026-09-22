@@ -1,7 +1,7 @@
 use self::decode::Error as DecodeError;
 pub mod decode;
 
-use crate::config::camera::{Camera, PixelFormat};
+use crate::config::camera::{CameraConfig, PixelConfig};
 use crate::driver::{CameraState, RecordState, SharedCameraState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
 use nokhwa::pixel_format::RgbFormat;
@@ -55,7 +55,7 @@ fn start_recorder(
     // Контейнер из настроек камеры. Других вариантов в config пока нет —
     // новый контейнер добавляется рукой сюда, иначе не скомпилируется.
     let result = match options.camera.dvr.container {
-        crate::config::camera::Container::Avi => {
+        crate::config::camera::ContainerConfig::Avi => {
             crate::driver::dvr::Recorder::start(options, width, height, fps, state)
         }
     };
@@ -106,7 +106,7 @@ fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
     Ok(formats)
 }
 
-pub fn list_cameras() -> Result<Vec<Camera>, String> {
+pub fn list_cameras() -> Result<Vec<CameraConfig>, String> {
     let mut cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(|e| e.to_string())?;
     cameras.sort_by(|a, b| a.human_name().cmp(&b.human_name()));
     let mut descriptions = Vec::new();
@@ -115,11 +115,11 @@ pub fn list_cameras() -> Result<Vec<Camera>, String> {
         for fmt in formats {
             // Other formats (GRAY, RGB, ...) are not offered in descriptions.
             let pixel_format = match fmt.format() {
-                nokhwa::utils::FrameFormat::YUYV => PixelFormat::Yuyv,
-                nokhwa::utils::FrameFormat::MJPEG => PixelFormat::Mjpeg,
+                nokhwa::utils::FrameFormat::YUYV => PixelConfig::Yuyv,
+                nokhwa::utils::FrameFormat::MJPEG => PixelConfig::Mjpeg,
                 _ => continue,
             };
-            descriptions.push(Camera::new(
+            descriptions.push(CameraConfig::new(
                 &cam.human_name(),
                 fmt.resolution().width(),
                 fmt.resolution().height(),
@@ -180,7 +180,7 @@ impl Webcam {
 
     pub fn start(
         camera_id: &str,
-        desc: Camera,
+        desc: CameraConfig,
         on_frame: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         // Момент запроса на cam: первый кадр сайдкара считаем от него.
@@ -417,7 +417,7 @@ impl Webcam {
     /// документом `{i, ms}` (время с предыдущего показанного).
     fn create_frames_log(
         camera_id: &str,
-        camera: &Camera,
+        camera: &CameraConfig,
     ) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
         let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
         std::fs::create_dir_all(dir)?;

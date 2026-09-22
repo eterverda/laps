@@ -24,7 +24,7 @@ pub struct Options {
     pub camera_id: String,
     /// Справочно: для шапки сайдкара и логов. Размеры/fps для записи
     /// авторитетны из согласованного формата, см. Recorder::start.
-    pub camera: crate::config::camera::Camera,
+    pub camera: crate::config::camera::CameraConfig,
 }
 
 const CHANNEL_CAP: usize = 64;

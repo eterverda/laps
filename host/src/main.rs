@@ -2,6 +2,7 @@ mod assets;
 mod config;
 mod driver;
 mod gui;
+mod model;
 
 #[derive(clap::Parser)]
 #[command(name = "laps")]

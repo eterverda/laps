@@ -1,5 +1,5 @@
-use crate::config::pilot::Pilot;
 use crate::config::setup::Setup;
+use crate::model::pilot::Pilot;
 
 mod clock;
 mod grid;
@@ -31,15 +31,10 @@ struct App {
 }
 
 fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
-    [
-        ("pad-1", "Скорострельников Генадий"),
-        ("pad-2", "Поэт Бездомный"),
-        ("pad-3", "Иванов Иван Иваныч"),
-        ("pad-4", "Цой Жив"),
-    ]
-    .into_iter()
-    .map(|(pad_id, name)| (pad_id.to_owned(), Pilot::new(name)))
-    .collect()
+    ["pad-1", "pad-2", "pad-3", "pad-4"]
+        .into_iter()
+        .map(|pad_id| (pad_id.to_owned(), Pilot::random()))
+        .collect()
 }
 
 impl App {

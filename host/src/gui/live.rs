@@ -1,7 +1,8 @@
 use super::*;
-use crate::config::camera::Camera;
-use crate::config::{pilot::Pilot, setup::Setup};
+use crate::config::camera::CameraConfig;
+use crate::config::setup::Setup;
 use crate::driver::CameraState;
+use crate::model::pilot::Pilot;
 use std::collections::HashMap;
 
 const MAX_PADS: usize = 4;
@@ -45,7 +46,7 @@ pub struct Live {
     clock: clock::Clock,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
-    active_cameras: HashMap<String, Camera>,
+    active_cameras: HashMap<String, CameraConfig>,
     // Показываемый fps: считаем на UI по забранным кадрам, только по
     // первой камере (как и остальные цифры статуса).
     shown_frames: u32,
@@ -64,7 +65,7 @@ impl Live {
         // Cameras feeding viewports of occupied pads (the screen shows at
         // most MAX_PADS columns); built once — assignments are fixed for the
         // lifetime of this screen.
-        let active_cameras: HashMap<String, Camera> = setup
+        let active_cameras: HashMap<String, CameraConfig> = setup
             .pads
             .iter()
             .filter(|(pad_id, _)| assignments.contains_key(*pad_id))

@@ -10,7 +10,7 @@ fn test_load_setup_yaml() {
     assert_eq!(setup.cameras["camera-1"].name, "C7-1");
     assert_eq!(
         setup.cameras["camera-1"].dvr.container,
-        super::super::camera::ContainerConfig::Avi
+        super::super::camera::ContainerConfig::Mkv
     );
     assert_eq!(setup.pads.len(), 4);
 

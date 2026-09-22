@@ -1,10 +1,12 @@
 //! DVR: запись сырого MJPEG-потока камеры на диск без перекодировки.
-//! Формат — AVI-MJPEG. Один файл на запуск камеры, финализация
-//! при остановке (по Drop). Рядом пишется сайдкар `<stem>-frames.yaml`:
-//! на каждый кадр — документ `{i, ms}`, где ms — время с предыдущего
-//! кадра на входе записи (для первого — с запроса на запись).
+//! Контейнер — AVI или MKV (настройка камеры). Один файл на запуск
+//! камеры, финализация при остановке (по Drop). Рядом пишется сайдкар
+//! `<stem>-frames.yaml`: на каждый кадр — документ `{i, ms}`, где ms —
+//! время с предыдущего кадра на входе записи (для первого — с запроса
+//! на запись).
 
 mod avi;
+mod mkv;
 
 use std::io;
 use std::io::Write as _;
@@ -12,8 +14,42 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use avi::AviWriter;
+use mkv::MkvWriter;
 
 use super::{RecordState, SharedRecordState};
+use crate::config::camera::ContainerConfig;
+
+/// Закрытое множество контейнеров — enum вместо трейта: новый контейнер
+/// добавляется рукой сюда и в Recorder::start, иначе не скомпилируется.
+enum VideoWriter {
+    Avi(AviWriter),
+    Mkv(MkvWriter),
+}
+
+impl VideoWriter {
+    /// `ts_ms` — момент кадра, мс с Unix-эпохи. AVI его игнорирует
+    /// (равномерный таймлайн по fps), MKV пишет как реальный таймкод.
+    fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> io::Result<()> {
+        match self {
+            VideoWriter::Avi(w) => w.write_frame(jpeg),
+            VideoWriter::Mkv(w) => w.write_frame(jpeg, ts_ms),
+        }
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        match self {
+            VideoWriter::Avi(w) => w.sync_data(),
+            VideoWriter::Mkv(w) => w.sync_data(),
+        }
+    }
+
+    fn finalize(self) -> io::Result<()> {
+        match self {
+            VideoWriter::Avi(w) => w.finalize(),
+            VideoWriter::Mkv(w) => w.finalize(),
+        }
+    }
+}
 
 /// Каталог записей по умолчанию, относительно рабочей директории.
 pub const CAPTURES_DIR: &str = "captures";
@@ -54,11 +90,22 @@ impl Recorder {
         let start_request_ms = epoch_millis();
         std::fs::create_dir_all(&options.dir)?;
         let stem = format!("{}-rec-{}", timestamp_prefix(), options.camera_id);
-        let path = options.dir.join(format!("{}.avi", stem));
+        // Контейнер из настроек камеры. Файл создаём здесь, а не в
+        // writer-потоке: ошибка (диск полон, нет прав) уезжает вызывающему
+        // вместо молчаливой мёртвой записи.
+        let (path, mut writer) = match options.camera.dvr.container {
+            ContainerConfig::Avi => {
+                let path = options.dir.join(format!("{stem}.avi"));
+                let writer = AviWriter::create(&path, width, height, fps, *b"MJPG")?;
+                (path, VideoWriter::Avi(writer))
+            }
+            ContainerConfig::Mkv => {
+                let path = options.dir.join(format!("{stem}.mkv"));
+                let writer = MkvWriter::create(&path, width, height)?;
+                (path, VideoWriter::Mkv(writer))
+            }
+        };
         let frames_path = options.dir.join(format!("{}-frames.yaml", stem));
-        // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
-        // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
-        let mut writer = AviWriter::create(&path, width, height, fps, *b"MJPG")?;
         let mut frames_file = io::BufWriter::new(std::fs::File::create(&frames_path)?);
         // Шапка — для читающего файл глазами: спека камеры, семантика полей.
         writeln!(frames_file, "# camera: {}", options.camera)?;
@@ -80,7 +127,7 @@ impl Recorder {
             let mut prev_ts = start_request_ms;
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((jpeg, ts)) = receiver.recv() {
-                if let Err(e) = writer.write_frame(&jpeg) {
+                if let Err(e) = writer.write_frame(&jpeg, ts) {
                     log::error!("dvr: write failed, recording aborted: {}", e);
                     state_clone.store(RecordState {
                         ok: false,

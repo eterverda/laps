@@ -6,7 +6,7 @@ cameras:
     frame-rate: 30fps
     format: mjpeg
     dvr:
-      container: avi
+      container: mkv
 pads:
   pad-1:
     label: CH1

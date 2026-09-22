@@ -50,8 +50,14 @@ fn test_camera_dvr_container() {
     .unwrap();
     assert_eq!(cam.dvr.container, ContainerConfig::Avi);
 
-    assert!(serde_yml::from_str::<CameraConfig>(
+    let cam: CameraConfig = serde_yml::from_str(
         "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mkv\n",
+    )
+    .unwrap();
+    assert_eq!(cam.dvr.container, ContainerConfig::Mkv);
+
+    assert!(serde_yml::from_str::<CameraConfig>(
+        "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mp4\n",
     )
     .is_err());
 }

@@ -52,13 +52,8 @@ fn start_recorder(
         log::error!("dvr: unsupported frame format {frame_format}, recording needs MJPEG");
         return None;
     }
-    // Контейнер из настроек камеры. Других вариантов в config пока нет —
-    // новый контейнер добавляется рукой сюда, иначе не скомпилируется.
-    let result = match options.camera.dvr.container {
-        crate::config::camera::ContainerConfig::Avi => {
-            crate::driver::dvr::Recorder::start(options, width, height, fps, state)
-        }
-    };
+    // Контейнер выбирается внутри Recorder::start из настроек камеры.
+    let result = crate::driver::dvr::Recorder::start(options, width, height, fps, state);
     match result {
         Ok(recorder) => Some(recorder),
         Err(e) => {

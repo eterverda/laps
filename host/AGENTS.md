@@ -22,8 +22,8 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
    │ driver                 │
    │ - webcam (nokhwa)      │  capture thread: MJPEG passthrough /
    │ - dvr (own muxers)     │  YUYV decode → ColorImage slot
-   │   AVI (RIFF+idx1)      │  recorder: writer thread, MJPEG blobs
-   │   MKV (EBML+Cues)      │  → container, no re-encode
+   │   MKV (EBML+Cues)      │  recorder: writer thread, MJPEG blobs
+   │   MP4/MOV (ISOBMFF)    │  → container, no re-encode
    └────────────────────────┘
 ```
 
@@ -66,16 +66,18 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 - **Passthrough**: camera already emits JPEG; recording = muxing blobs,
-  CPU cost ≈ 0. YUYV is rejected at recorder start with an error log.
-- **Containers** (per-camera setting in setup.yaml, `dvr.container`):
-  - `avi` — RIFF/MJPEG, idx1 per-frame index, 4 GiB guard (stops recording
-    instead of silent size-field overflow)
+  CPU cost ≈ 0. YUYV: RGBA re-encoded to JPEG (jpeg-encoder) in the
+  writer thread.
+- **Containers** (per-camera setting in setup.yaml, `dvr.container`,
+  default `mkv`):
   - `mkv` — Matroska/EBML, real per-frame millisecond timestamps
     (TimecodeScale = 1 ms, no fps input), Cues per 5 s cluster, no size limit
+  - `mp4`/`mov` — ISOBMFF; common engine in `dvr/mp4.rs` (MovWriter is a
+    thin `Flavor::Mov` wrapper), stss lists all frames as sync, co64
+    offsets unconditionally, mdat largesize patched at finalize
   - `VideoWriter` enum in `dvr/mod.rs` — closed set, new container added
     by hand (exhaustive match, won't compile otherwise)
-- One file per recording start; **no segment rotation** (documented gap;
-  AVI side has the 4 GiB guard)
+- One file per recording start; **no segment rotation** (documented gap)
 - Sidecar `<stem>-frames.yaml` per recording AND per live feed: per-frame
   `--- {i, ms}` documents, ms = time since previous frame at recorder
   input (first frame — since start request). MKV knows real frame
@@ -93,8 +95,9 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 ## Video Playback (planned)
 
-- Own reader (mirrors writers): idx1/Cues parsed once into memory,
-  `read_at` per frame (no seek), **zune-jpeg** decode of a single frame
+- Own reader (mirrors writers): MKV Cues / MP4-MOV moov tables
+  (stts/stsz/co64) parsed once into memory, `read_at` per frame (no seek),
+  **zune-jpeg** decode of a single frame
 - Scrubbing = index lookup + one JPEG decode (~5 ms); every MJPEG frame is
   a keyframe, no GOP rewinds. Target: faster than VLC, no pipeline flush
 - Sidecar `-frames.yaml` may complement MKV for start-request latency
@@ -103,9 +106,11 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 - **serde** + **serde_yml** (serde_yaml is deprecated/archived; serde_yml
   is the maintained fork) — setup files in YAML
-- Default setup embedded from `assets/setup.yaml`; config-loaded types
-  carry the `Config` suffix (`CameraConfig`, `PadConfig`, `DvrConfig`, …),
-  except `Setup`. Don't rename nokhwa's own `Camera`/`CameraFormat`/`CameraInfo`
+- Default setup embedded from `assets/setup.yaml` and loaded once at app
+  startup — no tests or other code may depend on its contents;
+  config-loaded types carry the `Config` suffix (`CameraConfig`,
+  `PadConfig`, `DvrConfig`, …), except `Setup`. Don't rename nokhwa's own
+  `Camera`/`CameraFormat`/`CameraInfo`
 - Camera spec canonical string form: `C7-1 1920x1080 @ 30fps [MJPEG]`
   (`CameraConfig: Display/FromStr`, lazy-regex based)
 

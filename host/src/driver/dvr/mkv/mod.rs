@@ -2,8 +2,8 @@
 //! Кадры — MJPEG в SimpleBlock (все ключевые), таймкоды — реальные,
 //! миллисекундные (TimecodeScale = 1 мс), поэтому fps на входе не нужен:
 //! переменный frame rate отражается честно. Лимита размера файла, вроде
-//! 4 ГиБ у RIFF, нет. Как и avi: файл живой до finalize() (патчим
-//! размеры Segment/Cluster, SeekHead и Duration), живучесть к крашу —
+//! 4 ГиБ у RIFF, нет. Файл живой до finalize() (патчим размеры
+//! Segment/Cluster, SeekHead и Duration), живучесть к крашу —
 //! через sync_data().
 
 use std::fs::{File, OpenOptions};

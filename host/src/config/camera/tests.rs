@@ -39,17 +39,11 @@ fn test_camera() {
     assert_eq!(cam.frame_rate, FpsConfig(30));
     assert_eq!(cam.format, PixelConfig::Mjpeg);
     // dvr в yaml отсутствует — дефолт.
-    assert_eq!(cam.dvr.container, ContainerConfig::Avi);
+    assert_eq!(cam.dvr.container, ContainerConfig::Mkv);
 }
 
 #[test]
 fn test_camera_dvr_container() {
-    let cam: CameraConfig = serde_yml::from_str(
-        "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: avi\n",
-    )
-    .unwrap();
-    assert_eq!(cam.dvr.container, ContainerConfig::Avi);
-
     let cam: CameraConfig = serde_yml::from_str(
         "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mkv\n",
     )

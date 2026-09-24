@@ -81,7 +81,6 @@ pub struct DvrConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ContainerConfig {
     #[default]
-    Avi,
     Mkv,
     Mp4,
     Mov,

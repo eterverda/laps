@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 /// nokhwa на V4L2 отдаёт `frame_raw()` — это весь mmap-буфер (его ёмкость,
 /// равная размеру несжатого кадра), а не реальную длину кадра: драйвер
 /// пишет jpeg в начало, а после EOI остаётся неиспользуемый хвост со
-/// старыми данными. MJPEG-кадр — это ровно SOI..EOI; без обрезки в AVI
+/// старыми данными. MJPEG-кадр — это ровно SOI..EOI; без обрезки в файл
 /// попадает мусор, а jpegparse в GStreamer теряет синхронизацию.
 /// Поиск EOI — через SIMD-поиск паттерна FFD9 (memmem): в entropy-данных
 /// FF заэскейпен как FF00, поэтому первое вхождение FFD9 после SOI — EOI.
@@ -67,11 +67,10 @@ fn start_recorder(
     options: &crate::driver::dvr::Options,
     width: u32,
     height: u32,
-    fps: u32,
     state: &SharedRecordState,
 ) -> Option<crate::driver::dvr::Recorder> {
     // Формат и контейнер ветвятся внутри Recorder::start.
-    let result = crate::driver::dvr::Recorder::start(options, width, height, fps, state);
+    let result = crate::driver::dvr::Recorder::start(options, width, height, state);
     match result {
         Ok(recorder) => Some(recorder),
         Err(e) => {
@@ -312,7 +311,7 @@ impl Webcam {
                 for cmd in commands_rx.try_iter() {
                     match cmd {
                         Command::StartRecording(options) => {
-                            recorder = start_recorder(&options, width, height, fps, &record_clone);
+                            recorder = start_recorder(&options, width, height, &record_clone);
                         }
                         Command::StopRecording => {
                             recorder = None; // drop: writer finalize'ит в фоне
@@ -493,7 +492,7 @@ impl Drop for Webcam {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         // Джойним capture-поток: он ждёт текущий кадр и stop_stream.
-        // Финализация AVI не входит в это ожидание — recorder уже
+        // Финализация контейнера не входит в это ожидание — recorder уже
         // отпущен детачем и дописывает файл в фоне.
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {

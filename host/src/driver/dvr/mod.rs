@@ -1,13 +1,12 @@
 //! DVR: запись потока камеры на диск. MJPEG — пасsthrough готовых
 //! JPEG-блобов без перекодировки. YUYV — декодированный RGBA кодируется
-//! в JPEG и пишется в тот же контейнер (AVI/MKV/MP4/MOV). Один файл на запуск
+//! в JPEG и пишется в тот же контейнер (MKV/MP4/MOV). Один файл на запуск
 //! камеры, финализация при остановке (по Drop). Рядом пишется сайдкар
 //! `<stem>-frames.yaml`: на каждый кадр — документ `{i, ms}`, где ms —
 //! время с предыдущего кадра на входе записи (для первого — с запроса
 //! на запись). RecordState целиком принадлежит writer-потоку
 //! (старт/окна fps/ошибка/выход) — вторых писателей быть не должно.
 
-mod avi;
 mod mkv;
 mod mov;
 mod mp4;
@@ -17,7 +16,6 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use avi::AviWriter;
 use mkv::MkvWriter;
 use mov::MovWriter;
 use mp4::Mp4Writer;
@@ -28,19 +26,16 @@ use crate::config::camera::{ContainerConfig, PixelConfig};
 /// Закрытое множество контейнеров — enum вместо трейта: новый контейнер
 /// добавляется рукой сюда и в Recorder::start, иначе не скомпилируется.
 enum VideoWriter {
-    Avi(AviWriter),
     Mkv(MkvWriter),
     Mp4(Mp4Writer),
     Mov(MovWriter),
 }
 
 impl VideoWriter {
-    /// `ts_ms` — момент кадра, мс с Unix-эпохи. AVI его игнорирует
-    /// (равномерный таймлайн по fps); MKV/MP4/MOV пишут как реальный
-    /// таймкод.
+    /// `ts_ms` — момент кадра, мс с Unix-эпохи; пишется как реальный
+    /// таймкод (равномерный таймлайн по fps никто не строит).
     fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> io::Result<()> {
         match self {
-            VideoWriter::Avi(w) => w.write_frame(jpeg),
             VideoWriter::Mkv(w) => w.write_frame(jpeg, ts_ms),
             VideoWriter::Mp4(w) => w.write_frame(jpeg, ts_ms),
             VideoWriter::Mov(w) => w.write_frame(jpeg, ts_ms),
@@ -49,7 +44,6 @@ impl VideoWriter {
 
     fn sync_data(&mut self) -> io::Result<()> {
         match self {
-            VideoWriter::Avi(w) => w.sync_data(),
             VideoWriter::Mkv(w) => w.sync_data(),
             VideoWriter::Mp4(w) => w.sync_data(),
             VideoWriter::Mov(w) => w.sync_data(),
@@ -58,7 +52,6 @@ impl VideoWriter {
 
     fn finalize(self) -> io::Result<()> {
         match self {
-            VideoWriter::Avi(w) => w.finalize(),
             VideoWriter::Mkv(w) => w.finalize(),
             VideoWriter::Mp4(w) => w.finalize(),
             VideoWriter::Mov(w) => w.finalize(),
@@ -116,7 +109,6 @@ impl Recorder {
         options: &Options,
         width: u32,
         height: u32,
-        fps: u32,
         state: &SharedRecordState,
     ) -> io::Result<Self> {
         // Момент запроса на запись: первый кадр сайдкара считаем от него.
@@ -127,11 +119,6 @@ impl Recorder {
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
         let format = options.camera.format;
         let (path, mut writer) = match options.camera.dvr.container {
-            ContainerConfig::Avi => {
-                let path = options.dir.join(format!("{stem}.avi"));
-                let writer = AviWriter::create(&path, width, height, fps, *b"MJPG")?;
-                (Some(path), Some(VideoWriter::Avi(writer)))
-            }
             ContainerConfig::Mkv => {
                 let path = options.dir.join(format!("{stem}.mkv"));
                 let writer = MkvWriter::create(&path, width, height)?;
@@ -341,7 +328,7 @@ mod tests {
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Yuyv),
         };
         {
-            let recorder = super::Recorder::start(&options, 64, 48, 30, &state).unwrap();
+            let recorder = super::Recorder::start(&options, 64, 48, &state).unwrap();
             for _ in 0..3 {
                 recorder.push_frame(vec![0u8; 64 * 48 * 4], super::epoch_millis());
             }
@@ -367,11 +354,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // Видеофайл есть (по умолчанию AVI), REC погашен.
+        // Видеофайл есть (контейнер по умолчанию — MKV), REC погашен.
         assert!(
             std::fs::read_dir(&dir)
                 .unwrap()
-                .any(|p| { p.unwrap().path().extension().is_some_and(|e| e == "avi") })
+                .any(|p| { p.unwrap().path().extension().is_some_and(|e| e == "mkv") })
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while state.load().ok && std::time::Instant::now() < deadline {

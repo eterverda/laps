@@ -1,6 +1,6 @@
 //! DVR: запись потока камеры на диск. MJPEG — пасsthrough готовых
 //! JPEG-блобов без перекодировки. YUYV — декодированный RGBA кодируется
-//! в JPEG и пишется в тот же контейнер (AVI/MKV). Один файл на запуск
+//! в JPEG и пишется в тот же контейнер (AVI/MKV/MP4/MOV). Один файл на запуск
 //! камеры, финализация при остановке (по Drop). Рядом пишется сайдкар
 //! `<stem>-frames.yaml`: на каждый кадр — документ `{i, ms}`, где ms —
 //! время с предыдущего кадра на входе записи (для первого — с запроса
@@ -9,6 +9,8 @@
 
 mod avi;
 mod mkv;
+mod mov;
+mod mp4;
 
 use std::io;
 use std::io::Write as _;
@@ -17,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use avi::AviWriter;
 use mkv::MkvWriter;
+use mov::MovWriter;
+use mp4::Mp4Writer;
 
 use super::{RecordState, SharedRecordState};
 use crate::config::camera::{ContainerConfig, PixelConfig};
@@ -26,15 +30,20 @@ use crate::config::camera::{ContainerConfig, PixelConfig};
 enum VideoWriter {
     Avi(AviWriter),
     Mkv(MkvWriter),
+    Mp4(Mp4Writer),
+    Mov(MovWriter),
 }
 
 impl VideoWriter {
     /// `ts_ms` — момент кадра, мс с Unix-эпохи. AVI его игнорирует
-    /// (равномерный таймлайн по fps), MKV пишет как реальный таймкод.
+    /// (равномерный таймлайн по fps); MKV/MP4/MOV пишут как реальный
+    /// таймкод.
     fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> io::Result<()> {
         match self {
             VideoWriter::Avi(w) => w.write_frame(jpeg),
             VideoWriter::Mkv(w) => w.write_frame(jpeg, ts_ms),
+            VideoWriter::Mp4(w) => w.write_frame(jpeg, ts_ms),
+            VideoWriter::Mov(w) => w.write_frame(jpeg, ts_ms),
         }
     }
 
@@ -42,6 +51,8 @@ impl VideoWriter {
         match self {
             VideoWriter::Avi(w) => w.sync_data(),
             VideoWriter::Mkv(w) => w.sync_data(),
+            VideoWriter::Mp4(w) => w.sync_data(),
+            VideoWriter::Mov(w) => w.sync_data(),
         }
     }
 
@@ -49,6 +60,8 @@ impl VideoWriter {
         match self {
             VideoWriter::Avi(w) => w.finalize(),
             VideoWriter::Mkv(w) => w.finalize(),
+            VideoWriter::Mp4(w) => w.finalize(),
+            VideoWriter::Mov(w) => w.finalize(),
         }
     }
 }
@@ -123,6 +136,16 @@ impl Recorder {
                 let path = options.dir.join(format!("{stem}.mkv"));
                 let writer = MkvWriter::create(&path, width, height)?;
                 (Some(path), Some(VideoWriter::Mkv(writer)))
+            }
+            ContainerConfig::Mp4 => {
+                let path = options.dir.join(format!("{stem}.mp4"));
+                let writer = Mp4Writer::create(&path, width, height)?;
+                (Some(path), Some(VideoWriter::Mp4(writer)))
+            }
+            ContainerConfig::Mov => {
+                let path = options.dir.join(format!("{stem}.mov"));
+                let writer = MovWriter::create(&path, width, height)?;
+                (Some(path), Some(VideoWriter::Mov(writer)))
             }
         };
         let frames_path = options.dir.join(format!("{}-frames.yaml", stem));

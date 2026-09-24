@@ -83,6 +83,8 @@ pub enum ContainerConfig {
     #[default]
     Avi,
     Mkv,
+    Mp4,
+    Mov,
 }
 
 impl CameraConfig {

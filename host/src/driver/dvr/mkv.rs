@@ -11,6 +11,8 @@ use std::io::{self, BufWriter, Seek, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use super::VideoWriter;
+
 /// Кластеры режем по таймкодам: внутри кластера SimpleBlock хранит
 /// относительный i16-таймкод, ширина винта ограничивает относительное
 /// смещение ~32767 мс — запас 5 с ни к чему не обязывает.
@@ -174,11 +176,13 @@ impl MkvWriter {
             duration_ms: 0,
         })
     }
+}
 
+impl VideoWriter for MkvWriter {
     /// Пишет один кадр как SimpleBlock с таймкодом ts_ms (мс с Unix-эпохи;
     /// внутри — относительно первого кадра). Кластер открывается при первом
     /// кадре и переключается, когда относительный таймкод уходит за спан.
-    pub fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
+    fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
         let first = *self.first_frame_ts.get_or_insert(ts_ms);
         let rel = ts_ms.saturating_sub(first);
         self.duration_ms = self.duration_ms.max(rel);
@@ -209,14 +213,14 @@ impl MkvWriter {
     }
 
     /// Периодический flush + sync для живучести к крашу.
-    pub fn sync_data(&mut self) -> io::Result<()> {
+    fn sync_data(&mut self) -> io::Result<()> {
         self.writer.flush()?;
         self.writer.get_ref().sync_data()
     }
 
     /// Закрывает кластер, пишет Cues, патчит Duration/SeekHead/Segment,
     /// flush + sync_all.
-    pub fn finalize(mut self) -> io::Result<()> {
+    fn finalize(mut self: Box<Self>) -> io::Result<()> {
         self.close_cluster()?;
 
         // Cues: по CuePoint на кластер; позиции — от начала данных Segment.
@@ -438,7 +442,7 @@ mod tests {
         let path = test_path("header");
         let frames = fake_frames(3);
         {
-            let mut writer = MkvWriter::create(&path, 1920, 1080).unwrap();
+            let mut writer = Box::new(MkvWriter::create(&path, 1920, 1080).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 1_000_000 + i as u64 * 33)
@@ -504,7 +508,7 @@ mod tests {
         let path = test_path("clusters");
         let frames = fake_frames(400); // 400 * 33 мс ≈ 13 с — два переключения
         {
-            let mut writer = MkvWriter::create(&path, 640, 480).unwrap();
+            let mut writer = Box::new(MkvWriter::create(&path, 640, 480).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 5_000_000 + i as u64 * 33)
@@ -574,8 +578,7 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let path = test_path("empty");
-        MkvWriter::create(&path, 640, 480)
-            .unwrap()
+        Box::new(MkvWriter::create(&path, 640, 480).unwrap())
             .finalize()
             .unwrap();
 

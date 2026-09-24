@@ -20,40 +20,15 @@ use mp4::Mp4Writer;
 use super::{RecordState, SharedRecordState};
 use crate::config::camera::{ContainerConfig, PixelConfig};
 
-/// Закрытое множество контейнеров — enum вместо трейта: новый контейнер
-/// добавляется рукой сюда и в Recorder::start, иначе не скомпилируется.
-enum VideoWriter {
-    Mkv(MkvWriter),
-    Mp4(Mp4Writer),
-    Mov(MovWriter),
-}
-
-impl VideoWriter {
-    /// `ts_ms` — момент кадра, мс с Unix-эпохи; пишется как реальный
-    /// таймкод (равномерный таймлайн по fps никто не строит).
-    fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> io::Result<()> {
-        match self {
-            VideoWriter::Mkv(w) => w.write_frame(jpeg, ts_ms),
-            VideoWriter::Mp4(w) => w.write_frame(jpeg, ts_ms),
-            VideoWriter::Mov(w) => w.write_frame(jpeg, ts_ms),
-        }
-    }
-
-    fn sync_data(&mut self) -> io::Result<()> {
-        match self {
-            VideoWriter::Mkv(w) => w.sync_data(),
-            VideoWriter::Mp4(w) => w.sync_data(),
-            VideoWriter::Mov(w) => w.sync_data(),
-        }
-    }
-
-    fn finalize(self) -> io::Result<()> {
-        match self {
-            VideoWriter::Mkv(w) => w.finalize(),
-            VideoWriter::Mp4(w) => w.finalize(),
-            VideoWriter::Mov(w) => w.finalize(),
-        }
-    }
+/// Общий интерфейс контейнеров. `ts_ms` — момент кадра, мс с Unix-эпохи;
+/// пишется как реальный таймкод (равномерный таймлайн по fps никто не
+/// строит). Конструктор `create` — inherent у каждого писателя, трейт
+/// покрывает жизненный цикл записи. `Send`: writer живёт в своём потоке.
+pub(crate) trait VideoWriter: Send {
+    fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> io::Result<()>;
+    fn sync_data(&mut self) -> io::Result<()>;
+    /// Потребляет писателя: таблицы/индекс, патчи заголовков, fsync.
+    fn finalize(self: Box<Self>) -> io::Result<()>;
 }
 
 /// Кодирует RGBA в JPEG. Для YUYV-источников capture-поток уже
@@ -113,22 +88,16 @@ impl Recorder {
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
         let format = options.camera.format;
-        let (path, mut writer) = match options.camera.dvr.container {
-            ContainerConfig::Mkv => {
-                let path = options.dir.join(format!("{stem}.mkv"));
-                let writer = MkvWriter::create(&path, width, height)?;
-                (Some(path), Some(VideoWriter::Mkv(writer)))
-            }
-            ContainerConfig::Mp4 => {
-                let path = options.dir.join(format!("{stem}.mp4"));
-                let writer = Mp4Writer::create(&path, width, height)?;
-                (Some(path), Some(VideoWriter::Mp4(writer)))
-            }
-            ContainerConfig::Mov => {
-                let path = options.dir.join(format!("{stem}.mov"));
-                let writer = MovWriter::create(&path, width, height)?;
-                (Some(path), Some(VideoWriter::Mov(writer)))
-            }
+        let extension = match options.camera.dvr.container {
+            ContainerConfig::Mkv => "mkv",
+            ContainerConfig::Mov => "mov",
+            ContainerConfig::Mp4 => "mp4",
+        };
+        let path = options.dir.join(format!("{stem}.{extension}"));
+        let mut writer: Box<dyn VideoWriter> = match options.camera.dvr.container {
+            ContainerConfig::Mkv => Box::new(MkvWriter::create(&path, width, height)?),
+            ContainerConfig::Mov => Box::new(MovWriter::create(&path, width, height)?),
+            ContainerConfig::Mp4 => Box::new(Mp4Writer::create(&path, width, height)?),
         };
         state.store(RecordState { ok: true, fps: 0.0 });
         let writer_path = path.clone();
@@ -143,29 +112,27 @@ impl Recorder {
             let mut fps_window = Instant::now();
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((data, ts)) = receiver.recv() {
-                if let Some(w) = &mut writer {
-                    let frame = match format {
-                        PixelConfig::Mjpeg => data,
-                        PixelConfig::Yuyv => match encode_rgba_to_jpeg(&data, width, height) {
-                            Ok(jpeg) => jpeg,
-                            Err(e) => {
-                                log::error!("dvr: jpeg encode failed, recording aborted: {}", e);
-                                state_clone.store(RecordState {
-                                    ok: false,
-                                    fps: 0.0,
-                                });
-                                return;
-                            }
-                        },
-                    };
-                    if let Err(e) = w.write_frame(&frame, ts) {
-                        log::error!("dvr: write failed, recording aborted: {}", e);
-                        state_clone.store(RecordState {
-                            ok: false,
-                            fps: 0.0,
-                        });
-                        return;
-                    }
+                let frame = match format {
+                    PixelConfig::Mjpeg => data,
+                    PixelConfig::Yuyv => match encode_rgba_to_jpeg(&data, width, height) {
+                        Ok(jpeg) => jpeg,
+                        Err(e) => {
+                            log::error!("dvr: jpeg encode failed, recording aborted: {}", e);
+                            state_clone.store(RecordState {
+                                ok: false,
+                                fps: 0.0,
+                            });
+                            return;
+                        }
+                    },
+                };
+                if let Err(e) = writer.write_frame(&frame, ts) {
+                    log::error!("dvr: write failed, recording aborted: {}", e);
+                    state_clone.store(RecordState {
+                        ok: false,
+                        fps: 0.0,
+                    });
+                    return;
                 }
                 fps_frames += 1;
                 if fps_window.elapsed() >= Duration::from_millis(500) {
@@ -179,10 +146,8 @@ impl Recorder {
                     fps_window = Instant::now();
                 }
                 if last_sync.elapsed() >= SYNC_INTERVAL {
-                    if let Some(w) = &mut writer {
-                        if let Err(e) = w.sync_data() {
-                            log::error!("dvr: sync failed: {}", e);
-                        }
+                    if let Err(e) = writer.sync_data() {
+                        log::error!("dvr: sync failed: {}", e);
                     }
                     last_sync = Instant::now();
                 }
@@ -193,11 +158,9 @@ impl Recorder {
                 ok: false,
                 fps: 0.0,
             });
-            if let Some(w) = writer {
-                match w.finalize() {
-                    Ok(()) => log::info!("dvr: finalized {:?}", writer_path),
-                    Err(e) => log::error!("dvr: finalize failed for {:?}: {}", writer_path, e),
-                }
+            match writer.finalize() {
+                Ok(()) => log::info!("dvr: finalized {:?}", writer_path),
+                Err(e) => log::error!("dvr: finalize failed for {:?}: {}", writer_path, e),
             }
         });
         log::info!("dvr: recording to {:?}", path);

@@ -82,8 +82,8 @@ pub struct DvrConfig {
 pub enum ContainerConfig {
     #[default]
     Mkv,
-    Mp4,
     Mov,
+    Mp4,
 }
 
 impl CameraConfig {
@@ -307,16 +307,16 @@ mod tests {
         assert_eq!(cam.dvr.container, ContainerConfig::Mkv);
 
         let cam: CameraConfig = serde_yml::from_str(
-            "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mp4\n",
-        )
-        .unwrap();
-        assert_eq!(cam.dvr.container, ContainerConfig::Mp4);
-
-        let cam: CameraConfig = serde_yml::from_str(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mov\n",
         )
         .unwrap();
         assert_eq!(cam.dvr.container, ContainerConfig::Mov);
+
+        let cam: CameraConfig = serde_yml::from_str(
+            "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mp4\n",
+        )
+        .unwrap();
+        assert_eq!(cam.dvr.container, ContainerConfig::Mp4);
 
         assert!(serde_yml::from_str::<CameraConfig>(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: webm\n",

@@ -23,7 +23,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
    │ - webcam (nokhwa)      │  capture thread: MJPEG passthrough /
    │ - dvr (own muxers)     │  YUYV decode → ColorImage slot
    │   MKV (EBML+Cues)      │  recorder: writer thread, MJPEG blobs
-   │   MP4/MOV (ISOBMFF)    │  → container, no re-encode
+   │   MOV/MP4 (ISOBMFF)    │  → container, no re-encode
    └────────────────────────┘
 ```
 
@@ -72,11 +72,13 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   default `mkv`):
   - `mkv` — Matroska/EBML, real per-frame millisecond timestamps
     (TimecodeScale = 1 ms, no fps input), Cues per 5 s cluster, no size limit
-  - `mp4`/`mov` — ISOBMFF; common engine in `dvr/mp4.rs` (MovWriter is a
+  - `mov`/`mp4` — ISOBMFF; common engine in `dvr/mp4.rs` (MovWriter is a
     thin `Flavor::Mov` wrapper), stss lists all frames as sync, co64
     offsets unconditionally, mdat largesize patched at finalize
-  - `VideoWriter` enum in `dvr/mod.rs` — closed set, new container added
-    by hand (exhaustive match, won't compile otherwise)
+  - `VideoWriter` trait in `dvr/mod.rs` (`write_frame` / `sync_data` /
+    `finalize(self: Box<Self>)`) — implemented by all three writers;
+    `create` stays inherent per writer, selection is a `match` on
+    `ContainerConfig` in `Recorder::start`
 - One file per recording start; **no segment rotation** (documented gap)
 - Writer thread + bounded channel (64): overflow = dropped frame + warn
   (capture outranks recording); periodic sync every 5 s; `Drop` detaches
@@ -91,7 +93,7 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 ## Video Playback (planned)
 
-- Own reader (mirrors writers): MKV Cues / MP4-MOV moov tables
+- Own reader (mirrors writers): MKV Cues / MOV-MP4 moov tables
   (stts/stsz/co64) parsed once into memory, `read_at` per frame (no seek),
   **zune-jpeg** decode of a single frame
 - Scrubbing = index lookup + one JPEG decode (~5 ms); every MJPEG frame is

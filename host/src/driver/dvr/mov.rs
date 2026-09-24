@@ -5,6 +5,7 @@
 use std::io;
 use std::path::Path;
 
+use super::VideoWriter;
 use super::mp4::{Flavor, IsobmffCore};
 
 /// Писатель MOV: ftyp(qt  ) + mdat + moov.
@@ -18,18 +19,20 @@ impl MovWriter {
             core: IsobmffCore::create(path, width, height, Flavor::Mov)?,
         })
     }
+}
 
+impl VideoWriter for MovWriter {
     /// `ts_ms` — момент кадра, мс с Unix-эпохи; внутри файла — относительно
     /// первого кадра.
-    pub fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
+    fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
         self.core.write_frame(data, ts_ms)
     }
 
-    pub fn sync_data(&mut self) -> io::Result<()> {
+    fn sync_data(&mut self) -> io::Result<()> {
         self.core.sync_data()
     }
 
-    pub fn finalize(self) -> io::Result<()> {
+    fn finalize(self: Box<Self>) -> io::Result<()> {
         self.core.finalize()
     }
 }
@@ -59,7 +62,7 @@ mod tests {
         let path = test_path("roundtrip");
         let frames = fake_frames(4);
         {
-            let mut writer = MovWriter::create(&path, 1280, 720).unwrap();
+            let mut writer = Box::new(MovWriter::create(&path, 1280, 720).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 7_000_000 + i as u64 * 33)

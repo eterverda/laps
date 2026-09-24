@@ -13,6 +13,8 @@ use std::io::{self, BufWriter, Seek, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+use super::VideoWriter;
+
 /// Таймлайн в миллисекундах: дельты таймкодов пишем без округления.
 const TIMESCALE: u32 = 1000;
 
@@ -24,23 +26,23 @@ const BRAND_QT: [u8; 4] = *b"qt  ";
 /// Вариант контейнера семейства ISOBMFF: отличаются только брендами ftyp.
 #[derive(Clone, Copy)]
 pub(crate) enum Flavor {
-    Mp4,
     Mov,
+    Mp4,
 }
 
 impl Flavor {
     fn major_brand(self) -> [u8; 4] {
         match self {
-            Flavor::Mp4 => BRAND_ISOM,
             Flavor::Mov => BRAND_QT,
+            Flavor::Mp4 => BRAND_ISOM,
         }
     }
 
     fn compat_brands(self) -> &'static [[u8; 4]] {
         match self {
+            Flavor::Mov => &[BRAND_QT],
             // major brand дублируется в compat — так принято у MP4.
             Flavor::Mp4 => &[BRAND_ISOM, BRAND_ISO2, BRAND_MP41],
-            Flavor::Mov => &[BRAND_QT],
         }
     }
 }
@@ -390,18 +392,20 @@ impl Mp4Writer {
             core: IsobmffCore::create(path, width, height, Flavor::Mp4)?,
         })
     }
+}
 
+impl VideoWriter for Mp4Writer {
     /// `ts_ms` — момент кадра, мс с Unix-эпохи; внутри файла — относительно
     /// первого кадра.
-    pub fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
+    fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
         self.core.write_frame(data, ts_ms)
     }
 
-    pub fn sync_data(&mut self) -> io::Result<()> {
+    fn sync_data(&mut self) -> io::Result<()> {
         self.core.sync_data()
     }
 
-    pub fn finalize(self) -> io::Result<()> {
+    fn finalize(self: Box<Self>) -> io::Result<()> {
         self.core.finalize()
     }
 }
@@ -542,7 +546,7 @@ mod tests {
         let path = test_path("roundtrip");
         let frames = fake_frames(3);
         {
-            let mut writer = Mp4Writer::create(&path, 1920, 1080).unwrap();
+            let mut writer = Box::new(Mp4Writer::create(&path, 1920, 1080).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 1_000_000 + i as u64 * 33)
@@ -605,7 +609,7 @@ mod tests {
         let rel = [0u64, 33, 67, 100, 150];
         let frames = fake_frames(rel.len());
         {
-            let mut writer = Mp4Writer::create(&path, 640, 480).unwrap();
+            let mut writer = Box::new(Mp4Writer::create(&path, 640, 480).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer.write_frame(frame, 5_000_000 + rel[i]).unwrap();
             }
@@ -632,8 +636,7 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let path = test_path("empty");
-        Mp4Writer::create(&path, 640, 480)
-            .unwrap()
+        Box::new(Mp4Writer::create(&path, 640, 480).unwrap())
             .finalize()
             .unwrap();
 

@@ -24,6 +24,7 @@ lazy-regex = "3.6.1"
 memchr = "2"
 rand = "0.9"
 zune-jpeg = "0.5"
+jpeg-encoder = "0.6"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-avfoundation"] }
@@ -39,6 +40,9 @@ nokhwa = { version = "0.10.11", default-features = false, features = ["input-msm
 opt-level = 2
 
 [profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.jpeg-encoder]
 opt-level = 3
 
 [profile.dev.package.zune-core]

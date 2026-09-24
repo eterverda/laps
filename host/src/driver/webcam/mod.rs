@@ -10,7 +10,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// nokhwa на V4L2 отдаёт `frame_raw()` — это весь mmap-буфер (его ёмкость,
 /// равная размеру несжатого кадра), а не реальную длину кадра: драйвер
@@ -27,6 +27,30 @@ fn trim_mjpeg(frame: &[u8]) -> Option<&[u8]> {
     };
     let end = memchr::memmem::find(&frame[start..], b"\xff\xd9")? + start + 2;
     Some(&frame[start..end])
+}
+
+/// HARD HACK / ДИСКЛЕЙМЕР. macOS (AVFoundation) часто открывает камеру на
+/// 60 fps, даже когда в настройках запрошено 30 fps. Вместо форка биндингов
+/// nokhwa мы дропаем кадры прямо в capture-потоке, но только на пути в DVR
+/// и только при целевом fps == 30. Live view продолжает обновляться на
+/// полном fps камеры. Интервал 25 мс (а не 33.3 мс) выбран так, чтобы при
+/// ровном 60 fps источника записывался примерно каждый второй кадр, то есть
+/// ~30 fps, не боясь пограничного джиттера.
+const RECORD_THROTTLE_30FPS: Duration = Duration::from_millis(25);
+
+/// Возвращает true, если кадр нужно отправить в DVR. Для целевого 30 fps
+/// дропаем кадры, пришедшие быстрее 25 мс после последнего записанного;
+/// для остальных fps каждый кадр проходит.
+fn should_record_frame(fps: u32, last_recorded_frame: &mut Instant) -> bool {
+    if fps != 30 {
+        return true;
+    }
+    if last_recorded_frame.elapsed() >= RECORD_THROTTLE_30FPS {
+        *last_recorded_frame = Instant::now();
+        true
+    } else {
+        false
+    }
 }
 
 type ImageSlot = Arc<Mutex<Option<egui::ColorImage>>>;
@@ -263,15 +287,19 @@ impl Webcam {
             let width = fmt.resolution().width();
             let height = fmt.resolution().height();
             let frame_format = fmt.format();
-            let fps = fmt.frame_rate();
+            // The camera may open at a higher frame rate than requested (e.g. 60 fps
+            // when 30 was asked for). Keep the negotiated stream as-is and drop excess
+            // frames below so recording/display run at the requested rate.
+            let fps = matched_fmt.frame_rate();
 
             // Recorder появляется и исчезает по командам из UI.
             let mut recorder: Option<crate::driver::dvr::Recorder> = None;
 
-            // Счётчик непрерывных ошибок захвата: nokhwa не отличает
-            // транзиентный сбой от отвала устройства (всё — ReadFrameError),
+            // Для определения ошибки захвата используем не счётчик,
+            // потому что frame() может виснуть на несколько секунд,
             // поэтому критерий — время без единого кадра.
             let mut errors_since: Option<std::time::Instant> = None;
+            let mut last_recorded_frame = Instant::now();
 
             loop {
                 if !running_clone.load(Ordering::Relaxed) {
@@ -314,14 +342,20 @@ impl Webcam {
                 // MJPEG пишем до декода: кадр валиден сам по себе (SOI..EOI),
                 // а декод может отказать на кадре, который ffmpeg/GStreamer
                 // съели бы — экранный дроп не должен терять кадр в DVR.
+                // При целевом 30 fps дропаем кадры, пришедшие быстрее 25 мс
+                // (см. HARD HACK выше), чтобы не писать 60 fps с камеры.
                 if frame_format == nokhwa::utils::FrameFormat::MJPEG {
                     if let Some(recorder) = &recorder {
-                        match trim_mjpeg(&raw) {
-                            Some(frame) => {
-                                recorder
-                                    .push_frame(frame.to_vec(), crate::driver::dvr::epoch_millis());
+                        if should_record_frame(fps, &mut last_recorded_frame) {
+                            match trim_mjpeg(&raw) {
+                                Some(frame) => {
+                                    recorder.push_frame(
+                                        frame.to_vec(),
+                                        crate::driver::dvr::epoch_millis(),
+                                    );
+                                }
+                                None => log::warn!("dvr: frame without EOI, skipped"),
                             }
-                            None => log::warn!("dvr: frame without EOI, skipped"),
                         }
                     }
                 }
@@ -338,12 +372,15 @@ impl Webcam {
                     }
                 };
 
-                // YUYV в DVR уходит декодированным RGBA — дальше по треду
-                // пока ничего не происходит (заглушка до JPEG-энкодера).
+                // YUYV в DVR уходит декодированным RGBA. При целевом 30 fps
+                // дропаем кадры, пришедшие быстрее 25 мс, чтобы не писать 60 fps
+                // с камеры (см. HARD HACK выше). Live view всё равно обновляется.
                 if frame_format != nokhwa::utils::FrameFormat::MJPEG {
                     if let Some(recorder) = &recorder {
-                        let rgba: &[u8] = bytemuck::cast_slice(&image.pixels);
-                        recorder.push_frame(rgba.to_vec(), crate::driver::dvr::epoch_millis());
+                        if should_record_frame(fps, &mut last_recorded_frame) {
+                            let rgba: &[u8] = bytemuck::cast_slice(&image.pixels);
+                            recorder.push_frame(rgba.to_vec(), crate::driver::dvr::epoch_millis());
+                        }
                     }
                 }
 

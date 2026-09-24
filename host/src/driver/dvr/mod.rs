@@ -1,11 +1,10 @@
 //! DVR: запись потока камеры на диск. MJPEG — пасsthrough готовых
-//! JPEG-блобов без перекодировки, контейнер — AVI или MKV (настройка
-//! камеры). YUYV — заглушка: JPEG-энкодера пока нет, буферы дропаются,
-//! но поток кадров, fps и сайдкар работают как для MJPEG. Один файл на
-//! запуск камеры, финализация при остановке (по Drop). Рядом пишется
-//! сайдкар `<stem>-frames.yaml`: на каждый кадр — документ `{i, ms}`,
-//! где ms — время с предыдущего кадра на входе записи (для первого — с
-//! запроса на запись). RecordState целиком принадлежит writer-потоку
+//! JPEG-блобов без перекодировки. YUYV — декодированный RGBA кодируется
+//! в JPEG и пишется в тот же контейнер (AVI/MKV). Один файл на запуск
+//! камеры, финализация при остановке (по Drop). Рядом пишется сайдкар
+//! `<stem>-frames.yaml`: на каждый кадр — документ `{i, ms}`, где ms —
+//! время с предыдущего кадра на входе записи (для первого — с запроса
+//! на запись). RecordState целиком принадлежит writer-потоку
 //! (старт/окна fps/ошибка/выход) — вторых писателей быть не должно.
 
 mod avi;
@@ -54,6 +53,24 @@ impl VideoWriter {
     }
 }
 
+/// Кодирует RGBA в JPEG. Для YUYV-источников capture-поток уже
+/// декодировал кадр в RGBA; здесь он готовится к записи в MJPEG-контейнер.
+const JPEG_QUALITY: u8 = 60;
+
+fn encode_rgba_to_jpeg(rgba: &[u8], width: u32, height: u32) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let encoder = jpeg_encoder::Encoder::new(&mut buf, JPEG_QUALITY);
+    encoder
+        .encode(
+            rgba,
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgba,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("jpeg encode: {e}")))?;
+    Ok(buf)
+}
+
 /// Каталог записей по умолчанию, относительно рабочей директории.
 pub const CAPTURES_DIR: &str = "captures";
 
@@ -95,22 +112,18 @@ impl Recorder {
         let stem = format!("{}-rec-{}", timestamp_prefix(), options.camera_id);
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
-        // YUYV: видеофайла нет — JPEG-энкодера пока нет, пишем только
-        // сайдкар и считаем fps.
-        let (path, mut writer) = match options.camera.format {
-            PixelConfig::Mjpeg => match options.camera.dvr.container {
-                ContainerConfig::Avi => {
-                    let path = options.dir.join(format!("{stem}.avi"));
-                    let writer = AviWriter::create(&path, width, height, fps, *b"MJPG")?;
-                    (Some(path), Some(VideoWriter::Avi(writer)))
-                }
-                ContainerConfig::Mkv => {
-                    let path = options.dir.join(format!("{stem}.mkv"));
-                    let writer = MkvWriter::create(&path, width, height)?;
-                    (Some(path), Some(VideoWriter::Mkv(writer)))
-                }
-            },
-            PixelConfig::Yuyv => (None, None),
+        let format = options.camera.format;
+        let (path, mut writer) = match options.camera.dvr.container {
+            ContainerConfig::Avi => {
+                let path = options.dir.join(format!("{stem}.avi"));
+                let writer = AviWriter::create(&path, width, height, fps, *b"MJPG")?;
+                (Some(path), Some(VideoWriter::Avi(writer)))
+            }
+            ContainerConfig::Mkv => {
+                let path = options.dir.join(format!("{stem}.mkv"));
+                let writer = MkvWriter::create(&path, width, height)?;
+                (Some(path), Some(VideoWriter::Mkv(writer)))
+            }
         };
         let frames_path = options.dir.join(format!("{}-frames.yaml", stem));
         let mut frames_file = io::BufWriter::new(std::fs::File::create(&frames_path)?);
@@ -137,11 +150,25 @@ impl Recorder {
             // в канале.
             let mut fps_frames = 0u32;
             let mut fps_window = Instant::now();
-            let mut warned_drop = false;
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((data, ts)) = receiver.recv() {
                 if let Some(w) = &mut writer {
-                    if let Err(e) = w.write_frame(&data, ts) {
+                    let frame = match format {
+                        PixelConfig::Mjpeg => data,
+                        PixelConfig::Yuyv => match encode_rgba_to_jpeg(&data, width, height) {
+                            Ok(jpeg) => jpeg,
+                            Err(e) => {
+                                log::error!("dvr: jpeg encode failed, recording aborted: {}", e);
+                                state_clone.store(RecordState {
+                                    ok: false,
+                                    fps: 0.0,
+                                });
+                                let _ = writeln!(frames_file, "...");
+                                return;
+                            }
+                        },
+                    };
+                    if let Err(e) = w.write_frame(&frame, ts) {
                         log::error!("dvr: write failed, recording aborted: {}", e);
                         state_clone.store(RecordState {
                             ok: false,
@@ -150,9 +177,6 @@ impl Recorder {
                         let _ = writeln!(frames_file, "...");
                         return;
                     }
-                } else if !warned_drop {
-                    log::warn!("dvr: yuyv recording not implemented yet, frames dropped");
-                    warned_drop = true;
                 }
                 if let Err(e) = writeln!(
                     frames_file,
@@ -175,10 +199,8 @@ impl Recorder {
                     // Пустое окно (пауза кадров) не затирает последнее
                     // известное значение.
                     if fps_frames > 0 {
-                        state_clone.store(RecordState {
-                            ok: true,
-                            fps: fps_frames as f32 / fps_window.elapsed().as_secs_f32(),
-                        });
+                        let fps = fps_frames as f32 / fps_window.elapsed().as_secs_f32();
+                        state_clone.store(RecordState { ok: true, fps });
                     }
                     fps_frames = 0;
                     fps_window = Instant::now();
@@ -209,10 +231,7 @@ impl Recorder {
                 }
             }
         });
-        match &path {
-            Some(p) => log::info!("dvr: recording to {:?}", p),
-            None => log::info!("dvr: recording without video file (yuyv stub)"),
-        }
+        log::info!("dvr: recording to {:?}", path);
         Ok(Self {
             state: state.clone(),
             sender: Some(sender),
@@ -325,13 +344,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // Видеофайла нет, REC погашен.
-        assert!(std::fs::read_dir(&dir).unwrap().all(|p| {
-            !p.unwrap()
-                .path()
-                .extension()
-                .is_some_and(|e| e == "avi" || e == "mkv")
-        }));
+        // Видеофайл есть (по умолчанию AVI), REC погашен.
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .any(|p| { p.unwrap().path().extension().is_some_and(|e| e == "avi") })
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while state.load().ok && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));

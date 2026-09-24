@@ -134,10 +134,11 @@ pub fn run() {
             .with_inner_size((1280.0, 720.0))
             .with_min_inner_size((960.0, 540.0))
             .with_icon(egui::IconData::default())
-            .with_title_shown(false)
-            .with_titlebar_shown(false)
+            .with_title("LAPS")
+            .with_title_shown(true)
+            .with_titlebar_shown(true)
             .with_titlebar_buttons_shown(true)
-            .with_fullsize_content_view(true),
+            .with_fullsize_content_view(false),
         ..Default::default()
     };
 

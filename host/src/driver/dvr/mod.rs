@@ -9,16 +9,28 @@ mod mkv;
 mod mov;
 mod mp4;
 
+use crossbeam_utils::atomic::AtomicCell;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mkv::MkvWriter;
 use mov::MovWriter;
 use mp4::Mp4Writer;
 
-use super::{RecordState, SharedRecordState};
 use crate::config::camera::{ContainerConfig, PixelConfig};
+
+/// Состояние записи: writer жив и пишет на диск.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecordState {
+    pub ok: bool,
+    /// Скользящий fps фактически пишущихся кадров (окно ~0.5 с).
+    pub fps: f32,
+}
+
+/// Общий для потока и UI хэндл состояния записи.
+pub type SharedRecordState = Arc<AtomicCell<RecordState>>;
 
 /// Общий интерфейс контейнеров. `ts_ms` — момент кадра, мс с Unix-эпохи;
 /// пишется как реальный таймкод (равномерный таймлайн по fps никто не
@@ -233,8 +245,8 @@ mod tests {
     /// умолчанию (MKV); REC гаснет по выходу writer-потока.
     #[test]
     fn yuyv_reencode_records_to_container() {
+        use super::{RecordState, SharedRecordState};
         use crate::config::camera::{CameraConfig, PixelConfig};
-        use crate::driver::{RecordState, SharedRecordState};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
 

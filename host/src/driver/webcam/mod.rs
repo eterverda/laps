@@ -2,13 +2,27 @@ use self::decode::Error as DecodeError;
 pub mod decode;
 
 use crate::config::camera::{CameraConfig, PixelConfig};
-use crate::driver::{CameraState, RecordState, SharedCameraState, SharedRecordState};
+use crate::driver::dvr::{RecordState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraInfo, RequestedFormat, RequestedFormatType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Состояние камеры (capture-потока).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraState {
+    /// Поток жив, идёт инициализация (перебор устройств, открытие стрима).
+    Starting,
+    /// Стрим открыт, кадры идут.
+    Live,
+    /// Поток мёртв: камера не найдена, открытие не удалось или отвал.
+    Dead,
+}
+
+/// Общий для потока и UI хэндл состояния камеры.
+pub type SharedCameraState = Arc<AtomicCell<CameraState>>;
 use std::time::{Duration, Instant};
 
 /// nokhwa на V4L2 отдаёт `frame_raw()` — это весь mmap-буфер (его ёмкость,

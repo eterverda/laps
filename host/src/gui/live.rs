@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
-use crate::driver::CameraState;
+use crate::driver::webcam::CameraState;
 use crate::model::pilot::Pilot;
 use std::collections::HashMap;
 

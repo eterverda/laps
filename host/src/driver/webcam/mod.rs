@@ -44,15 +44,9 @@ fn start_recorder(
     width: u32,
     height: u32,
     fps: u32,
-    frame_format: nokhwa::utils::FrameFormat,
     state: &SharedRecordState,
 ) -> Option<crate::driver::dvr::Recorder> {
-    if frame_format != nokhwa::utils::FrameFormat::MJPEG {
-        // Запись — пасsthrough MJPEG; YUYV требовал бы JPEG-кодирования.
-        log::error!("dvr: unsupported frame format {frame_format}, recording needs MJPEG");
-        return None;
-    }
-    // Контейнер выбирается внутри Recorder::start из настроек камеры.
+    // Формат и контейнер ветвятся внутри Recorder::start.
     let result = crate::driver::dvr::Recorder::start(options, width, height, fps, state);
     match result {
         Ok(recorder) => Some(recorder),
@@ -274,10 +268,6 @@ impl Webcam {
             // Recorder появляется и исчезает по командам из UI.
             let mut recorder: Option<crate::driver::dvr::Recorder> = None;
 
-            // Счётчик пишущихся кадров: fps показываем в UI (окно ~0.5 с).
-            let mut rec_frames = 0u32;
-            let mut rec_window = std::time::Instant::now();
-
             // Счётчик непрерывных ошибок захвата: nokhwa не отличает
             // транзиентный сбой от отвала устройства (всё — ReadFrameError),
             // поэтому критерий — время без единого кадра.
@@ -294,26 +284,10 @@ impl Webcam {
                 for cmd in commands_rx.try_iter() {
                     match cmd {
                         Command::StartRecording(options) => {
-                            recorder = start_recorder(
-                                &options,
-                                width,
-                                height,
-                                fps,
-                                frame_format,
-                                &record_clone,
-                            );
-                            // Окно замера сбрасываем: fps считаем от старта
-                            // записи, иначе первое окно тянет elapsed со
-                            // старта потока и даёт мгновенный "0 fps".
-                            rec_frames = 0;
-                            rec_window = std::time::Instant::now();
+                            recorder = start_recorder(&options, width, height, fps, &record_clone);
                         }
                         Command::StopRecording => {
                             recorder = None; // drop: writer finalize'ит в фоне
-                            record_clone.store(RecordState {
-                                ok: false,
-                                fps: 0.0,
-                            });
                         }
                     }
                 }
@@ -337,28 +311,18 @@ impl Webcam {
                     }
                 };
 
-                // Запись идёт до декода: кадр валиден сам по себе (SOI..EOI),
+                // MJPEG пишем до декода: кадр валиден сам по себе (SOI..EOI),
                 // а декод может отказать на кадре, который ffmpeg/GStreamer
                 // съели бы — экранный дроп не должен терять кадр в DVR.
-                if let Some(recorder) = &recorder {
-                    match trim_mjpeg(&raw) {
-                        Some(frame) => {
-                            recorder.push_frame(frame.to_vec(), crate::driver::dvr::epoch_millis());
-                            rec_frames += 1;
-                            if rec_window.elapsed() >= Duration::from_millis(500) {
-                                // Пустое окно (старт, пауза кадров) не
-                                // затирает последнее известное значение.
-                                if rec_frames > 0 {
-                                    record_clone.store(RecordState {
-                                        ok: true,
-                                        fps: rec_frames as f32 / rec_window.elapsed().as_secs_f32(),
-                                    });
-                                }
-                                rec_frames = 0;
-                                rec_window = std::time::Instant::now();
+                if frame_format == nokhwa::utils::FrameFormat::MJPEG {
+                    if let Some(recorder) = &recorder {
+                        match trim_mjpeg(&raw) {
+                            Some(frame) => {
+                                recorder
+                                    .push_frame(frame.to_vec(), crate::driver::dvr::epoch_millis());
                             }
+                            None => log::warn!("dvr: frame without EOI, skipped"),
                         }
-                        None => log::warn!("dvr: frame without EOI, skipped"),
                     }
                 }
 
@@ -374,18 +338,23 @@ impl Webcam {
                     }
                 };
 
+                // YUYV в DVR уходит декодированным RGBA — дальше по треду
+                // пока ничего не происходит (заглушка до JPEG-энкодера).
+                if frame_format != nokhwa::utils::FrameFormat::MJPEG {
+                    if let Some(recorder) = &recorder {
+                        let rgba: &[u8] = bytemuck::cast_slice(&image.pixels);
+                        recorder.push_frame(rgba.to_vec(), crate::driver::dvr::epoch_millis());
+                    }
+                }
+
                 *slot_clone.lock().unwrap() = Some(image);
                 on_frame();
             }
 
-            // Поток умирает (штатный стоп или потеря камеры) — гасим
-            // индикаторы, иначе CAM/REC висят белым/красным на мёртвой
-            // картинке.
+            // Поток умирает (штатный стоп или потеря камеры) — гасим CAM,
+            // иначе индикатор висит белым на мёртвой картинке. REC гаснет
+            // сам: writer-поток — единственный владелец RecordState.
             state_clone.store(CameraState::Dead);
-            record_clone.store(RecordState {
-                ok: false,
-                fps: 0.0,
-            });
 
             if let Err(e) = camera.stop_stream() {
                 log::error!("failed to stop stream: {}", e);

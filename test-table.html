@@ -41,6 +41,80 @@
                 align-items: center;
                 justify-content: center;
                 overflow: hidden;
+                transition: transform 0.35s ease, opacity 0.35s ease;
+            }
+            .cell.q1 {
+                transform-origin: top left;
+            }
+            .cell.q2 {
+                transform-origin: top right;
+            }
+            .cell.q3 {
+                transform-origin: bottom left;
+            }
+            .cell.q4 {
+                transform-origin: bottom right;
+            }
+
+            /* Режим одиночного квадранта: выбранный cell зумится scale(2)
+               из своего угла и заполняет весь aspect-box, остальные тают.
+               Шрифты и рамки масштабируются трансформом сами. */
+            #aspect-box.single .cell {
+                opacity: 0;
+                pointer-events: none;
+            }
+            #aspect-box.single .cell.zoomed {
+                opacity: 1;
+                pointer-events: auto;
+                transform: scale(2);
+                z-index: 2;
+            }
+
+            /* Кнопки-контролы поверх таблицы: слева — переключение видов
+               (всегда), справа — фуллскрин/закрытие (только когда страницу
+               открыл нативный хост, см. host-controls в скрипте). */
+            .ctrl-btn {
+                width: 32px;
+                height: 32px;
+                padding: 0;
+                border: none;
+                border-radius: 6px;
+                background: transparent;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            .ctrl-btn:hover {
+                background: rgba(70, 70, 70, 0.85);
+            }
+            .ctrl-btn:focus {
+                outline: none;
+            }
+            .ctrl-btn svg {
+                width: 18px;
+                height: 18px;
+                display: block;
+            }
+
+            #view-btn {
+                position: fixed;
+                top: 8px;
+                left: 8px;
+                z-index: 10;
+            }
+
+            /* По умолчанию скрыты: показывает их только нативный хост. */
+            #host-controls {
+                position: fixed;
+                top: 8px;
+                right: 8px;
+                z-index: 10;
+                display: none;
+                gap: 6px;
+            }
+            #host-controls.shown {
+                display: flex;
             }
 
             .waves {
@@ -130,12 +204,19 @@
                 font-size: 1.8vw;
                 color: #fff;
             }
+
+
         </style>
     </head>
     <body>
+        <button id="view-btn" class="ctrl-btn" title="View: all quadrants"></button>
+        <div id="host-controls">
+            <button id="fs-btn" class="ctrl-btn" title="Fullscreen"></button>
+            <button id="close-btn" class="ctrl-btn" title="Close"></button>
+        </div>
         <div id="container">
             <div id="aspect-box">
-                <div class="cell">
+                <div class="cell q1">
                     <canvas class="waves"></canvas>
                     <div class="dashed-16 red"></div>
                     <div class="solid-43 red">
@@ -145,7 +226,7 @@
                         </div>
                     </div>
                 </div>
-                <div class="cell">
+                <div class="cell q2">
                     <canvas class="waves"></canvas>
                     <div class="dashed-16 blue"></div>
                     <div class="solid-43 blue">
@@ -155,7 +236,7 @@
                         </div>
                     </div>
                 </div>
-                <div class="cell">
+                <div class="cell q3">
                     <canvas class="waves"></canvas>
                     <div class="dashed-16 green"></div>
                     <div class="solid-43 green">
@@ -165,7 +246,7 @@
                         </div>
                     </div>
                 </div>
-                <div class="cell">
+                <div class="cell q4">
                     <canvas class="waves"></canvas>
                     <div class="dashed-16 yellow"></div>
                     <div class="solid-43 yellow">
@@ -208,7 +289,10 @@
                 const YAW = yaw;
 
                 function resize() {
-                    const dpr = window.devicePixelRatio || 1;
+                    // В зуме cell масштабируется CSS-трансформом — рисуем
+                    // канвас с удвоенным разрешением, чтобы точки не плыли.
+                    const zoom = canvas.closest(".cell").classList.contains("zoomed") ? 2 : 1;
+                    const dpr = (window.devicePixelRatio || 1) * zoom;
                     w = canvas.clientWidth;
                     h = canvas.clientHeight;
                     canvas.width = Math.round(w * dpr);
@@ -273,7 +357,52 @@
                     ctx.globalAlpha = 1;
                 }
 
-                return draw;
+                return { draw, resize };
+            }
+
+            // Иконки режимов вида: мини-табличка 2x2 и цифры 1..4 в квадрате
+            // (контуры цифр — из FiraCode Nerd Font Mono Bold).
+            const VIEW_SVGS = (() => {
+                const DIGIT_PATHS = {
+                    1: "M10.72 10.46V11.75H5.84V10.46H7.65V5.93L6.11 6.9L5.38 5.72L7.8 4.25H9.31V10.46Z",
+                    2: "M7.74 4.06Q8.6 4.06 9.17 4.36Q9.75 4.66 10.04 5.15Q10.33 5.64 10.33 6.21Q10.33 6.66 10.17 7.1Q10.02 7.53 9.67 8.02Q9.31 8.5 8.73 9.09Q8.15 9.68 7.3 10.45H10.5L10.32 11.75H5.33V10.54Q6.26 9.65 6.88 9.0Q7.51 8.36 7.88 7.89Q8.26 7.42 8.42 7.06Q8.58 6.7 8.58 6.36Q8.58 5.91 8.32 5.64Q8.06 5.38 7.58 5.38Q7.15 5.38 6.84 5.55Q6.52 5.73 6.23 6.13L5.18 5.34Q5.6 4.76 6.22 4.41Q6.84 4.06 7.74 4.06Z",
+                    3: "M7.7 4.06Q8.51 4.06 9.08 4.32Q9.65 4.59 9.95 5.02Q10.25 5.46 10.25 5.98Q10.25 6.7 9.83 7.14Q9.41 7.58 8.72 7.78Q9.49 7.88 9.99 8.31Q10.49 8.73 10.49 9.64Q10.49 10.27 10.14 10.79Q9.79 11.31 9.14 11.62Q8.49 11.93 7.59 11.93Q6.75 11.93 6.08 11.64Q5.42 11.34 4.95 10.81L5.91 9.91Q6.24 10.28 6.63 10.45Q7.03 10.62 7.48 10.62Q8.03 10.62 8.38 10.34Q8.74 10.06 8.74 9.52Q8.74 8.93 8.4 8.66Q8.07 8.4 7.46 8.4H6.78L6.98 7.22H7.46Q7.96 7.22 8.28 6.98Q8.6 6.73 8.6 6.24Q8.6 5.82 8.29 5.58Q7.99 5.33 7.51 5.33Q7.06 5.33 6.69 5.51Q6.33 5.68 6.01 5.98L5.13 5.07Q5.65 4.57 6.28 4.32Q6.92 4.06 7.7 4.06Z",
+                    4: "M9.99 7.09V8.89H10.74V10.18H9.99V11.75H8.35L8.34 10.18H5.23V9.04L7.32 4.06L8.77 4.6L7.0 8.89H8.35L8.55 7.09Z",
+                };
+                const HEAD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">';
+                const grid =
+                    HEAD +
+                    '<path d="M3 3 H13 V13 H3 Z M8 3 V13 M3 8 H13" stroke="#eee" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>';
+                const digit = (n) =>
+                    HEAD +
+                    '<path d="M3 3 H13 V13 H3 Z" stroke="#eee" stroke-width="1.5" stroke-linejoin="round" fill="none"/>' +
+                    `<path d="${DIGIT_PATHS[n]}" fill="#eee"/></svg>`;
+                return [grid, digit(1), digit(2), digit(3), digit(4)];
+            })();
+
+            // Переключение видов: 0 — все четыре квадранта; 1..4 — один квадрант.
+            // Клик по кнопке и хоткеи хоста (setView/cycleView ниже) идут сюда.
+            // Переходы анимированы: квадрант плавно зумится scale(2) из своего
+            // угла (CSS transition на transform/opacity).
+            let viewState = 0;
+            const viewBtn = document.getElementById("view-btn");
+
+            function setView(n) {
+                viewState = n;
+                viewBtn.innerHTML = VIEW_SVGS[n];
+                viewBtn.title = n === 0 ? "View: all quadrants" : `View: quadrant ${n}`;
+                const box = document.getElementById("aspect-box");
+                const cells = box.querySelectorAll(".cell");
+                box.classList.toggle("single", n !== 0);
+                cells.forEach((cell, i) => {
+                    cell.classList.toggle("zoomed", i === n - 1);
+                });
+                // перерендер канвасов под новое разрешение (зум x2 или обратно)
+                for (const layer of waveLayers) layer.resize();
+            }
+
+            function cycleView() {
+                setView((viewState + 1) % 5);
             }
 
             const canvases = document.querySelectorAll(".cell .waves");
@@ -284,6 +413,47 @@
                 createWaves(canvases[3], "#ffbf00", 5.5, -0.58),
             ];
 
+            viewBtn.addEventListener("click", cycleView);
+            viewBtn.innerHTML = VIEW_SVGS[0];
+
+            // Кнопки фуллскрина/закрытия: показываем и вешаем обработчики,
+            // только если страницу открыл нативный хост — он регистрирует
+            // мост window.webkit.messageHandlers.host. В обычном браузере
+            // моста нет, и #host-controls остаются скрытыми.
+            const FS_ENTER_SVG =
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">' +
+                '<path d="M3 6.5 V3 H6.5 M9.5 3 H13 V6.5 M13 9.5 V13 H9.5 M6.5 13 H3 V9.5" stroke="#eee" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>';
+            const FS_EXIT_SVG =
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">' +
+                '<path d="M6.5 3 V6.5 H3 M9.5 3 V6.5 H13 M6.5 13 V9.5 H3 M9.5 13 V9.5 H13" stroke="#eee" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>';
+            const CLOSE_SVG =
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">' +
+                '<path d="M4 4 L12 12 M12 4 L4 12" stroke="#eee" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>';
+
+            const hostBridge =
+                typeof window.webkit !== "undefined" &&
+                window.webkit.messageHandlers &&
+                window.webkit.messageHandlers.host;
+
+            if (hostBridge) {
+                const hostControls = document.getElementById("host-controls");
+                const fsBtn = document.getElementById("fs-btn");
+                const closeBtn = document.getElementById("close-btn");
+                fsBtn.innerHTML = FS_ENTER_SVG;
+                closeBtn.innerHTML = CLOSE_SVG;
+                fsBtn.addEventListener("click", () => hostBridge.postMessage("fullscreen"));
+                closeBtn.addEventListener("click", () => hostBridge.postMessage("close"));
+                hostControls.classList.add("shown");
+
+                // Хост зовёт это при изменении фуллскрина окна (иконка/тултип).
+                window.setFullscreen = (active) => {
+                    fsBtn.innerHTML = active ? FS_EXIT_SVG : FS_ENTER_SVG;
+                    fsBtn.title = active ? "Exit fullscreen" : "Fullscreen";
+                };
+            } else {
+                window.setFullscreen = () => {};
+            }
+
             function update(t) {
                 const now = new Date();
                 const text = formatRFC(now);
@@ -291,7 +461,7 @@
                     const el = document.getElementById("ticker-" + id);
                     if (el) el.textContent = text;
                 });
-                for (const draw of waveLayers) draw(t);
+                for (const layer of waveLayers) layer.draw(t);
                 requestAnimationFrame(update);
             }
             update(performance.now());

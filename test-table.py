@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """test-table: голое окно WebKitGTK с test-table.html.
 
-Обычное окно 1024x768, никакого UI, тёмный фон вебвью сразу (без белой
-вспышки), app-id окна: test-table. Все записи — во временный каталог.
+Обычное окно 1024x768, никакого нативного UI: все кнопки живут в самой
+странице. Кнопки фуллскрина/закрытия страница показывает только при
+наличии нативного моста (window.webkit.messageHandlers.host), который
+мы здесь и регистрируем; в обычном браузере их нет. Тёмный фон вебвью
+сразу (без белой вспышки), app-id окна: test-table. Все записи — во
+временный каталог.
 """
 import os
 import sys
@@ -43,52 +47,25 @@ bg = Gdk.RGBA()
 bg.parse("#1e1e1e")
 web.set_background_color(bg)
 
+# Нативный мост для страницы: window.webkit.messageHandlers.host.
+# Регистрируем ДО загрузки — страница при старте проверяет его наличие
+# и только тогда показывает кнопки фуллскрина/закрытия.
+ucm = web.get_user_content_manager()
+ucm.register_script_message_handler("host")
+
 web.load_uri(PAGE)
 
-# Контролы поверх контента в правом верхнем углу: фуллскрин и закрытие.
-overlay = Gtk.Overlay()
-overlay.set_child(web)
 
-controls = Gtk.Box(spacing=6)
-controls.set_halign(Gtk.Align.END)
-controls.set_valign(Gtk.Align.START)
-controls.set_margin_top(8)
-controls.set_margin_end(8)
-controls.add_css_class("overlay-controls")
+# Все кнопки и состояние видов живут в самой странице (test-table.html);
+# отсюда только дёргаем её функции по горячим клавишам и событиям окна.
+def eval_js(script: str):
+    def _js_done(_wv, res, _ud):
+        try:
+            web.evaluate_javascript_finish(res)
+        except GLib.Error:
+            pass  # страница ещё не загрузилась — останется вид по умолчанию
 
-# Иконки — inline-SVG. Растеризуем с запасом (64x64); Gtk.Image с
-# pixel_size жёстко показывает их как 16x16 — даунскейл чёткий на любом DPI.
-def svg_icon(svg: str) -> Gtk.Image:
-    texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(svg.encode()))
-    img = Gtk.Image.new_from_paintable(texture)
-    img.set_pixel_size(16)
-    return img
-
-
-# Уголки по краям — «развернуть на весь экран».
-FS_ENTER_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 16 16">
-<path d="M3 6.5 V3 H6.5 M9.5 3 H13 V6.5 M13 9.5 V13 H9.5 M6.5 13 H3 V9.5"
- stroke="#eee" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>'''
-# Уголки вершиной внутрь (раскрытием к углам) — «свернуть обратно».
-FS_EXIT_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 16 16">
-<path d="M6.5 3 V6.5 H3 M9.5 3 V6.5 H13 M6.5 13 V9.5 H3 M9.5 13 V9.5 H13"
- stroke="#eee" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>'''
-CLOSE_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 16 16">
-<path d="M4 4 L12 12 M12 4 L4 12"
- stroke="#eee" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>'''
-
-pic_fs_enter = svg_icon(FS_ENTER_SVG)
-pic_fs_exit = svg_icon(FS_EXIT_SVG)
-
-btn_fs = Gtk.Button(child=pic_fs_enter)
-btn_fs.set_tooltip_text("Fullscreen")
-btn_fs.set_size_request(28, 28)
-btn_close = Gtk.Button(child=svg_icon(CLOSE_SVG))
-btn_close.set_tooltip_text("Close")
-btn_close.set_size_request(28, 28)
-controls.append(btn_fs)
-controls.append(btn_close)
-overlay.add_overlay(controls)
+    web.evaluate_javascript(script, -1, None, None, None, _js_done, None)
 
 
 def toggle_fullscreen(*_):
@@ -98,42 +75,65 @@ def toggle_fullscreen(*_):
         win.fullscreen()
 
 
-def on_fullscreen_changed(window, _pspec):
-    if window.is_fullscreen():
-        btn_fs.set_child(pic_fs_exit)
-        btn_fs.set_tooltip_text("Exit fullscreen")
-    else:
-        btn_fs.set_child(pic_fs_enter)
-        btn_fs.set_tooltip_text("Fullscreen")
+def sync_fullscreen_icon():
+    eval_js("setFullscreen(%s);" % ("true" if win.is_fullscreen() else "false"))
 
 
-btn_fs.connect("clicked", toggle_fullscreen)
-btn_close.connect("clicked", lambda *_: win.close())
+def on_fullscreen_changed(_window, _pspec):
+    sync_fullscreen_icon()
+
+
+# Клики по HTML-кнопкам приходят сюда строками: "fullscreen" / "close".
+def on_host_message(_ucm, value):
+    msg = value.to_string()
+    if msg == "fullscreen":
+        toggle_fullscreen()
+    elif msg == "close":
+        win.close()
+
+
+ucm.connect("script-message-received::host", on_host_message)
 win.connect("notify::fullscreened", on_fullscreen_changed)
 
-# Стиль контролов: полупрозрачные тёмные кнопки поверх страницы.
-css = Gtk.CssProvider()
-css.load_from_string("""
-.overlay-controls button {
-    background: transparent;
-    color: #eeeeee;
-    border: none;
-    box-shadow: none;
-    outline: none;
-    border-radius: 6px;
-    padding: 0;
-    min-width: 28px;
-    min-height: 28px;
-    font-size: 16px;
-    line-height: 1;
-}
-.overlay-controls button:hover { background: rgba(70, 70, 70, 0.85); }
-""")
-Gtk.StyleContext.add_provider_for_display(
-    Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-)
 
-win.set_child(overlay)
+# После загрузки страницы синхронизируем иконку фуллскрина с состоянием окна.
+def on_load_changed(_wv, event):
+    if event == WebKit.LoadEvent.FINISHED:
+        sync_fullscreen_icon()
+
+
+web.connect("load-changed", on_load_changed)
+
+
+# Горячие клавиши: Ctrl+1..4 — квадрант, Ctrl+A — все виды, Ctrl+M — следующий
+# режим, Ctrl+F — фуллскрин, Ctrl+Q / Ctrl+W — выход. Русская раскладка
+# учитывается по физическим клавишам: A=ф, M=ь, F=а, Q=й, W=ц.
+# CAPTURE-фаза — перехватываем до того, как клавишу съест WebView.
+def on_key_pressed(_ctrl, keyval, _keycode, state):
+    if not state & Gdk.ModifierType.CONTROL_MASK:
+        return False
+    if Gdk.KEY_1 <= keyval <= Gdk.KEY_4:
+        eval_js(f"setView({keyval - Gdk.KEY_0});")
+    elif keyval in (Gdk.KEY_a, Gdk.KEY_A, Gdk.KEY_Cyrillic_ef, Gdk.KEY_Cyrillic_EF):
+        eval_js("setView(0);")
+    elif keyval in (Gdk.KEY_m, Gdk.KEY_M, Gdk.KEY_Cyrillic_softsign, Gdk.KEY_Cyrillic_SOFTSIGN):
+        eval_js("cycleView();")
+    elif keyval in (Gdk.KEY_f, Gdk.KEY_F, Gdk.KEY_Cyrillic_a, Gdk.KEY_Cyrillic_A):
+        toggle_fullscreen()
+    elif keyval in (Gdk.KEY_q, Gdk.KEY_Q, Gdk.KEY_Cyrillic_shorti, Gdk.KEY_Cyrillic_SHORTI,
+                    Gdk.KEY_w, Gdk.KEY_W, Gdk.KEY_Cyrillic_tse, Gdk.KEY_Cyrillic_TSE):
+        win.close()
+    else:
+        return False
+    return True
+
+
+keys = Gtk.EventControllerKey()
+keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+keys.connect("key-pressed", on_key_pressed)
+win.add_controller(keys)
+
+win.set_child(web)
 win.set_default_size(1024, 768)
 win.present()
 

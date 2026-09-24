@@ -6,7 +6,6 @@ use crate::driver::{CameraState, RecordState, SharedCameraState, SharedRecordSta
 use crossbeam_utils::atomic::AtomicCell;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraInfo, RequestedFormat, RequestedFormatType};
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -151,12 +150,6 @@ pub struct Webcam {
     camera: SharedCameraState,
     record: SharedRecordState,
     commands: crossbeam_channel::Sender<Command>,
-    /// Сайдкар показанных кадров (формат как у rec). None — файл не
-    /// создался, показ продолжается без лога.
-    frames_file: Option<std::io::BufWriter<std::fs::File>>,
-    // ts предыдущего показанного кадра (старт — момент запроса на cam).
-    frames_prev_ts: u64,
-    frames_next: u64,
 }
 
 impl Webcam {
@@ -190,20 +183,7 @@ impl Webcam {
         }
     }
 
-    pub fn start(
-        camera_id: &str,
-        desc: CameraConfig,
-        on_frame: impl Fn() + Send + Sync + 'static,
-    ) -> Self {
-        // Момент запроса на cam: первый кадр сайдкара считаем от него.
-        let start_request_ms = crate::driver::dvr::epoch_millis();
-        let (frames_file, frames_prev_ts) = match Self::create_frames_log(camera_id, &desc) {
-            Ok(file) => (Some(file), start_request_ms),
-            Err(e) => {
-                log::error!("cam frames log unavailable: {}", e);
-                (None, start_request_ms)
-            }
-        };
+    pub fn start(desc: CameraConfig, on_frame: impl Fn() + Send + Sync + 'static) -> Self {
         let slot: ImageSlot = Arc::default();
         let slot_clone = Arc::clone(&slot);
         let running = Arc::new(AtomicBool::new(true));
@@ -407,56 +387,7 @@ impl Webcam {
             camera: state,
             record,
             commands: commands_tx,
-            frames_file,
-            frames_prev_ts,
-            frames_next: 0,
         }
-    }
-
-    /// Создать сайдкар показанных кадров, формат как у rec: каждый кадр
-    /// документом `{i, ms}` (время с предыдущего показанного).
-    fn create_frames_log(
-        camera_id: &str,
-        camera: &CameraConfig,
-    ) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
-        let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!(
-            "{}-cam-{}-frames.yaml",
-            crate::driver::dvr::timestamp_prefix(),
-            camera_id
-        ));
-        log::info!("cam frames log: {:?}", path);
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
-        // Шапка — для читающего файл глазами: спека камеры, семантика полей.
-        writeln!(file, "# camera: {}", camera)?;
-        writeln!(
-            file,
-            "# i — порядковый номер кадра, ms — время с предыдущего кадра в мс (у i=0 — от запроса на cam)"
-        )?;
-        Ok(file)
-    }
-
-    /// Записать интервал показа. Вызывается из UI-потока ровно на
-    /// показанных кадрах (той же выборкой считается shown fps).
-    fn log_shown_frame(&mut self, ts: u64) {
-        let Some(file) = &mut self.frames_file else {
-            return;
-        };
-        // ms — время с предыдущего показанного кадра (у первого — с
-        // запроса на cam).
-        if let Err(e) = writeln!(
-            file,
-            "--- {{i: {}, ms: {}}}",
-            self.frames_next,
-            ts.saturating_sub(self.frames_prev_ts)
-        ) {
-            log::error!("cam frames log failed: {}", e);
-            self.frames_file = None;
-            return;
-        }
-        self.frames_prev_ts = ts;
-        self.frames_next += 1;
     }
 
     /// Забрать новый кадр из слота, если есть, и обновить текстуру.
@@ -468,9 +399,6 @@ impl Webcam {
             guard.take()
         };
         let new_frame = image.is_some();
-        if new_frame {
-            self.log_shown_frame(crate::driver::dvr::epoch_millis());
-        }
 
         if let Some(image) = image {
             match &mut self.texture {
@@ -497,14 +425,6 @@ impl Drop for Webcam {
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
                 log::error!("capture thread panicked");
-            }
-        }
-        // Финализируем сайдкар cam: все кадры задокументированы,
-        // закрываем поток YAML-документов.
-        if let Some(file) = &mut self.frames_file {
-            let _ = writeln!(file, "...");
-            if let Err(e) = file.flush() {
-                log::error!("cam frames log flush failed: {}", e);
             }
         }
     }

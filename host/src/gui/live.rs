@@ -426,7 +426,7 @@ impl Live {
             // per `request_repaint` (outstanding = 1), and the second pass
             // always finds an empty slot. A tiny delay gives a single pass
             // per camera frame.
-            let webcam = crate::driver::webcam::Webcam::start(id, camera.clone(), move || {
+            let webcam = crate::driver::webcam::Webcam::start(camera.clone(), move || {
                 ctx.request_repaint_after(std::time::Duration::from_millis(1));
             });
             self.webcams.insert(id.clone(), webcam);

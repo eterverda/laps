@@ -78,10 +78,6 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   - `VideoWriter` enum in `dvr/mod.rs` — closed set, new container added
     by hand (exhaustive match, won't compile otherwise)
 - One file per recording start; **no segment rotation** (documented gap)
-- Sidecar `<stem>-frames.yaml` per recording AND per live feed: per-frame
-  `--- {i, ms}` documents, ms = time since previous frame at recorder
-  input (first frame — since start request). MKV knows real frame
-  timestamps, but not these two signals.
 - Writer thread + bounded channel (64): overflow = dropped frame + warn
   (capture outranks recording); periodic sync every 5 s; `Drop` detaches
   the thread intentionally (finalize+sync_all in background, no join —
@@ -100,7 +96,6 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   **zune-jpeg** decode of a single frame
 - Scrubbing = index lookup + one JPEG decode (~5 ms); every MJPEG frame is
   a keyframe, no GOP rewinds. Target: faster than VLC, no pipeline flush
-- Sidecar `-frames.yaml` may complement MKV for start-request latency
 
 ## Configuration
 

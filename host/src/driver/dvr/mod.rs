@@ -1,18 +1,15 @@
 //! DVR: запись потока камеры на диск. MJPEG — пасsthrough готовых
 //! JPEG-блобов без перекодировки. YUYV — декодированный RGBA кодируется
 //! в JPEG и пишется в тот же контейнер (MKV/MP4/MOV). Один файл на запуск
-//! камеры, финализация при остановке (по Drop). Рядом пишется сайдкар
-//! `<stem>-frames.yaml`: на каждый кадр — документ `{i, ms}`, где ms —
-//! время с предыдущего кадра на входе записи (для первого — с запроса
-//! на запись). RecordState целиком принадлежит writer-потоку
-//! (старт/окна fps/ошибка/выход) — вторых писателей быть не должно.
+//! камеры, финализация при остановке (по Drop). RecordState целиком
+//! принадлежит writer-потоку (старт/окна fps/ошибка/выход) — вторых
+//! писателей быть не должно.
 
 mod mkv;
 mod mov;
 mod mp4;
 
 use std::io;
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -84,8 +81,8 @@ pub const CAPTURES_DIR: &str = "captures";
 pub struct Options {
     pub dir: PathBuf,
     pub camera_id: String,
-    /// Справочно: для шапки сайдкара и логов. Размеры/fps для записи
-    /// авторитетны из согласованного формата, см. Recorder::start.
+    /// Справочно: для логов. Размеры для записи авторитетны из
+    /// согласованного формата, см. Recorder::start.
     pub camera: crate::config::camera::CameraConfig,
 }
 
@@ -111,10 +108,8 @@ impl Recorder {
         height: u32,
         state: &SharedRecordState,
     ) -> io::Result<Self> {
-        // Момент запроса на запись: первый кадр сайдкара считаем от него.
-        let start_request_ms = epoch_millis();
         std::fs::create_dir_all(&options.dir)?;
-        let stem = format!("{}-rec-{}", timestamp_prefix(), options.camera_id);
+        let stem = format!("{}-{}-mjpeg", timestamp_prefix(), options.camera_id);
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
         let format = options.camera.format;
@@ -135,26 +130,12 @@ impl Recorder {
                 (Some(path), Some(VideoWriter::Mov(writer)))
             }
         };
-        let frames_path = options.dir.join(format!("{}-frames.yaml", stem));
-        let mut frames_file = io::BufWriter::new(std::fs::File::create(&frames_path)?);
-        // Шапка — для читающего файл глазами: спека камеры, семантика полей.
-        writeln!(frames_file, "# camera: {}", options.camera)?;
-        writeln!(
-            frames_file,
-            "# i — порядковый номер кадра, ms — время с предыдущего кадра в мс (у i=0 — от запроса на запись)"
-        )?;
         state.store(RecordState { ok: true, fps: 0.0 });
         let writer_path = path.clone();
         let (sender, receiver) = crossbeam_channel::bounded::<(Vec<u8>, u64)>(CHANNEL_CAP);
         let state_clone = state.clone();
         let thread = std::thread::spawn(move || {
             let mut last_sync = Instant::now();
-            // ms кадра — время с предыдущего на входе записи (у первого —
-            // с start_request_ms), документ пишется при приходе кадра. i
-            // совпадает с порядком в контейнере: сюда доходят только
-            // реально записанные кадры.
-            let mut frame_no: u64 = 0;
-            let mut prev_ts = start_request_ms;
             // Замер пишущихся кадров для UI (окно ~0.5 с): это второй,
             // независимый от capture-потока счётчик — отражает потери
             // в канале.
@@ -173,7 +154,6 @@ impl Recorder {
                                     ok: false,
                                     fps: 0.0,
                                 });
-                                let _ = writeln!(frames_file, "...");
                                 return;
                             }
                         },
@@ -184,26 +164,9 @@ impl Recorder {
                             ok: false,
                             fps: 0.0,
                         });
-                        let _ = writeln!(frames_file, "...");
                         return;
                     }
                 }
-                if let Err(e) = writeln!(
-                    frames_file,
-                    "--- {{i: {}, ms: {}}}",
-                    frame_no,
-                    ts.saturating_sub(prev_ts)
-                ) {
-                    log::error!("dvr: frames sidecar failed, recording aborted: {}", e);
-                    state_clone.store(RecordState {
-                        ok: false,
-                        fps: 0.0,
-                    });
-                    let _ = writeln!(frames_file, "...");
-                    return;
-                }
-                prev_ts = ts;
-                frame_no += 1;
                 fps_frames += 1;
                 if fps_window.elapsed() >= Duration::from_millis(500) {
                     // Пустое окно (пауза кадров) не затирает последнее
@@ -224,16 +187,12 @@ impl Recorder {
                     last_sync = Instant::now();
                 }
             }
-            // Канал закрыт: все кадры задокументированы. REC гасим до
-            // (медленного) fsync, чтобы индикатор не висел.
+            // Канал закрыт. REC гасим до (медленного) fsync, чтобы
+            // индикатор не висел.
             state_clone.store(RecordState {
                 ok: false,
                 fps: 0.0,
             });
-            let _ = writeln!(frames_file, "...");
-            if let Err(e) = frames_file.flush() {
-                log::error!("dvr: frames sidecar flush failed: {}", e);
-            }
             if let Some(w) = writer {
                 match w.finalize() {
                     Ok(()) => log::info!("dvr: finalized {:?}", writer_path),
@@ -307,10 +266,10 @@ mod tests {
         );
     }
 
-    /// YUYV-заглушка: видеофайла нет, сайдкар пишется, состояние гаснет
-    /// по выходу writer-потока.
+    /// YUYV: RGBA перекодируется в JPEG и пишется в контейнер по
+    /// умолчанию (MKV); REC гаснет по выходу writer-потока.
     #[test]
-    fn yuyv_stub_records_sidecar_only() {
+    fn yuyv_reencode_records_to_container() {
         use crate::config::camera::{CameraConfig, PixelConfig};
         use crate::driver::{RecordState, SharedRecordState};
         use crossbeam_utils::atomic::AtomicCell;
@@ -332,39 +291,34 @@ mod tests {
             for _ in 0..3 {
                 recorder.push_frame(vec![0u8; 64 * 48 * 4], super::epoch_millis());
             }
-        } // drop: writer дописывает сайдкар в фоне
+        } // drop: writer дописывает файл в фоне
 
-        // Джойна нет по дизайну — ждём финализированный сайдкар.
-        let sidecar = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.to_string_lossy().ends_with("-frames.yaml"))
-            .expect("no sidecar");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let text = std::fs::read_to_string(&sidecar).unwrap();
-            if text.contains("...") {
-                assert_eq!(text.matches("--- {i:").count(), 3);
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "sidecar not finalized"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        // Видеофайл есть (контейнер по умолчанию — MKV), REC погашен.
-        assert!(
-            std::fs::read_dir(&dir)
-                .unwrap()
-                .any(|p| { p.unwrap().path().extension().is_some_and(|e| e == "mkv") })
-        );
+        // Джойна нет по дизайну — ждём гашение REC (writer гасит его по
+        // закрытию канала, до finalize/fsync).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while state.load().ok && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(!state.load().ok);
+
+        // Видеофайл есть (контейнер по умолчанию — MKV), больше никаких
+        // файлов писать не должны.
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|p| p.extension().is_some_and(|e| e == "mkv")),
+            "no mkv in {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|p| p.extension().is_some_and(|e| e == "mkv")),
+            "unexpected files: {entries:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -13,7 +13,7 @@ use std::thread;
 
 /// Состояние камеры (capture-потока).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CameraState {
+pub enum CaptureState {
     /// Поток жив, идёт инициализация (перебор устройств, открытие стрима).
     Starting,
     /// Стрим открыт, кадры идут.
@@ -23,7 +23,7 @@ pub enum CameraState {
 }
 
 /// Общий для потока и UI хэндл состояния камеры.
-pub type SharedCameraState = Arc<AtomicCell<CameraState>>;
+pub type SharedCaptureState = Arc<AtomicCell<CaptureState>>;
 use std::time::{Duration, Instant};
 
 /// nokhwa на V4L2 отдаёт `frame_raw()` — это весь mmap-буфер (его ёмкость,
@@ -161,14 +161,14 @@ pub struct Webcam {
     texture: Option<egui::TextureHandle>,
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
-    camera: SharedCameraState,
+    camera: SharedCaptureState,
     record: SharedRecordState,
     commands: crossbeam_channel::Sender<Command>,
 }
 
 impl Webcam {
     /// Стрим открыт, поток камеры жив.
-    pub fn camera_state(&self) -> CameraState {
+    pub fn capture_state(&self) -> CaptureState {
         self.camera.load()
     }
 
@@ -202,7 +202,7 @@ impl Webcam {
         let slot_clone = Arc::clone(&slot);
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
-        let state: SharedCameraState = Arc::new(AtomicCell::new(CameraState::Starting));
+        let state: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
         let state_clone = Arc::clone(&state);
         let record: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
             ok: false,
@@ -272,7 +272,7 @@ impl Webcam {
                 log::error!("failed to open stream: {}", e);
                 return;
             }
-            state_clone.store(CameraState::Live);
+            state_clone.store(CaptureState::Live);
 
             let fmt = camera.camera_format();
             log::info!("capture stream opened, format: {:?}", fmt);
@@ -384,7 +384,7 @@ impl Webcam {
             // Поток умирает (штатный стоп или потеря камеры) — гасим CAM,
             // иначе индикатор висит белым на мёртвой картинке. REC гаснет
             // сам: writer-поток — единственный владелец RecordState.
-            state_clone.store(CameraState::Dead);
+            state_clone.store(CaptureState::Dead);
 
             if let Err(e) = camera.stop_stream() {
                 log::error!("failed to stop stream: {}", e);

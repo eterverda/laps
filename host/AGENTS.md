@@ -57,7 +57,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Per-frame latency hot spots: nokhwa buffer copy and decode; hot crates
   get `opt-level` bumps in dev profile (`zune-jpeg`/`zune-core` = 3,
   `memchr` = 3, `epaint` = 2) instead of optimizing our own crate in dev
-- Camera lifecycle states (`CameraState`: Starting/Live/Dead) and
+- Camera lifecycle states (`CaptureState`: Starting/Live/Dead) and
   feed states (`FeedState`: Off/Live/Rec) signaled UI-ward via
   `crossbeam_utils::AtomicCell`
 

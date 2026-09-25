@@ -45,7 +45,7 @@ impl Clock {
             egui::Align2::CENTER_CENTER,
             format_timestamp(now, millis),
             super::style::FONT_REGULAR,
-            egui::Color32::WHITE,
+            egui::Color32::GRAY,
         );
     }
 }

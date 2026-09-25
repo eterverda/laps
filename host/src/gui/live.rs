@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
-use crate::driver::webcam::CameraState;
+use crate::driver::webcam::CaptureState;
 use crate::model::pilot::Pilot;
 use std::collections::HashMap;
 
@@ -30,7 +30,7 @@ impl Res {
 }
 
 /// Состояние потока: Rec возможен только внутри Live (REC-on стартует
-/// захват и запись; CAM-off гасит всё; REC тогглится независимо внутри
+/// захват и запись; LIVE-off гасит всё; REC тогглится независимо внутри
 /// захвата).
 #[derive(Clone, Copy, PartialEq)]
 enum FeedState {
@@ -94,7 +94,7 @@ impl Live {
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
         ui.ctx().viewport_id();
         enum Action {
-            ToggleCam,
+            ToggleLive,
             ToggleRec,
             GotoMenu,
             None,
@@ -114,7 +114,7 @@ impl Live {
         let mut contents: HashMap<String, viewfinder::ViewfinderContents> = HashMap::new();
         let primary_id = self.active_cameras.keys().next().cloned();
         for (id, webcam) in self.webcams.iter_mut() {
-            let camera_state = webcam.camera_state();
+            let capture_state = webcam.capture_state();
             let (texture, new_frame) = webcam.update(ctx);
             if new_frame && Some(id) == primary_id.as_ref() {
                 self.shown.on_frame();
@@ -122,7 +122,7 @@ impl Live {
             // Поток мёртв (камера не найдена, отвалилась) — testcard вместо
             // замершей последней текстуры: состояние не отличить по ней.
             // Starting тоже testcard: кадров ещё нет.
-            let state = if camera_state == CameraState::Live {
+            let state = if capture_state == CaptureState::Live {
                 match texture {
                     Some(tex) => viewfinder::ViewfinderContents::Texture(tex.id()),
                     None => viewfinder::ViewfinderContents::Pending,
@@ -232,11 +232,11 @@ impl Live {
                         );
                         guidelines::dashed_rect(
                             ui,
-                            grid::cell(col, 14 + VIEWFINDER_ROWS)
-                                .extrude(VIEWFINDER_COLS, bottom_right.row - 18 - VIEWFINDER_ROWS),
+                            grid::cell(col, 9 + VIEWFINDER_ROWS)
+                                .extrude(VIEWFINDER_COLS, bottom_right.row - 14 - VIEWFINDER_ROWS),
                         );
 
-                        let text_rect = grid::cell(col, 14 + VIEWFINDER_ROWS).to_pos2();
+                        let text_rect = grid::cell(col, 9 + VIEWFINDER_ROWS).to_pos2();
                         ui.painter().text(
                             text_rect,
                             egui::Align2::LEFT_TOP,
@@ -246,19 +246,17 @@ impl Live {
                         );
                     }
                 }
-                // CAM и REC — независимые виджеты: клик по CAM тогглит
+                // LIVE и REC — независимые виджеты: клик по LIVE тогглит
                 // захват, клик по REC — запись. Подпись под кнопкой: error
                 // при отвале, измеренный fps после замера, "-- fps" до
                 // замера, заявленный fps в покое. Кликабельна вся область.
-                let status_row = 9 + VIEWFINDER_ROWS;
-                let right_edge = GRID_WIDTH - RIGHT_MARGIN;
-                let cam_state = self.webcams.values().next().map(|w| w.camera_state());
-                let cam_active = cam_state == Some(CameraState::Live);
-                let cam_dead = cam_state == Some(CameraState::Dead);
+                let live_state = self.webcams.values().next().map(|w| w.capture_state());
+                let live_active = live_state == Some(CaptureState::Live);
+                let live_dead = live_state == Some(CaptureState::Dead);
                 // Starting: поток жив, камера инициализируется — для статуса
                 // это «active», а не отвал (error рисуем только по Dead).
-                let starting = cam_state == Some(CameraState::Starting);
-                let cam_show = cam_active || (self.feed != FeedState::Off && !cam_dead);
+                let starting = live_state == Some(CaptureState::Starting);
+                let live_show = live_active || (self.feed != FeedState::Off && !live_dead);
                 let rec_active = self.webcams.values().any(|w| w.record_state().ok);
                 let cfg_fps = self
                     .active_cameras
@@ -267,7 +265,9 @@ impl Live {
                     .map(|camera| camera.frame_rate.0);
                 let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
 
-                let rec_rect = grid::cell(right_edge, status_row).extrude(-6, 3);
+                let rec_rect = grid::cell(LEFT_MARGIN, bottom_right.row)
+                    .translate(16, -1)
+                    .extrude(6, -2);
                 let rec_response = ui
                     .interact(
                         rec_rect,
@@ -287,18 +287,18 @@ impl Live {
                     if !rec_active && !starting {
                         "error".to_owned()
                     } else if rec_fps.unwrap_or_default() > 0.0 {
-                        format!("{:.0} fps", rec_fps.unwrap_or_default())
+                        format!("{:.0}fps", rec_fps.unwrap())
                     } else {
-                        "-- fps".to_owned()
+                        "--fps".to_owned()
                     }
                 } else if rec_active && rec_fps.unwrap_or_default() > 0.0 {
-                    format!("{:.0} fps", rec_fps.unwrap_or_default())
+                    format!("{:.0}fps", rec_fps.unwrap())
                 } else {
-                    format!("{} fps", cfg_fps.unwrap_or_default())
+                    format!("{}fps", cfg_fps.unwrap_or_default())
                 };
                 ui.painter().text(
-                    rec_rect.left_center(),
-                    egui::Align2::LEFT_CENTER,
+                    rec_rect.left_bottom(),
+                    egui::Align2::LEFT_BOTTOM,
                     "REC",
                     style::FONT_REGULAR_X2,
                     if rec_active {
@@ -308,63 +308,65 @@ impl Live {
                     },
                 );
                 ui.painter().text(
-                    grid::cell(right_edge, status_row + 2)
-                        .extrude(-6, 1)
-                        .center(),
-                    egui::Align2::CENTER_CENTER,
+                    grid::cell(LEFT_MARGIN, bottom_right.row)
+                        .translate(16, -1)
+                        .translate(7, 0)
+                        .extrude(5, -1)
+                        .right_bottom(),
+                    egui::Align2::RIGHT_BOTTOM,
                     rec_text,
                     style::FONT_REGULAR,
                     rec_color,
                 );
 
-                let cam_rect = grid::cell(right_edge, status_row)
-                    .translate(-8, 0)
-                    .extrude(-6, 3);
-                let cam_response = ui
+                let live_rect = grid::cell(LEFT_MARGIN, bottom_right.row)
+                    .translate(0, -1)
+                    .extrude(8, -2);
+                let live_response = ui
                     .interact(
-                        cam_rect,
-                        ui.make_persistent_id("status_cam"),
+                        live_rect,
+                        ui.make_persistent_id("status_live"),
                         egui::Sense::click(),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if cam_response.clicked() {
-                    action = Action::ToggleCam;
+                if live_response.clicked() {
+                    action = Action::ToggleLive;
                 }
-                let (cam_text, cam_color) = if self.feed != FeedState::Off && cam_dead {
+                let (live_text, live_color) = if self.feed != FeedState::Off && live_dead {
                     ("error".to_owned(), egui::Color32::WHITE)
-                } else if cam_show {
+                } else if live_show {
                     let text = if self.shown_fps > 0.0 {
-                        format!("{:.0} fps", self.shown_fps)
+                        format!("{:.0}fps", self.shown_fps)
                     } else {
-                        "-- fps".to_owned()
+                        "--fps".to_owned()
                     };
                     (text, egui::Color32::WHITE)
                 } else {
                     (
-                        format!("{} fps", cfg_fps.unwrap_or_default()),
+                        format!("{}fps", cfg_fps.unwrap_or_default()),
                         egui::Color32::DARK_GRAY,
                     )
                 };
                 ui.painter().text(
-                    cam_rect.left_center(),
-                    egui::Align2::LEFT_CENTER,
-                    "CAM",
+                    live_rect.left_bottom(),
+                    egui::Align2::LEFT_BOTTOM,
+                    "LIVE",
                     style::FONT_REGULAR_X2,
-                    if cam_show {
+                    if live_show {
                         egui::Color32::WHITE
                     } else {
                         egui::Color32::DARK_GRAY
                     },
                 );
                 ui.painter().text(
-                    grid::cell(right_edge, status_row + 2)
-                        .translate(-8, 0)
-                        .extrude(-6, 1)
-                        .center(),
-                    egui::Align2::CENTER_CENTER,
-                    cam_text,
+                    grid::cell(LEFT_MARGIN, bottom_right.row)
+                        .translate(9, -1)
+                        .extrude(6, -1)
+                        .left_bottom(),
+                    egui::Align2::LEFT_BOTTOM,
+                    live_text,
                     style::FONT_REGULAR,
-                    cam_color,
+                    live_color,
                 );
 
                 guidelines::dashed_line(
@@ -375,39 +377,19 @@ impl Live {
                 guidelines::dashed_line(
                     ui,
                     egui::Direction::RightToLeft,
-                    grid::cell_y(9 + VIEWFINDER_ROWS),
-                );
-                guidelines::dashed_line(
-                    ui,
-                    egui::Direction::RightToLeft,
-                    grid::cell_y(13 + VIEWFINDER_ROWS),
+                    grid::cell_y(bottom_right.row - 4),
                 );
 
-                let text_rect = grid::cell(11, bottom_right.row)
+                let text_rect = grid::cell(bottom_right.col, bottom_right.row)
                     .translate(0, -1)
-                    .extrude(23, -1);
+                    .translate(-RIGHT_MARGIN, 0)
+                    .extrude(-25, -1);
                 self.clock.show(ui, text_rect);
-                {
-                    let button = egui::Button::new(
-                        egui::RichText::new(" Выход ⌘W ")
-                            .font(style::FONT_REGULAR)
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(egui::Color32::BLUE)
-                    .stroke(egui::Stroke::NONE)
-                    .frame(false);
-
-                    let button_rect = bottom_right.translate(-2, -1).extrude(-10, -1);
-
-                    if ui.put(button_rect, button).clicked() {
-                        action = Action::GotoMenu;
-                    }
-                }
             });
 
         match action {
             Action::GotoMenu => navigator.goto(menu::Menu),
-            Action::ToggleCam => self.toggle_cam(ui.ctx()),
+            Action::ToggleLive => self.toggle_live(ui.ctx()),
             Action::ToggleRec => self.toggle_rec(ui.ctx()),
             Action::None => {}
         }
@@ -448,7 +430,7 @@ impl Live {
         self.shown_fps = 0.0;
     }
 
-    fn toggle_cam(&mut self, ctx: &egui::Context) {
+    fn toggle_live(&mut self, ctx: &egui::Context) {
         match self.feed {
             FeedState::Off => {
                 self.start_captures(ctx);

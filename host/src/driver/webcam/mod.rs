@@ -1,5 +1,6 @@
 use self::decode::Error as DecodeError;
 pub mod decode;
+pub mod fps;
 
 use crate::config::camera::{CameraConfig, PixelConfig};
 use crate::driver::dvr::{RecordState, SharedRecordState};
@@ -78,12 +79,11 @@ enum Command {
 /// при старте захвата: так CAM и REC можно включать независимо.
 fn start_recorder(
     options: &crate::driver::dvr::Options,
-    width: u32,
-    height: u32,
+    negotiated: &nokhwa::utils::CameraFormat,
     state: &SharedRecordState,
 ) -> Option<crate::driver::dvr::Recorder> {
     // Формат и контейнер ветвятся внутри Recorder::start.
-    let result = crate::driver::dvr::Recorder::start(options, width, height, state);
+    let result = crate::driver::dvr::Recorder::start(options, negotiated, state);
     match result {
         Ok(recorder) => Some(recorder),
         Err(e) => {
@@ -305,7 +305,7 @@ impl Webcam {
                 for cmd in commands_rx.try_iter() {
                     match cmd {
                         Command::StartRecording(options) => {
-                            recorder = start_recorder(&options, width, height, &record_clone);
+                            recorder = start_recorder(&options, &fmt, &record_clone);
                         }
                         Command::StopRecording => {
                             recorder = None; // drop: writer finalize'ит в фоне

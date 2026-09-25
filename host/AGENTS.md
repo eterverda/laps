@@ -6,7 +6,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 
 ```
 ┌──────────────────────────────────────────┐
-│  UI Layer (egui + eframe)                │
+│  UI Layer (egui + eRa)                │
 │  - Immediate mode, own cell grid layout  │
 │  - Own zoom (egui auto-zoom disabled)    │
 │  - Fira Code Nerd Font (2:1 cell aspect) │
@@ -101,8 +101,11 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 ## Configuration
 
-- **serde** + **serde_yml** (serde_yaml is deprecated/archived; serde_yml
-  is the maintained fork) — setup files in YAML
+- **serde** + **serde_yaml** pinned `=0.9.34` (dtolnay's final release,
+  deprecated = frozen, not broken). Unlike serde_yml/noyalib it writes
+  valid plain scalars unquoted (`1920x1080`, `30fps`) — noyalib quotes
+  any string starting with a digit. Revisit noyalib only if serde_yaml
+  breaks — setup files in YAML
 - Default setup embedded from `assets/setup.yaml` and loaded once at app
   startup — no tests or other code may depend on its contents;
   config-loaded types carry the `Config` suffix (`CameraConfig`,

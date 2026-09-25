@@ -49,8 +49,9 @@ pub struct Live {
     active_cameras: HashMap<String, CameraConfig>,
     // Показываемый fps: считаем на UI по забранным кадрам, только по
     // первой камере (как и остальные цифры статуса).
-    shown_frames: u32,
-    shown_window: std::time::Instant,
+    shown: crate::driver::webcam::fps::FpsCounter,
+    /// Последний измеренный fps; 0.0 = замера ещё не было, UI покажет
+    /// "-- fps". Пауза кадров значение не затирает.
     shown_fps: f32,
 }
 
@@ -85,9 +86,7 @@ impl Live {
             setup,
             assignments,
             active_cameras,
-            shown_frames: 0,
-            shown_window: std::time::Instant::now(),
-            // 0.0 = замера ещё не было, UI покажет "-- fps".
+            shown: crate::driver::webcam::fps::FpsCounter::default(),
             shown_fps: 0.0,
         }
     }
@@ -118,7 +117,7 @@ impl Live {
             let camera_state = webcam.camera_state();
             let (texture, new_frame) = webcam.update(ctx);
             if new_frame && Some(id) == primary_id.as_ref() {
-                self.shown_frames += 1;
+                self.shown.on_frame();
             }
             // Поток мёртв (камера не найдена, отвалилась) — testcard вместо
             // замершей последней текстуры: состояние не отличить по ней.
@@ -133,15 +132,10 @@ impl Live {
             };
             contents.insert(id.clone(), state);
         }
-        // Пассивный замер: окно 0.5 с, считается только по поступающим
-        // кадрам; пустое окно последнее значение не затирает.
-        if self.shown_window.elapsed() >= std::time::Duration::from_millis(500) {
-            if self.shown_frames > 0 {
-                self.shown_fps =
-                    self.shown_frames as f32 / self.shown_window.elapsed().as_secs_f32();
-            }
-            self.shown_frames = 0;
-            self.shown_window = std::time::Instant::now();
+        // Пассивный замер: считается только по поступающим кадрам,
+        // пустое окно последнее значение не затирает.
+        if let Some(fps) = self.shown.fps() {
+            self.shown_fps = fps as f32;
         }
 
         view::Letterbox::new(grid::cell(160, 45))
@@ -446,12 +440,11 @@ impl Live {
         }
     }
 
-    // Сброс окна замера показа: fps считаем от старта захвата, иначе
-    // первое окно тянет elapsed с момента создания экрана и даёт
-    // мгновенный "0 fps". Пока замера нет — "-- fps".
+    // Сброс замера показа: fps считаем от старта захвата, иначе первые
+    // штампы тянут интервал с момента создания экрана. Пока замера нет —
+    // "-- fps".
     fn reset_shown_fps(&mut self) {
-        self.shown_frames = 0;
-        self.shown_window = std::time::Instant::now();
+        self.shown.reset();
         self.shown_fps = 0.0;
     }
 

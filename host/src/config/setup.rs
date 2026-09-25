@@ -48,7 +48,7 @@ mod tests {
 
     #[test]
     fn test_viewport_defaults_to_full_frame() {
-        let fpv: FpvConfig = serde_yml::from_str("camera-id: camera-1\n").unwrap();
+        let fpv: FpvConfig = serde_yaml::from_str("camera-id: camera-1\n").unwrap();
         assert_eq!(
             fpv.viewport,
             super::super::camera::ViewportConfig {

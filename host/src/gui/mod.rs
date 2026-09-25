@@ -39,7 +39,7 @@ fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
 
 impl App {
     fn new() -> Self {
-        let setup: Setup = serde_yml::from_str(crate::assets::SETUP_YAML)
+        let setup: Setup = serde_yaml::from_str(crate::assets::SETUP_YAML)
             .expect("embedded setup.yaml failed to parse");
         let assignments = hardcoded_assignments();
         Self {

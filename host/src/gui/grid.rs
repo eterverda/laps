@@ -56,6 +56,19 @@ impl From<egui::Vec2> for Cell {
     }
 }
 
+pub trait IntoCell {
+    fn into_cell(self) -> Cell;
+}
+
+impl<T> IntoCell for T
+where
+    T: Into<Cell>,
+{
+    fn into_cell(self) -> Cell {
+        self.into()
+    }
+}
+
 pub const fn cell(col: isize, row: isize) -> Cell {
     Cell { col, row }
 }

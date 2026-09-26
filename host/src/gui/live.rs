@@ -2,6 +2,7 @@ use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
 use crate::driver::webcam::CaptureState;
+use crate::gui::grid::IntoCell;
 use crate::model::pilot::Pilot;
 use std::collections::HashMap;
 
@@ -9,10 +10,15 @@ const MAX_PADS: usize = 4;
 const GRID_WIDTH: isize = 160;
 const LEFT_MARGIN: isize = 4;
 const RIGHT_MARGIN: isize = 4;
+const TOP_BAR_ROWS: isize = 2;
+const BOTTOM_BAR_ROWS: isize = 2;
 // Вьюфайндер фиксированный, высота задаёт ширину. Ячейки 8x16 pt,
 // поэтому физический 4:3 — это 32x12 клеток (256x192 pt).
 const VIEWFINDER_ROWS: isize = 12;
 const VIEWFINDER_COLS: isize = VIEWFINDER_ROWS * 8 / 3; // 32
+
+/// Фон плашки заголовка — colorSecondaryDark из laps-bar.
+const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x7F, 0xA9);
 
 struct Res;
 
@@ -170,6 +176,24 @@ impl Live {
 
                 let bottom_right = grid::cell_at(ui.max_rect().max);
 
+                let title_rect = grid::cell(0, 0).translate(1, 0).extrude(9, 2);
+                ui.painter().text(
+                    title_rect.right_top().into_cell().extrude(2, 2).left_top(),
+                    egui::Align2::LEFT_TOP,
+                    "\u{e0bc}",
+                    style::FONT_REGULAR_X2,
+                    TITLE_BG,
+                );
+                ui.painter()
+                    .rect_filled(title_rect.with_min_x(0.0), 0.0, TITLE_BG);
+                ui.painter().text(
+                    title_rect.left_top(),
+                    egui::Align2::LEFT_TOP,
+                    "LAPS",
+                    style::FONT_REGULAR_X2,
+                    egui::Color32::BLACK,
+                );
+
                 if columns > 0 {
                     let border_width = grid::cell_x(1) / 2.0;
                     for (i, (pad_id, pad)) in pads.into_iter().enumerate() {
@@ -178,8 +202,9 @@ impl Live {
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - VIEWFINDER_COLS) / 2;
                         let color = pad.color.to_color32();
-                        let viewfinder_rect =
-                            grid::cell(col, 3).extrude(VIEWFINDER_COLS, VIEWFINDER_ROWS);
+                        let viewfinder_rect = grid::cell(col, TOP_BAR_ROWS)
+                            .translate(0, 3)
+                            .extrude(VIEWFINDER_COLS, VIEWFINDER_ROWS);
                         ui.painter().rect_stroke(
                             viewfinder_rect,
                             0.0,
@@ -199,10 +224,15 @@ impl Live {
                         );
 
                         let label_len = pad.label.len() as isize;
-                        let label_rect = grid::cell(col, 1)
-                            .extrude(label_len * 2, 2)
-                            .expand2(egui::vec2(grid::cell_x(1) / 2.0, 0.0));
-                        ui.painter().rect_filled(label_rect, 0.0, color);
+                        let label_rect = viewfinder_rect
+                            .left_top()
+                            .into_cell()
+                            .extrude(label_len * 2, -2);
+                        ui.painter().rect_filled(
+                            label_rect.expand2(egui::vec2(grid::cell_x(1) / 2.0, 0.0)),
+                            0.0,
+                            color,
+                        );
                         ui.painter().text(
                             label_rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -215,30 +245,39 @@ impl Live {
                             .assignments
                             .get(pad_id)
                             .map_or("", |pilot| pilot.name.as_str());
-                        let pilot_rect = grid::cell(col + label_len * 2 + 2, 1).extrude(0, 1);
+                        let pilot_rect = label_rect
+                            .right_top()
+                            .into_cell()
+                            .translate(2, 0)
+                            .extrude(0, 1);
                         ui.painter().text(
-                            pilot_rect.center(),
-                            egui::Align2::LEFT_CENTER,
+                            pilot_rect.left_top(),
+                            egui::Align2::LEFT_TOP,
                             pilot_name,
                             style::FONT_REGULAR,
                             egui::Color32::WHITE,
                         );
+                        let graph_rect = viewfinder_rect
+                            .left_bottom()
+                            .into_cell()
+                            .translate(0, 1)
+                            .extrude(VIEWFINDER_COLS, 4);
                         ui.painter().rect(
-                            grid::cell(col, VIEWFINDER_ROWS + 4).extrude(VIEWFINDER_COLS, 4),
+                            graph_rect,
                             0.0,
                             egui::Color32::TRANSPARENT,
                             egui::Stroke::new(1.0, egui::Color32::from_gray(48)),
                             egui::StrokeKind::Inside,
                         );
-                        guidelines::dashed_rect(
-                            ui,
-                            grid::cell(col, 9 + VIEWFINDER_ROWS)
-                                .extrude(VIEWFINDER_COLS, bottom_right.row - 14 - VIEWFINDER_ROWS),
-                        );
-
-                        let text_rect = grid::cell(col, 9 + VIEWFINDER_ROWS).to_pos2();
+                        let laps_rect = graph_rect
+                            .left_bottom()
+                            .into_cell()
+                            .translate(0, 1)
+                            .extrude(VIEWFINDER_COLS, 0)
+                            .with_max_y(bottom_right.translate(0, -4).to_pos2().y);
+                        guidelines::dashed_rect(ui, laps_rect);
                         ui.painter().text(
-                            text_rect,
+                            laps_rect.left_top(),
                             egui::Align2::LEFT_TOP,
                             "1) 4:56.789 \u{f0537} \u{f00d} \u{f00d} \u{ea72} \u{f4aa}",
                             style::FONT_REGULAR,
@@ -265,9 +304,63 @@ impl Live {
                     .map(|camera| camera.frame_rate.0);
                 let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
 
-                let rec_rect = grid::cell(LEFT_MARGIN, bottom_right.row)
-                    .translate(16, -1)
-                    .extrude(6, -2);
+                let live_rect = grid::cell(1, bottom_right.row)
+                    .translate(1, -1)
+                    .extrude(12, -2);
+                let live_response = ui
+                    .interact(
+                        live_rect,
+                        ui.make_persistent_id("status_live"),
+                        egui::Sense::click(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if live_response.clicked() {
+                    action = Action::ToggleLive;
+                }
+                let (live_text, live_color) = if self.feed != FeedState::Off && live_dead {
+                    ("error".to_owned(), egui::Color32::WHITE)
+                } else if live_show {
+                    let text = if self.shown_fps > 0.0 {
+                        format!("{:.0}fps", self.shown_fps)
+                    } else {
+                        "--fps".to_owned()
+                    };
+                    (text, egui::Color32::WHITE)
+                } else {
+                    (
+                        format!("{}fps", cfg_fps.unwrap_or_default()),
+                        egui::Color32::DARK_GRAY,
+                    )
+                };
+                ui.painter().text(
+                    live_rect.left_bottom(),
+                    egui::Align2::LEFT_BOTTOM,
+                    " LIVE",
+                    style::FONT_REGULAR_X2,
+                    if live_show {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::DARK_GRAY
+                    },
+                );
+                let live_fps_rect = live_rect
+                    .right_bottom()
+                    .into_cell()
+                    .translate(1, 0)
+                    .extrude(6, -1);
+                ui.painter().text(
+                    live_fps_rect.left_bottom(),
+                    egui::Align2::LEFT_BOTTOM,
+                    live_text,
+                    style::FONT_REGULAR,
+                    live_color,
+                );
+
+                let rec_rect = live_fps_rect
+                    .right_bottom()
+                    .into_cell()
+                    .translate(2, 0)
+                    .extrude(10, -2);
                 let rec_response = ui
                     .interact(
                         rec_rect,
@@ -299,7 +392,7 @@ impl Live {
                 ui.painter().text(
                     rec_rect.left_bottom(),
                     egui::Align2::LEFT_BOTTOM,
-                    "REC",
+                    "󰑊 REC",
                     style::FONT_REGULAR_X2,
                     if rec_active {
                         egui::Color32::RED
@@ -307,82 +400,63 @@ impl Live {
                         egui::Color32::DARK_GRAY
                     },
                 );
+                let rec_fps_rect = rec_rect
+                    .right_bottom()
+                    .into_cell()
+                    .translate(1, 0)
+                    .extrude(5, -1);
                 ui.painter().text(
-                    grid::cell(LEFT_MARGIN, bottom_right.row)
-                        .translate(16, -1)
-                        .translate(7, 0)
-                        .extrude(5, -1)
-                        .right_bottom(),
+                    rec_fps_rect.right_bottom(),
                     egui::Align2::RIGHT_BOTTOM,
                     rec_text,
                     style::FONT_REGULAR,
                     rec_color,
                 );
 
-                let live_rect = grid::cell(LEFT_MARGIN, bottom_right.row)
-                    .translate(0, -1)
-                    .extrude(8, -2);
-                let live_response = ui
-                    .interact(
-                        live_rect,
-                        ui.make_persistent_id("status_live"),
-                        egui::Sense::click(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if live_response.clicked() {
-                    action = Action::ToggleLive;
-                }
-                let (live_text, live_color) = if self.feed != FeedState::Off && live_dead {
-                    ("error".to_owned(), egui::Color32::WHITE)
-                } else if live_show {
-                    let text = if self.shown_fps > 0.0 {
-                        format!("{:.0}fps", self.shown_fps)
-                    } else {
-                        "--fps".to_owned()
-                    };
-                    (text, egui::Color32::WHITE)
-                } else {
-                    (
-                        format!("{}fps", cfg_fps.unwrap_or_default()),
-                        egui::Color32::DARK_GRAY,
-                    )
-                };
-                ui.painter().text(
-                    live_rect.left_bottom(),
-                    egui::Align2::LEFT_BOTTOM,
-                    "LIVE",
-                    style::FONT_REGULAR_X2,
-                    if live_show {
-                        egui::Color32::WHITE
-                    } else {
-                        egui::Color32::DARK_GRAY
-                    },
+                let race_rect = rec_fps_rect
+                    .right_bottom()
+                    .into_cell()
+                    .translate(2, 0)
+                    .extrude(12, -2);
+                ui.interact(
+                    race_rect,
+                    ui.make_persistent_id("status_race"),
+                    egui::Sense::click(),
                 );
                 ui.painter().text(
-                    grid::cell(LEFT_MARGIN, bottom_right.row)
-                        .translate(9, -1)
-                        .extrude(6, -1)
-                        .left_bottom(),
+                    race_rect.left_bottom(),
                     egui::Align2::LEFT_BOTTOM,
-                    live_text,
-                    style::FONT_REGULAR,
-                    live_color,
+                    "\u{f140b} RACE",
+                    style::FONT_REGULAR_X2,
+                    egui::Color32::DARK_GRAY,
+                );
+                let race_time_rect = race_rect
+                    .right_bottom()
+                    .into_cell()
+                    .translate(1, 0)
+                    .extrude(24, -2);
+                ui.painter().text(
+                    race_time_rect.left_bottom(),
+                    egui::Align2::LEFT_BOTTOM,
+                    "00:00.000",
+                    style::FONT_REGULAR_X2,
+                    egui::Color32::DARK_GRAY,
                 );
 
                 guidelines::dashed_line(
                     ui,
                     egui::Direction::RightToLeft,
-                    grid::cell_y(4 + VIEWFINDER_ROWS),
+                    grid::cell_y(TOP_BAR_ROWS),
                 );
                 guidelines::dashed_line(
                     ui,
                     egui::Direction::RightToLeft,
-                    grid::cell_y(bottom_right.row - 4),
+                    grid::cell_y(bottom_right.row - 1 - BOTTOM_BAR_ROWS),
                 );
 
                 let text_rect = grid::cell(bottom_right.col, bottom_right.row)
                     .translate(0, -1)
-                    .translate(-RIGHT_MARGIN, 0)
+                    .translate(-1, 0)
                     .extrude(-25, -1);
                 self.clock.show(ui, text_rect);
             });

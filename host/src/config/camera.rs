@@ -80,6 +80,9 @@ pub struct CameraConfig {
 pub struct DvrConfig {
     #[serde(default)]
     pub container: ContainerConfig,
+    /// Целевой fps записи. None (дефолт) = fps камеры (camera.frame-rate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_rate: Option<FrameRateConfig>,
 }
 
 /// Контейнер DVR-записи.

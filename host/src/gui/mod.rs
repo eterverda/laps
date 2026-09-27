@@ -39,8 +39,16 @@ fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
 
 impl App {
     fn new() -> Self {
-        let setup: Setup = serde_yaml::from_str(crate::assets::SETUP_YAML)
-            .expect("embedded setup.yaml failed to parse");
+        // Ошибка сетапа фатальна: без него экраны не построить. Пишем
+        // ERROR в лог и выходим с ненулевым кодом (fatal по смыслу — у
+        // log-крейта уровня fatal нет, error! + exit(1) принятое замещение).
+        let setup: Setup = match serde_yaml::from_str(crate::assets::SETUP_YAML) {
+            Ok(setup) => setup,
+            Err(e) => {
+                log::error!("embedded setup.yaml failed to parse: {e}");
+                std::process::exit(1);
+            }
+        };
         let assignments = hardcoded_assignments();
         Self {
             state: State::Live(live::Live::new(setup.clone(), assignments.clone())),

@@ -12,10 +12,18 @@ const LEFT_MARGIN: isize = 4;
 const RIGHT_MARGIN: isize = 4;
 const TOP_BAR_ROWS: isize = 2;
 const BOTTOM_BAR_ROWS: isize = 2;
-// Вьюфайндер фиксированный, высота задаёт ширину. Ячейки 8x16 pt,
-// поэтому физический 4:3 — это 32x12 клеток (256x192 pt).
-const VIEWFINDER_ROWS: isize = 12;
-const VIEWFINDER_COLS: isize = VIEWFINDER_ROWS * 8 / 3; // 32
+
+fn viewfinder_rows(count: usize) -> isize {
+    match count {
+        1 | 2 => 21,
+        3 => 15,
+        _ => 12,
+    }
+}
+
+fn viewfinder_cols(count: usize) -> isize {
+    viewfinder_rows(count) * 8 / 3
+}
 
 /// Фон плашки заголовка — colorSecondaryDark из laps-bar.
 const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x7F, 0xA9);
@@ -150,6 +158,8 @@ impl Live {
             .show(ui, |ui| {
                 let pads: Vec<_> = self.setup.pads.iter().take(MAX_PADS).collect();
                 let columns = pads.len() as isize;
+                let viewfinder_rows = viewfinder_rows(pads.len());
+                let viewfinder_cols = viewfinder_cols(pads.len());
                 // Единый источник геометрии: строка от LEFT_MARGIN до
                 // GRID_WIDTH - RIGHT_MARGIN делится на columns зон. Размер
                 // вьюфайндера фиксирован — зона только центрирует его.
@@ -200,11 +210,11 @@ impl Live {
                         // Вьюфайндер по горизонтали в середине зоны
                         // (с точностью до клетки).
                         let (zone_start, zone_width) = column_geometry[i];
-                        let col = zone_start + (zone_width - VIEWFINDER_COLS) / 2;
+                        let col = zone_start + (zone_width - viewfinder_cols) / 2;
                         let color = pad.color.to_color32();
                         let viewfinder_rect = grid::cell(col, TOP_BAR_ROWS)
                             .translate(0, 3)
-                            .extrude(VIEWFINDER_COLS, VIEWFINDER_ROWS);
+                            .extrude(viewfinder_cols, viewfinder_rows);
                         ui.painter().rect_stroke(
                             viewfinder_rect,
                             0.0,
@@ -261,7 +271,7 @@ impl Live {
                             .left_bottom()
                             .into_cell()
                             .translate(0, 1)
-                            .extrude(VIEWFINDER_COLS, 4);
+                            .extrude(viewfinder_cols, 4);
                         ui.painter().rect(
                             graph_rect,
                             0.0,
@@ -273,7 +283,7 @@ impl Live {
                             .left_bottom()
                             .into_cell()
                             .translate(0, 1)
-                            .extrude(VIEWFINDER_COLS, 0)
+                            .extrude(viewfinder_cols, 0)
                             .with_max_y(bottom_right.translate(0, -4).to_pos2().y);
                         guidelines::dashed_rect(ui, laps_rect);
                         ui.painter().text(

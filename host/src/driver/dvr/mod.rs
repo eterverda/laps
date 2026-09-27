@@ -87,13 +87,19 @@ struct Report<'a> {
 }
 
 /// Реально согласованный формат (nokhwa CameraFormat) для отчёта.
-struct CameraReport<'a>(&'a nokhwa::utils::CameraFormat);
+/// `name` — имя из конфига, которым мы матчили камеру (в согласованном
+/// формате имени нет).
+struct CameraReport<'a> {
+    name: &'a str,
+    format: &'a nokhwa::utils::CameraFormat,
+}
 
 impl serde::Serialize for CameraReport<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let fmt = self.0;
-        let mut st = s.serialize_struct("CameraReport", 3)?;
+        let fmt = self.format;
+        let mut st = s.serialize_struct("CameraReport", 4)?;
+        st.serialize_field("name", self.name)?;
         st.serialize_field(
             "resolution",
             &format!("{}x{}", fmt.resolution().width(), fmt.resolution().height()),
@@ -387,7 +393,10 @@ impl Recorder {
             interval_digest.flush();
             let report = Report {
                 requested: &camera_owned,
-                actual: CameraReport(&negotiated_owned),
+                actual: CameraReport {
+                    name: &camera_owned.name,
+                    format: &negotiated_owned,
+                },
                 recorded: ReportRecorded {
                     frames_written: frames,
                     duration: Duration::from_millis(duration_ms),

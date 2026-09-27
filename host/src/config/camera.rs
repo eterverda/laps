@@ -81,7 +81,11 @@ pub struct DvrConfig {
     #[serde(default)]
     pub container: ContainerConfig,
     /// Целевой fps записи. None (дефолт) = fps камеры (camera.frame-rate).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "frame-rate",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub frame_rate: Option<FrameRateConfig>,
 }
 
@@ -184,6 +188,12 @@ impl serde::Serialize for ResolutionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FrameRateConfig(pub u32);
 
+impl fmt::Display for FrameRateConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}fps", self.0)
+    }
+}
+
 impl<'de> Deserialize<'de> for FrameRateConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -198,7 +208,7 @@ impl<'de> Deserialize<'de> for FrameRateConfig {
 
 impl serde::Serialize for FrameRateConfig {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}fps", self.0))
+        s.serialize_str(&self.to_string())
     }
 }
 
@@ -368,6 +378,22 @@ mod tests {
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: webm\n",
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_camera_dvr_frame_rate() {
+        let cam: CameraConfig = serde_yaml::from_str(
+            "name: C7-1\nresolution: 1920x1080\nframe-rate: 60fps\nformat: mjpeg\ndvr:\n  container: mkv\n  frame-rate: 30fps\n",
+        )
+        .unwrap();
+        assert_eq!(cam.dvr.frame_rate, Some(FrameRateConfig(30)));
+
+        // Без dvr.frame-rate — наследуем fps камеры (None).
+        let cam: CameraConfig = serde_yaml::from_str(
+            "name: C7-1\nresolution: 1920x1080\nframe-rate: 60fps\nformat: mjpeg\n",
+        )
+        .unwrap();
+        assert_eq!(cam.dvr.frame_rate, None);
     }
 
     #[test]

@@ -301,7 +301,12 @@ impl Live {
                     .active_cameras
                     .values()
                     .next()
-                    .map(|camera| camera.frame_rate.0);
+                    .map(|camera| camera.frame_rate);
+                let dvr_fps = self
+                    .active_cameras
+                    .values()
+                    .next()
+                    .map(|camera| camera.dvr.frame_rate.unwrap_or(camera.frame_rate));
                 let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
 
                 let live_rect = grid::cell(1, bottom_right.row)
@@ -328,7 +333,7 @@ impl Live {
                     (text, egui::Color32::WHITE)
                 } else {
                     (
-                        format!("{}fps", cfg_fps.unwrap_or_default()),
+                        cfg_fps.map(|f| f.to_string()).unwrap_or_default(),
                         egui::Color32::DARK_GRAY,
                     )
                 };
@@ -387,7 +392,7 @@ impl Live {
                 } else if rec_active && rec_fps.unwrap_or_default() > 0.0 {
                     format!("{:.0}fps", rec_fps.unwrap())
                 } else {
-                    format!("{}fps", cfg_fps.unwrap_or_default())
+                    dvr_fps.map(|f| f.to_string()).unwrap_or_default()
                 };
                 ui.painter().text(
                     rec_rect.left_bottom(),

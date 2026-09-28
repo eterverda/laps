@@ -3,10 +3,11 @@ cameras:
   camera-1:
     name: C7-1
     resolution: 1920x1080
-    frame-rate: 30fps
+    frame-rate: 60fps
     format: mjpeg
     dvr:
       container: mkv
+      frame-rate: 30fps
 pads:
   pad-1:
     label: CH1

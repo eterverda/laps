@@ -69,9 +69,9 @@ pub struct Live {
     shown_fps: f32,
 }
 
-impl Into<State> for Live {
-    fn into(self) -> State {
-        State::Live(self)
+impl From<Box<Live>> for State {
+    fn from(val: Box<Live>) -> Self {
+        State::Live(val)
     }
 }
 

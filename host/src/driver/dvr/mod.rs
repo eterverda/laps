@@ -57,7 +57,7 @@ fn encode_rgba_to_jpeg(rgba: &[u8], width: u32, height: u32) -> io::Result<Vec<u
             height as u16,
             jpeg_encoder::ColorType::Rgba,
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("jpeg encode: {e}")))?;
+        .map_err(|e| io::Error::other(format!("jpeg encode: {e}")))?;
     Ok(buf)
 }
 

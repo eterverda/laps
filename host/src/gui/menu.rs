@@ -7,9 +7,9 @@ pub enum Action {
     None,
 }
 
-impl Into<State> for Menu {
-    fn into(self) -> State {
-        State::Menu(self)
+impl From<Menu> for State {
+    fn from(val: Menu) -> Self {
+        State::Menu(val)
     }
 }
 

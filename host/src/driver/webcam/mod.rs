@@ -137,7 +137,7 @@ fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
 
 pub fn list_cameras() -> Result<Vec<CameraConfig>, String> {
     let mut cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(|e| e.to_string())?;
-    cameras.sort_by(|a, b| a.human_name().cmp(&b.human_name()));
+    cameras.sort_by_key(|a| a.human_name());
     let mut descriptions = Vec::new();
     for cam in cameras {
         let formats = list_formats_for_cam(&cam).unwrap_or_default();
@@ -149,7 +149,7 @@ pub fn list_cameras() -> Result<Vec<CameraConfig>, String> {
                 _ => continue,
             };
             descriptions.push(CameraConfig::new(
-                &cam.human_name(),
+                cam.human_name(),
                 fmt.resolution().width(),
                 fmt.resolution().height(),
                 fmt.frame_rate(),

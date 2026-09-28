@@ -12,7 +12,7 @@ mod viewfinder;
 
 enum State {
     Menu(menu::Menu),
-    Live(live::Live),
+    Live(Box<live::Live>),
 }
 
 #[derive(Default)]
@@ -51,7 +51,10 @@ impl App {
         };
         let assignments = hardcoded_assignments();
         Self {
-            state: State::Live(live::Live::new(setup.clone(), assignments.clone())),
+            state: State::Live(Box::new(live::Live::new(
+                setup.clone(),
+                assignments.clone(),
+            ))),
             setup,
             assignments,
         }
@@ -76,18 +79,17 @@ impl eframe::App for App {
 
                 match self.state {
                     State::Menu(ref mut menu) => match menu.update(ui) {
-                        menu::Action::Start => navigator.goto(live::Live::new(
+                        menu::Action::Start => navigator.goto(Box::new(live::Live::new(
                             self.setup.clone(),
                             self.assignments.clone(),
-                        )),
+                        ))),
                         menu::Action::None => {}
                     },
                     State::Live(ref mut live) => live.update(ui, &mut navigator),
                 }
 
-                match navigator.0 {
-                    Some(state) => self.state = state,
-                    None => {}
+                if let Some(state) = navigator.0 {
+                    self.state = state
                 }
             });
     }

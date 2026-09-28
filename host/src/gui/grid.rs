@@ -24,23 +24,23 @@ impl Cell {
         } else {
             (self.row + rows, self.row)
         };
-        return egui::Rect::from_min_max(cell_pos2(left, top), cell_pos2(right, bottom));
+        egui::Rect::from_min_max(cell_pos2(left, top), cell_pos2(right, bottom))
     }
 
-    pub const fn to_pos2(&self) -> egui::Pos2 {
-        return cell_pos2(self.col, self.row);
-    }
-}
-
-impl Into<egui::Pos2> for Cell {
-    fn into(self) -> egui::Pos2 {
-        egui::pos2(cell_x(self.col), cell_y(self.row))
+    pub const fn to_pos2(self) -> egui::Pos2 {
+        cell_pos2(self.col, self.row)
     }
 }
 
-impl Into<egui::Vec2> for Cell {
-    fn into(self) -> egui::Vec2 {
-        egui::vec2(cell_x(self.col), cell_y(self.row))
+impl From<Cell> for egui::Pos2 {
+    fn from(val: Cell) -> Self {
+        egui::pos2(cell_x(val.col), cell_y(val.row))
+    }
+}
+
+impl From<Cell> for egui::Vec2 {
+    fn from(val: Cell) -> Self {
+        egui::vec2(cell_x(val.col), cell_y(val.row))
     }
 }
 

@@ -24,9 +24,9 @@ lazy-regex = "3.6.1"
 humantime-serde = "1"
 tdigest = "1"
 memchr = "2"
-rand = "0.9"
+rand = "0.10"
 zune-jpeg = "0.5"
-jpeg-encoder = "0.6"
+jpeg-encoder = "0.7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-avfoundation"] }
@@ -37,6 +37,9 @@ nokhwa = { version = "0.10.11", default-features = false, features = ["input-v4l
 
 [target.'cfg(target_os = "windows")'.dependencies]
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-msmf"] }
+
+[lints.clippy]
+collapsible_if = "allow"
 
 [profile.dev.package.yuv]
 opt-level = 2

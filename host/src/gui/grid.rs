@@ -95,3 +95,8 @@ pub const fn cell_y(row: isize) -> f32 {
 const fn cell_pos2(col: isize, row: isize) -> egui::Pos2 {
     egui::pos2(cell_x(col), cell_y(row))
 }
+
+#[inline]
+pub fn whole_cols(px: f32) -> isize {
+    px.div(CELL_SIZE.x).ceil() as isize
+}

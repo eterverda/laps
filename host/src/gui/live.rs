@@ -266,9 +266,10 @@ impl Live {
                     }
                 }
                 // LIVE и REC — независимые виджеты: клик по LIVE тогглит
-                // захват, клик по REC — запись. Подпись под кнопкой: error
-                // при отвале, измеренный fps после замера, "-- fps" до
-                // замера, заявленный fps в покое. Кликабельна вся область.
+                // захват, клик по REC — запись. Мелкий текст справа от
+                // названия: error при отвале, измеренный fps после замера,
+                // "-- fps" до замера, заявленный fps в покое. Кликабельна
+                // вся область.
                 let live_state = self.webcams.values().next().map(|w| w.capture_state());
                 let live_active = live_state == Some(CaptureState::Live);
                 let live_dead = live_state == Some(CaptureState::Dead);
@@ -289,19 +290,6 @@ impl Live {
                     .map(|camera| camera.dvr.frame_rate.unwrap_or(camera.frame_rate));
                 let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
 
-                let live_rect = grid::cell(1, bottom_right.row)
-                    .translate(1, -1)
-                    .extrude(12, -2);
-                let live_response = ui
-                    .interact(
-                        live_rect,
-                        ui.make_persistent_id("status_live"),
-                        egui::Sense::click(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if live_response.clicked() {
-                    action = Action::ToggleLive;
-                }
                 let (live_text, live_color) = if self.feed != FeedState::Off && live_dead {
                     ("error".to_owned(), egui::Color32::WHITE)
                 } else if live_show {
@@ -317,45 +305,16 @@ impl Live {
                         egui::Color32::DARK_GRAY,
                     )
                 };
-                ui.painter().text(
-                    live_rect.left_bottom(),
-                    egui::Align2::LEFT_BOTTOM,
-                    " LIVE",
-                    style::FONT_REGULAR_X2,
-                    if live_show {
-                        egui::Color32::WHITE
-                    } else {
-                        egui::Color32::DARK_GRAY
-                    },
+                let live_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
+                    grid::whole_cols(view::content_width(ui.ctx(), " LIVE", &live_text)),
+                    -2,
                 );
-                let live_fps_rect = live_rect
-                    .right_bottom()
-                    .into_cell()
-                    .translate(1, 0)
-                    .extrude(6, -1);
-                ui.painter().text(
-                    live_fps_rect.left_bottom(),
-                    egui::Align2::LEFT_BOTTOM,
-                    live_text,
-                    style::FONT_REGULAR,
-                    live_color,
-                );
-
-                let rec_rect = live_fps_rect
-                    .right_bottom()
-                    .into_cell()
-                    .translate(2, 0)
-                    .extrude(10, -2);
-                let rec_response = ui
-                    .interact(
-                        rec_rect,
-                        ui.make_persistent_id("status_rec"),
-                        egui::Sense::click(),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if rec_response.clicked() {
-                    action = Action::ToggleRec;
+                let live_response = view::BigButton::new(" LIVE", "", &live_text, live_color)
+                    .show(ui, live_rect, ui.make_persistent_id("status_live"));
+                if live_response.clicked() {
+                    action = Action::ToggleLive;
                 }
+
                 let rec_color = if rec_active {
                     egui::Color32::RED
                 } else {
@@ -374,59 +333,33 @@ impl Live {
                 } else {
                     dvr_fps.map(|f| f.to_string()).unwrap_or_default()
                 };
-                ui.painter().text(
-                    rec_rect.left_bottom(),
-                    egui::Align2::LEFT_BOTTOM,
-                    "󰑊 REC",
-                    style::FONT_REGULAR_X2,
-                    if rec_active {
-                        egui::Color32::RED
-                    } else {
-                        egui::Color32::DARK_GRAY
-                    },
-                );
-                let rec_fps_rect = rec_rect
-                    .right_bottom()
-                    .into_cell()
-                    .translate(1, 0)
-                    .extrude(5, -1);
-                ui.painter().text(
-                    rec_fps_rect.right_bottom(),
-                    egui::Align2::RIGHT_BOTTOM,
-                    rec_text,
-                    style::FONT_REGULAR,
-                    rec_color,
-                );
-
-                let race_rect = rec_fps_rect
+                let rec_rect = live_rect
                     .right_bottom()
                     .into_cell()
                     .translate(2, 0)
-                    .extrude(12, -2);
-                ui.interact(
-                    race_rect,
-                    ui.make_persistent_id("status_race"),
-                    egui::Sense::click(),
+                    .extrude(
+                        grid::whole_cols(view::content_width(ui.ctx(), "󰑊 REC", &rec_text)),
+                        -2,
+                    );
+                let rec_response = view::BigButton::new("󰑊 REC", "", &rec_text, rec_color).show(
+                    ui,
+                    rec_rect,
+                    ui.make_persistent_id("status_rec"),
                 );
-                ui.painter().text(
-                    race_rect.left_bottom(),
-                    egui::Align2::LEFT_BOTTOM,
-                    "\u{f140b} RACE",
-                    style::FONT_REGULAR_X2,
-                    egui::Color32::DARK_GRAY,
+                if rec_response.clicked() {
+                    action = Action::ToggleRec;
+                }
+
+                let race_rect = rec_rect.right_bottom().into_cell().translate(2, 0).extrude(
+                    grid::whole_cols(view::content_width(
+                        ui.ctx(),
+                        "\u{f140b} RACE 00:00.000",
+                        "",
+                    )),
+                    -2,
                 );
-                let race_time_rect = race_rect
-                    .right_bottom()
-                    .into_cell()
-                    .translate(1, 0)
-                    .extrude(24, -2);
-                ui.painter().text(
-                    race_time_rect.left_bottom(),
-                    egui::Align2::LEFT_BOTTOM,
-                    "00:00.000",
-                    style::FONT_REGULAR_X2,
-                    egui::Color32::DARK_GRAY,
-                );
+                view::BigButton::new("\u{f140b} RACE 00:00.000", "", "", egui::Color32::DARK_GRAY)
+                    .show(ui, race_rect, ui.make_persistent_id("status_race"));
 
                 guidelines::dashed_line(
                     ui,

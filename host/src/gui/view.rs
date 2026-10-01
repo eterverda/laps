@@ -133,3 +133,92 @@ impl Letterbox {
         egui::InnerResponse::new(response.inner, response.response)
     }
 }
+
+/// Большая кнопка статуса: текст слева (слова через одинарные пробелы —
+/// по одной ячейке), верхняя мелкая строка у правого края, нижняя —
+/// правее крупного текста. Rect кнопки приходит снаружи целиком и должен
+/// покрывать весь контент — ширину считает вызывающий код (см.
+/// content_width). Ховер и клик — по пришедшему rect, Response
+/// возвращается наружу — действие решает вызывающий код.
+pub struct BigButton<'a> {
+    /// Левая строка кнопки: разбивается по пробелам, слова рисуются
+    /// в ряд, между ними — одинарный (1 ячейка) пробел.
+    pub text: &'a str,
+    pub top: &'a str,
+    pub bottom: &'a str,
+    pub color: egui::Color32,
+}
+
+impl<'a> BigButton<'a> {
+    pub fn new(text: &'a str, top: &'a str, bottom: &'a str, color: egui::Color32) -> Self {
+        Self {
+            text,
+            top,
+            bottom,
+            color,
+        }
+    }
+
+    pub fn show(&self, ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id) -> egui::Response {
+        let response = ui
+            .interact(rect, id, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+        let painter = ui.painter();
+        let mut pos = rect.left_bottom();
+        for word in self.text.split(' ').filter(|word| !word.is_empty()) {
+            painter.text(
+                pos,
+                egui::Align2::LEFT_BOTTOM,
+                word,
+                super::style::FONT_REGULAR_X2,
+                self.color,
+            );
+            pos.x += super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, word).x
+                + super::grid::cell_x(1);
+        }
+        if !self.top.is_empty() {
+            painter.text(
+                rect.right_top(),
+                egui::Align2::RIGHT_TOP,
+                self.top,
+                super::style::FONT_REGULAR,
+                self.color,
+            );
+        }
+        if !self.bottom.is_empty() {
+            // Мелкая строка — правее крупного текста (курсор после цикла
+            // слов уже стоит на одну ячейку за его концом), а не у правого
+            // края rect: иначе она наезжает под слова.
+            painter.text(
+                pos,
+                egui::Align2::LEFT_BOTTOM,
+                self.bottom,
+                super::style::FONT_REGULAR,
+                self.color,
+            );
+        }
+        response
+    }
+}
+
+/// Ширина контента кнопки (крупный текст + нижняя строка) в пикселях —
+/// чтобы вызывающий код мог посчитать rect.
+pub fn content_width(ctx: &egui::Context, text: &str, bottom: &str) -> f32 {
+    let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
+    let mut width: f32 = words
+        .iter()
+        .map(|word| super::measure_text(ctx, super::style::FONT_REGULAR_X2, *word).x)
+        .sum();
+    if words.len() > 1 {
+        width += super::grid::cell_x(1) * (words.len() - 1) as f32;
+    }
+    if !bottom.is_empty() {
+        // Ячейка между последним словом и нижней строкой; без нижней
+        // строки хвостовый пробел не считаем — ховер заканчивается ровно
+        // по тексту.
+        width +=
+            super::grid::cell_x(1) + super::measure_text(ctx, super::style::FONT_REGULAR, bottom).x;
+    }
+    width
+}

@@ -205,68 +205,38 @@ impl Live {
                 );
 
                 if columns > 0 {
-                    let border_width = grid::cell_x(1) / 2.0;
                     for (i, (pad_id, pad)) in pads.into_iter().enumerate() {
                         // Вьюфайндер по горизонтали в середине зоны
                         // (с точностью до клетки).
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - viewfinder_cols) / 2;
-                        let color = pad.color.to_color32();
                         let viewfinder_rect = grid::cell(col, TOP_BAR_ROWS)
-                            .translate(0, 3)
-                            .extrude(viewfinder_cols, viewfinder_rows);
-                        ui.painter().rect_stroke(
-                            viewfinder_rect,
-                            0.0,
-                            egui::Stroke::new(border_width, color),
-                            egui::StrokeKind::Outside,
-                        );
+                            .translate(0, 1)
+                            .extrude(viewfinder_cols, viewfinder_rows + 2);
                         // Off: no webcam feeds this viewport; Pending: webcam
                         // runs but no frame decoded yet; Texture: live feed.
                         let webcam_contents = contents
                             .get(&pad.fpv.camera_id)
                             .copied()
                             .unwrap_or(viewfinder::ViewfinderContents::Off);
-                        viewfinder::Viewfinder::new(pad.fpv.viewport.to_rect()).show(
-                            ui,
-                            webcam_contents,
-                            viewfinder_rect,
-                        );
-
-                        let label_len = pad.label.len() as isize;
-                        let label_rect = viewfinder_rect
-                            .left_top()
-                            .into_cell()
-                            .extrude(label_len * 2, -2);
-                        ui.painter().rect_filled(
-                            label_rect.expand2(egui::vec2(grid::cell_x(1) / 2.0, 0.0)),
-                            0.0,
-                            color,
-                        );
-                        ui.painter().text(
-                            label_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            &pad.label,
-                            style::FONT_REGULAR_X2,
-                            egui::Color32::WHITE,
-                        );
-
                         let pilot_name = self
                             .assignments
                             .get(pad_id)
                             .map_or("", |pilot| pilot.name.as_str());
-                        let pilot_rect = label_rect
-                            .right_top()
-                            .into_cell()
-                            .translate(2, 0)
-                            .extrude(0, 1);
-                        ui.painter().text(
-                            pilot_rect.left_top(),
-                            egui::Align2::LEFT_TOP,
+                        let frame_rect = viewfinder_rect.with_min_y(grid::cell_y(TOP_BAR_ROWS + 1));
+                        viewfinder::ViewfinderFrame::new(
+                            &pad.label,
                             pilot_name,
-                            style::FONT_REGULAR,
-                            egui::Color32::WHITE,
-                        );
+                            pad.color.to_color32(),
+                        )
+                        .show(ui, frame_rect, |ui, rect| {
+                            viewfinder::Viewfinder::new(pad.fpv.viewport.to_rect()).show(
+                                ui,
+                                webcam_contents,
+                                rect,
+                            );
+                        });
+
                         let graph_rect = viewfinder_rect
                             .left_bottom()
                             .into_cell()

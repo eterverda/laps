@@ -67,7 +67,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   только для экрана (**zune-jpeg**)
 - YUYV cameras: decode via **yuv** crate (dev-profile opt-level = 2)
 - Per-frame latency hot spots: nokhwa buffer copy and decode; hot crates
-  get `opt-level` bumps in dev profile (`zune-jpeg`/`zune-core` = 3,
+  get `opt-level` bumps in dev profile (`zune-jpeg`/`zune-core`/`jpeg-rusturbo` = 3,
   `memchr` = 3, `epaint` = 2) instead of optimizing our own crate in dev
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) and
   feed states (`FeedState`: Off/Live/Rec) signaled UI-ward via
@@ -78,7 +78,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 - **Passthrough**: camera already emits JPEG; recording = muxing blobs,
-  CPU cost ≈ 0. YUYV: RGBA re-encoded to JPEG (jpeg-encoder) in the
+  CPU cost ≈ 0. YUYV: RGBA re-encoded to JPEG (**jpeg-rusturbo**, SIMD; fallback — jpeg-encoder) in the
   writer thread.
 - **Containers** (per-camera setting in setup.yaml, `dvr.container`,
   default `mkv`):

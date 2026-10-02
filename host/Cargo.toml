@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Desktop application for the Laps timing system"
 
+[features]
+# Кодек перекодирования RGBA→jpeg в записи YUYV-потока.
+default = ["jpeg-rusturbo"]
+jpeg-rusturbo = ["dep:jpeg-rusturbo"]
+jpeg-encoder = ["dep:jpeg-encoder"]
+
 [dependencies]
 bytemuck = { version = "1.25", features = ["extern_crate_alloc"] }
 clap = { version = "4.6", features = ["derive"] }
@@ -25,7 +31,8 @@ tdigest = "1"
 memchr = "2"
 rand = "0.10"
 zune-jpeg = "0.5"
-jpeg-encoder = "0.7"
+jpeg-rusturbo = { version = "0.9", optional = true }
+jpeg-encoder = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-avfoundation"] }
@@ -44,6 +51,8 @@ collapsible_if = "allow"
 opt-level = 2
 
 [profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.jpeg-rusturbo]
 opt-level = 3
 
 [profile.dev.package.jpeg-encoder]

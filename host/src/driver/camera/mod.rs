@@ -17,7 +17,7 @@ pub use capture::{
 pub use nokhwa::NokhwaCapture as Backend;
 
 use crate::config::camera::{CameraConfig, PixelConfig};
-use crate::driver::dvr::{DvrSink, Options, RecordState, SharedRecordState};
+use crate::driver::dvr::{DvrSink, RecordParams, RecordState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,9 +40,9 @@ pub type SharedCaptureState = Arc<AtomicCell<CaptureState>>;
 
 type ImageSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 
-/// Команды из UI-потока в capture-поток (управление записью).
-enum Command {
-    StartRecording(Options),
+/// Команды записи из UI-потока в capture-поток.
+enum RecordCommand {
+    StartRecording(RecordParams),
     StopRecording,
 }
 
@@ -91,7 +91,7 @@ pub struct Camera {
     thread: Option<thread::JoinHandle<()>>,
     camera: SharedCaptureState,
     record: SharedRecordState,
-    commands: crossbeam_channel::Sender<Command>,
+    commands: crossbeam_channel::Sender<RecordCommand>,
     ui_latency: Arc<Mutex<fps::FrameStats>>,
 }
 
@@ -108,10 +108,10 @@ impl Camera {
 
     /// Запустить запись. Команда применится перед следующим кадром;
     /// ошибка создания файла уйдёт в лог, RecordState останется false.
-    pub fn start_recording(&self, options: Options) {
+    pub fn start_recording(&self, params: RecordParams) {
         if self
             .commands
-            .try_send(Command::StartRecording(options))
+            .try_send(RecordCommand::StartRecording(params))
             .is_err()
         {
             log::warn!("dvr: start_recording ignored (capture thread gone)");
@@ -121,7 +121,7 @@ impl Camera {
     /// Остановить запись; файл финализируется в фоне. Команда
     /// применится между кадрами, затем — drop recorder'а.
     pub fn stop_recording(&self) {
-        if self.commands.try_send(Command::StopRecording).is_err() {
+        if self.commands.try_send(RecordCommand::StopRecording).is_err() {
             log::warn!("dvr: stop_recording ignored (capture thread gone)");
         }
     }
@@ -225,8 +225,8 @@ impl Camera {
                 // блокирует до ~периода кадра, задержка незаметна.
                 for cmd in commands_rx.try_iter() {
                     match cmd {
-                        Command::StartRecording(options) => dvr_sink.start(&options),
-                        Command::StopRecording => dvr_sink.stop(),
+                        RecordCommand::StartRecording(options) => dvr_sink.start(&options),
+                        RecordCommand::StopRecording => dvr_sink.stop(),
                     }
                 }
 

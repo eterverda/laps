@@ -51,7 +51,7 @@ pub(crate) trait VideoWriter: Send {
 pub const CAPTURES_DIR: &str = "captures";
 
 /// Параметры записи одной камеры.
-pub struct Options {
+pub struct RecordParams {
     pub dir: PathBuf,
     pub camera_id: String,
     /// Справочно: для логов и отчёта. Размеры для записи авторитетны
@@ -81,24 +81,24 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn start(
-        options: &Options,
+        params: &RecordParams,
         negotiated: &crate::driver::camera::capture::CaptureFormat,
         state: &SharedRecordState,
     ) -> io::Result<Self> {
         use crate::driver::camera::capture::FrameData;
-        std::fs::create_dir_all(&options.dir)?;
-        let stem = format!("{}-{}-mjpeg", timestamp_prefix(), options.camera_id);
+        std::fs::create_dir_all(&params.dir)?;
+        let stem = format!("{}-{}-mjpeg", timestamp_prefix(), params.camera_id);
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
         let width = negotiated.resolution.width;
         let height = negotiated.resolution.height;
-        let extension = match options.camera.dvr.container {
+        let extension = match params.camera.dvr.container {
             ContainerConfig::Mkv => "mkv",
             ContainerConfig::Mov => "mov",
             ContainerConfig::Mp4 => "mp4",
         };
-        let path = options.dir.join(format!("{stem}.{extension}"));
-        let mut writer: Box<dyn VideoWriter> = match options.camera.dvr.container {
+        let path = params.dir.join(format!("{stem}.{extension}"));
+        let mut writer: Box<dyn VideoWriter> = match params.camera.dvr.container {
             ContainerConfig::Mkv => Box::new(MkvWriter::create(&path, width, height)?),
             ContainerConfig::Mov => Box::new(MovWriter::create(&path, width, height)?),
             ContainerConfig::Mp4 => Box::new(Mp4Writer::create(&path, width, height)?),
@@ -297,7 +297,7 @@ mod tests {
             ok: false,
             fps: 0.0,
         }));
-        let options = super::Options {
+        let params = super::RecordParams {
             dir: dir.clone(),
             camera_id: "camera-1".to_owned(),
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Yuyv),
@@ -311,7 +311,7 @@ mod tests {
             format: PixelConfig::Yuyv,
         };
         {
-            let recorder = super::Recorder::start(&options, &negotiated, &state).unwrap();
+            let recorder = super::Recorder::start(&params, &negotiated, &state).unwrap();
             for _ in 0..3 {
                 let pixels = vec![egui::Color32::BLACK; 64 * 48];
                 recorder.push(

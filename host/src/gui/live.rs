@@ -405,7 +405,7 @@ impl Live {
     fn start_recording_all(&mut self) {
         for (id, camera) in &self.active_cameras {
             if let Some(webcam) = self.webcams.get(id) {
-                webcam.start_recording(crate::driver::dvr::Options {
+                webcam.start_recording(crate::driver::dvr::RecordParams {
                     dir: crate::driver::dvr::CAPTURES_DIR.into(),
                     camera_id: id.clone(),
                     camera: camera.clone(),

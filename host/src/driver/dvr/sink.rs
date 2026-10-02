@@ -3,7 +3,7 @@
 //! `dvr → camera::capture` (контракт sink'а), а не наоборот. Camera
 //! pipeline владеет экземпляром и дёргает start/stop по командам UI.
 
-use super::{Options, Recorder, SharedRecordState};
+use super::{RecordParams, Recorder, SharedRecordState};
 use crate::config::camera::FrameRateConfig;
 use crate::driver::camera::capture::{Frame, FrameData, FrameSink};
 use std::sync::Arc;
@@ -72,9 +72,9 @@ impl DvrSink {
 
     /// Файл создаётся здесь, а не в writer-потоке: ошибка (диск полон,
     /// нет прав) логируется, RecordState остаётся false — как раньше.
-    pub fn start(&mut self, options: &Options) {
-        self.set_fps(FrameRateConfig(options.camera.dvr_frame_rate().0));
-        match Recorder::start(options, &self.negotiated, &self.state) {
+    pub fn start(&mut self, params: &RecordParams) {
+        self.set_fps(FrameRateConfig(params.camera.dvr_frame_rate().0));
+        match Recorder::start(params, &self.negotiated, &self.state) {
             Ok(recorder) => self.recorder = Some(recorder),
             Err(e) => {
                 log::error!("dvr: recording unavailable: {}", e);

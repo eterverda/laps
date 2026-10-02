@@ -45,7 +45,7 @@ pub enum FrameError {
 /// Кадр: таймстемп + контент. Таймстемп штампует бэкенд каждый кадр —
 /// из низлежащих данных устройства, если они есть (V4L2
 /// `v4l2_buffer.timestamp`, приведённый к Instant), иначе время прихода.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Frame {
     pub timestamp: Instant,
     pub data: FrameData,
@@ -55,7 +55,9 @@ pub struct Frame {
 /// (P4: срез по `len` делает потребитель). `Rgba` — только от pipeline
 /// (после конверсии) или от нативно-RGBA бэкенда будущего: sink'и `Yuyv`
 /// не получают никогда — это инвариант pipeline, а не типа.
-#[derive(Debug, Clone)]
+/// Общность для нескольких потребителей выражается снаружи:
+/// `Arc<Frame>` (см. FrameSink), а не полями внутри вариантов.
+#[derive(Debug)]
 pub enum FrameData {
     /// `buf` — весь полученный буфер; `len` — длина jpeg-кадра SOI..EOI,
     /// вычисленная источником (FFD9-поиск). `None` — EOI не найден
@@ -63,9 +65,8 @@ pub enum FrameData {
     Jpeg { buf: Vec<u8>, len: Option<usize> },
     /// Сырые Y0 U Y1 V. Дальше pipeline не проходит без конверсии.
     Yuyv { buf: Vec<u8> },
-    /// Декодированная картинка. `Arc` — чтобы pipeline мог отдать один
-    /// декод нескольким sink'ам без копий (клон = бамп счётчика).
-    Rgba { rgba: Arc<egui::ColorImage> },
+    /// Декодированная картинка.
+    Rgba { rgba: egui::ColorImage },
 }
 
 /// Фабрика сессий захвата. Два метода: перечисление устройств (с
@@ -90,9 +91,11 @@ pub trait CaptureSession {
 
 /// Потребитель кадров pipeline. Инвариант: sink получает только `Jpeg`
 /// (DVR) или `Rgba` (любой); `Yuyv` pipeline конвертировал до fan-out.
-/// Кадр передаётся по значению — реализации забирают буфер без копий.
+/// Кадр приходит как `Arc<Frame>`: несколько sink'ов получают один кадр
+/// бампом счётчика, без копий; sink вправе хранить Arc за пределами
+/// коллбэка (UI-slot, канал writer'а).
 pub trait FrameSink {
-    fn on_frame(&mut self, frame: Frame);
+    fn on_frame(&mut self, frame: Arc<Frame>);
     /// Pipeline завершается (камера потеряна, стоп) — sink подчищается.
     fn on_stop(&mut self) {}
 }

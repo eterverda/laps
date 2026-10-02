@@ -53,7 +53,7 @@ fn should_record_frame(fps: FrameRateConfig, last_recorded_frame: &mut Instant) 
     }
 }
 
-type ImageSlot = Arc<Mutex<Option<Arc<egui::ColorImage>>>>;
+type ImageSlot = Arc<Mutex<Option<Arc<capture::Frame>>>>;
 
 /// Команды из UI-потока в capture-поток (управление записью).
 enum Command {
@@ -70,10 +70,10 @@ struct UiSink {
 }
 
 impl FrameSink for UiSink {
-    fn on_frame(&mut self, frame: Frame) {
-        match frame.data {
-            FrameData::Rgba { rgba } => {
-                *self.slot.lock().unwrap() = Some(rgba);
+    fn on_frame(&mut self, frame: Arc<capture::Frame>) {
+        match &frame.data {
+            capture::FrameData::Rgba { .. } => {
+                *self.slot.lock().unwrap() = Some(frame);
                 (self.on_frame)();
             }
             _ => log::warn!("ui sink: unexpected non-RGBA frame"),
@@ -140,7 +140,7 @@ impl DvrSink {
 }
 
 impl FrameSink for DvrSink {
-    fn on_frame(&mut self, frame: Frame) {
+    fn on_frame(&mut self, frame: Arc<capture::Frame>) {
         if self.recorder.is_none() {
             return;
         }
@@ -148,13 +148,10 @@ impl FrameSink for DvrSink {
             return;
         }
         let ts = self.epoch_millis(frame.timestamp);
-        match frame.data {
-            // Jpeg: passthrough, буфер не копируется (P4).
-            FrameData::Jpeg { .. } | FrameData::Rgba { .. } => {
-                self.recorder.as_ref().unwrap().push(frame.data, ts)
-            }
+        match &frame.data {
             // Инвариант pipeline: до sink'ов Yuyv не доходит.
             FrameData::Yuyv { .. } => log::error!("dvr sink: raw YUYV frame, skipped"),
+            _ => self.recorder.as_ref().unwrap().push(frame, ts),
         }
     }
 
@@ -351,17 +348,15 @@ impl Webcam {
                         // может отказать на кадре, который плеер съел бы —
                         // экранный дроп не должен терять кадр в записи.
                         let decoded = decode::decode_frame(PixelConfig::Mjpeg, &buf, width, height);
-                        dvr_sink.on_frame(Frame {
+                        dvr_sink.on_frame(Arc::new(Frame {
                             timestamp: ts,
                             data: FrameData::Jpeg { buf, len },
-                        });
+                        }));
                         match decoded {
-                            Ok(image) => ui_sink.on_frame(Frame {
+                            Ok(image) => ui_sink.on_frame(Arc::new(Frame {
                                 timestamp: ts,
-                                data: FrameData::Rgba {
-                                    rgba: Arc::new(image),
-                                },
-                            }),
+                                data: FrameData::Rgba { rgba: image },
+                            })),
                             Err(DecodeError::Recoverable(e)) => {
                                 log::warn!("frame skipped: {}", e);
                             }
@@ -374,12 +369,11 @@ impl Webcam {
                     FrameData::Yuyv { buf } => {
                         match decode::decode_frame(PixelConfig::Yuyv, &buf, width, height) {
                             Ok(image) => {
-                                let frame = Frame {
+                                // Один декод — обоим sink'ам бампом счётчика.
+                                let frame = Arc::new(Frame {
                                     timestamp: ts,
-                                    data: FrameData::Rgba {
-                                        rgba: Arc::new(image),
-                                    },
-                                };
+                                    data: FrameData::Rgba { rgba: image },
+                                });
                                 dvr_sink.on_frame(frame.clone());
                                 ui_sink.on_frame(frame);
                             }
@@ -394,10 +388,10 @@ impl Webcam {
                     }
                     // Нативный RGBA от будущих бэкендов: без декода.
                     FrameData::Rgba { rgba } => {
-                        let frame = Frame {
+                        let frame = Arc::new(Frame {
                             timestamp: ts,
                             data: FrameData::Rgba { rgba },
-                        };
+                        });
                         dvr_sink.on_frame(frame.clone());
                         ui_sink.on_frame(frame);
                     }
@@ -439,15 +433,18 @@ impl Webcam {
         };
         let new_frame = image.is_some();
 
-        if let Some(image) = image {
+        if let Some(frame) = image {
+            let capture::FrameData::Rgba { rgba } = &frame.data else {
+                unreachable!("ui slot holds only RGBA frames");
+            };
             match &mut self.texture {
                 Some(texture) => {
-                    texture.set((*image).clone(), egui::TextureOptions::NEAREST);
+                    texture.set((*rgba).clone(), egui::TextureOptions::NEAREST);
                 }
                 None => {
                     self.texture = Some(ctx.load_texture(
                         "camera",
-                        (*image).clone(),
+                        (*rgba).clone(),
                         egui::TextureOptions::NEAREST,
                     ));
                 }

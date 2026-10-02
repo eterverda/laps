@@ -227,7 +227,7 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// не держит, detach безопасен).
 pub struct Recorder {
     state: SharedRecordState,
-    sender: Option<crossbeam_channel::Sender<(crate::driver::capture::FrameData, u64)>>,
+    sender: Option<crossbeam_channel::Sender<(std::sync::Arc<crate::driver::capture::Frame>, u64)>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// Дропы в канале (try_send failed), считает push, читает
     /// writer-поток для отчёта.
@@ -262,7 +262,10 @@ impl Recorder {
         };
         state.store(RecordState { ok: true, fps: 0.0 });
         let writer_path = path.clone();
-        let (sender, receiver) = crossbeam_channel::bounded::<(FrameData, u64)>(CHANNEL_CAP);
+        let (sender, receiver) = crossbeam_channel::bounded::<(
+            std::sync::Arc<crate::driver::capture::Frame>,
+            u64,
+        )>(CHANNEL_CAP);
         let state_clone = state.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_clone = dropped.clone();
@@ -290,11 +293,11 @@ impl Recorder {
             // Времена кодирования — t-digest для p90 в отчёте.
             let mut enc_digest = tdigest::TDigest::new_with_size(100);
             // Канал закрывается по Drop отправителя → finalize и выход.
-            while let Ok((data, ts)) = receiver.recv() {
+            while let Ok((frame, ts)) = receiver.recv() {
                 // Перекодированный jpeg текущего кадра: живёт до конца
                 // итерации, освобождается после write_frame.
                 let encoded: Option<Vec<u8>>;
-                let frame: &[u8] = match &data {
+                let data: &[u8] = match &frame.data {
                     FrameData::Jpeg { buf, len } => {
                         let Some(len) = len else {
                             log::warn!("dvr: frame without EOI, skipped");
@@ -304,7 +307,7 @@ impl Recorder {
                     }
                     FrameData::Rgba { rgba } => {
                         let t0 = Instant::now();
-                        // Владение у rgba — в writer-потоке, копий нет.
+                        // Кадр общий (Arc), пиксели только заимствуем.
                         let jpeg = match encode_rgba_to_jpeg(
                             bytemuck::cast_slice(&rgba.pixels),
                             width,
@@ -337,7 +340,7 @@ impl Recorder {
                         continue;
                     }
                 };
-                if let Err(e) = writer.write_frame(frame, ts) {
+                if let Err(e) = writer.write_frame(data, ts) {
                     log::error!("dvr: write failed, recording aborted: {}", e);
                     state_clone.store(RecordState {
                         ok: false,
@@ -455,12 +458,12 @@ impl Recorder {
     /// просто выбрасывается (состояние уже отражено в RecordState, UI
     /// показал). Переполнение канала = дроп кадра + warn (захват важнее
     /// записи).
-    pub fn push(&self, data: crate::driver::capture::FrameData, ts: u64) {
+    pub fn push(&self, frame: std::sync::Arc<crate::driver::capture::Frame>, ts: u64) {
         if !self.state.load().ok {
             return;
         }
         if let Some(sender) = &self.sender {
-            if sender.try_send((data, ts)).is_err() {
+            if sender.try_send((frame, ts)).is_err() {
                 self.dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::warn!("dvr: frame dropped (writer busy)");
@@ -605,9 +608,12 @@ mod tests {
             for _ in 0..3 {
                 let pixels = vec![egui::Color32::BLACK; 64 * 48];
                 recorder.push(
-                    crate::driver::capture::FrameData::Rgba {
-                        rgba: std::sync::Arc::new(egui::ColorImage::new([64, 48], pixels)),
-                    },
+                    std::sync::Arc::new(crate::driver::capture::Frame {
+                        timestamp: std::time::Instant::now(),
+                        data: crate::driver::capture::FrameData::Rgba {
+                            rgba: egui::ColorImage::new([64, 48], pixels),
+                        },
+                    }),
                     super::epoch_millis(),
                 );
             }

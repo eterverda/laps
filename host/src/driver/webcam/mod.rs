@@ -76,7 +76,7 @@ impl FrameSink for UiSink {
                 *self.slot.lock().unwrap() = Some(frame);
                 (self.on_frame)();
             }
-            _ => log::warn!("ui sink: unexpected non-RGBA frame"),
+            other => log::error!("ui sink: unexpected frame variant {other:?}"),
         }
     }
 }
@@ -149,9 +149,13 @@ impl FrameSink for DvrSink {
         }
         let ts = self.epoch_millis(frame.timestamp);
         match &frame.data {
-            // Инвариант pipeline: до sink'ов Yuyv не доходит.
-            FrameData::Yuyv { .. } => log::error!("dvr sink: raw YUYV frame, skipped"),
-            _ => self.recorder.as_ref().unwrap().push(frame, ts),
+            // Известные к записи варианты; буфер не копируется (P4).
+            FrameData::Jpeg { .. } | FrameData::Rgba { .. } => {
+                self.recorder.as_ref().unwrap().push(frame, ts)
+            }
+            // Yuyv и любые будущие варианты сюда не должны доходить
+            // (инвариант pipeline) — принципиально неизвестное отвергаем.
+            other => log::error!("dvr sink: unexpected frame variant {other:?}, skipped"),
         }
     }
 

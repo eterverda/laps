@@ -23,7 +23,7 @@ use mkv::MkvWriter;
 use mov::MovWriter;
 use mp4::Mp4Writer;
 
-use crate::config::camera::{ContainerConfig, PixelConfig};
+use crate::config::camera::ContainerConfig;
 
 /// Состояние записи: writer жив и пишет на диск.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -59,149 +59,6 @@ pub struct Options {
     pub camera: crate::config::camera::CameraConfig,
 }
 
-/// Отчёт о записи: `{stem}-report.yaml` рядом с видео, пишется при
-/// финализации. Три секции: что просили, что открыл драйвер, что реально
-/// попало в файл. `actual.frame-rate` — заявление драйвера, сверять
-/// с `recorded`.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct Report<'a> {
-    requested: &'a crate::config::camera::CameraConfig,
-    actual: CameraReport<'a>,
-    recorded: ReportRecorded,
-    system: ReportSystem,
-}
-
-/// Реально согласованный формат (capture::CaptureFormat) для отчёта.
-/// `name` — имя из конфига, которым мы матчили камеру (в согласованном
-/// формате имени нет).
-struct CameraReport<'a> {
-    name: &'a str,
-    format: &'a crate::driver::camera::capture::CaptureFormat,
-}
-
-impl serde::Serialize for CameraReport<'_> {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let fmt = self.format;
-        let mut st = s.serialize_struct("CameraReport", 4)?;
-        st.serialize_field("name", self.name)?;
-        st.serialize_field(
-            "resolution",
-            &format!("{}x{}", fmt.resolution.width, fmt.resolution.height),
-        )?;
-        st.serialize_field("frame-rate", &format!("{}fps", fmt.frame_rate.0))?;
-        st.serialize_field("format", &fmt.format.as_str().to_lowercase())?;
-        st.end()
-    }
-}
-
-/// Сведения о машине, где шла запись: диагностика fps-просадок
-/// часто упирается в железо/хост.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct ReportSystem {
-    hostname: String,
-    os: String,
-    cpu: String,
-    gpu: String,
-}
-
-fn read_first_line(path: &str) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-fn system_info() -> ReportSystem {
-    let hostname = read_first_line("/proc/sys/kernel/hostname")
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "unknown".into());
-    let os = std::fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|c| {
-            c.lines()
-                .find_map(|l| l.strip_prefix("PRETTY_NAME="))
-                .map(|s| s.trim_matches('"').to_owned())
-        })
-        .unwrap_or_else(|| std::env::consts::OS.to_owned());
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|c| {
-            c.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(str::trim)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".into());
-    // VGA-контроллер; на машинах без lspci (не-Linux) будет "unknown".
-    let gpu = std::process::Command::new("lspci")
-        .output()
-        .ok()
-        .and_then(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .find(|l| {
-                    let l = l.to_lowercase();
-                    ["vga", "3d controller", "display controller"]
-                        .iter()
-                        .any(|k| l.contains(k))
-                })
-                .and_then(|l| l.split(':').nth(2))
-                .map(str::trim)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".into());
-    ReportSystem {
-        hostname,
-        os,
-        cpu,
-        gpu,
-    }
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct ReportRecorded {
-    frames_written: u64,
-    /// Кадры, не влезшие в канал writer (try_send failed).
-    frames_dropped: u64,
-    #[serde(with = "humantime_serde")]
-    duration: Duration,
-    frame_rate_average: crate::config::camera::FrameRateFConfig,
-    #[serde(with = "humantime_serde")]
-    frame_interval_min: Duration,
-    #[serde(with = "humantime_serde")]
-    frame_interval_max: Duration,
-    #[serde(with = "humantime_serde")]
-    frame_interval_p90: Duration,
-    /// Время перекодирования RGBA→JPEG; отсутствует для MJPEG-пайплайна
-    /// (там перекода нет).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    jpeg_encode: Option<ReportJpegEncode>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct ReportJpegEncode {
-    frames: u64,
-    #[serde(with = "humantime_serde")]
-    total: Duration,
-    #[serde(with = "humantime_serde")]
-    min: Duration,
-    #[serde(with = "humantime_serde")]
-    max: Duration,
-    #[serde(with = "humantime_serde")]
-    avg: Duration,
-    #[serde(with = "humantime_serde")]
-    p90: Duration,
-}
-
 const CHANNEL_CAP: usize = 64;
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -235,8 +92,6 @@ impl Recorder {
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
         let width = negotiated.resolution.width;
         let height = negotiated.resolution.height;
-        let format = options.camera.format;
-        let report_path = options.dir.join(format!("{stem}-report.yaml"));
         let extension = match options.camera.dvr.container {
             ContainerConfig::Mkv => "mkv",
             ContainerConfig::Mov => "mov",
@@ -256,35 +111,16 @@ impl Recorder {
         )>(CHANNEL_CAP);
         let state_clone = state.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let dropped_clone = dropped.clone();
         // В поток уходят owned-копии: ссылки на параметры не 'static.
-        let camera_owned = options.camera.clone();
-        let negotiated_owned = *negotiated;
         let thread = std::thread::spawn(move || {
             let mut last_sync = Instant::now();
             // Замер пишущихся кадров для UI: второй, независимый от
             // capture-потока счётчик — отражает потери в канале.
             let mut fps_counter = crate::driver::camera::fps::FpsCounter::default();
-            // Статистика для отчёта.
-            let mut frames: u64 = 0;
-            let mut first_ts: u64 = 0;
-            let mut last_ts: u64 = 0;
-            let mut min_interval: u64 = u64::MAX;
-            let mut max_interval: u64 = 0;
-            // Интервалы между кадрами — t-digest для перцентиля в отчёте
-            // (приближённо, но память O(1) вне зависимости от длины записи).
-            let mut interval_digest = tdigest::TDigest::new_with_size(100);
-            let mut enc_frames: u64 = 0;
-            let mut enc_total_ms: u64 = 0;
-            let mut enc_max_ms: u64 = 0;
-            let mut enc_min_ms: u64 = u64::MAX;
-            // Времена кодирования — t-digest для p90 в отчёте.
-            let mut enc_digest = tdigest::TDigest::new_with_size(100);
             // Латентность кадра: от его таймстемпа до окончания записи
             // в файл (включая ожидание в канале). Один лог при финализации.
             let mut latency = crate::driver::camera::fps::FrameStats::default();
             // Длительность перекодирования rgba→jpeg (фаза, не латентность).
-            // Ручные enc_* выше — для yaml-отчёта, этот счётчик — для лога.
             let mut encode = crate::driver::camera::fps::FrameStats::default();
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((frame, ts)) = receiver.recv() {
@@ -317,14 +153,7 @@ impl Recorder {
                                 return;
                             }
                         };
-                        enc_frames += 1;
-                        let dur = t0.elapsed();
-                        encode.on_process(dur);
-                        let ms = dur.as_millis() as u64;
-                        enc_total_ms += ms;
-                        enc_max_ms = enc_max_ms.max(ms);
-                        enc_min_ms = enc_min_ms.min(ms);
-                        enc_digest.push(ms as f64);
+                        encode.on_process(t0.elapsed());
                         // jpeg живёт до write_frame в этом scope; хвост
                         // храним во временной переменной.
                         encoded = Some(jpeg);
@@ -344,16 +173,6 @@ impl Recorder {
                     });
                     return;
                 }
-                if frames > 0 {
-                    let d = ts.saturating_sub(last_ts);
-                    min_interval = min_interval.min(d);
-                    max_interval = max_interval.max(d);
-                    interval_digest.push(d as f64);
-                } else {
-                    first_ts = ts;
-                }
-                last_ts = ts;
-                frames += 1;
                 // Кадр (Arc) ещё жив: замер от его таймстемпа до конца
                 // записи.
                 latency.on_frame(&frame);
@@ -382,65 +201,6 @@ impl Recorder {
             match writer.finalize() {
                 Ok(()) => log::info!("dvr: finalized {:?}", writer_path),
                 Err(e) => log::error!("dvr: finalize failed for {:?}: {}", writer_path, e),
-            }
-            let duration_ms = if frames > 1 {
-                last_ts.saturating_sub(first_ts)
-            } else {
-                0
-            };
-            let avg_fps = if duration_ms > 0 {
-                round1((frames - 1) as f64 / duration_ms as f64 * 1000.0)
-            } else {
-                0.0
-            };
-            enc_digest.flush();
-            let jpeg_encode =
-                (format == PixelConfig::Yuyv && enc_frames > 0).then(|| ReportJpegEncode {
-                    frames: enc_frames,
-                    total: Duration::from_millis(enc_total_ms),
-                    avg: Duration::from_nanos(enc_total_ms * 1_000_000 / enc_frames),
-                    min: Duration::from_millis(enc_min_ms),
-                    max: Duration::from_millis(enc_max_ms),
-                    p90: Duration::from_millis(
-                        enc_digest.estimate_quantile(0.9).unwrap_or(0.0) as u64
-                    ),
-                });
-            // Буферизованные значения нужно слить в центроиды перед
-            // оценкой квантиля.
-            interval_digest.flush();
-            let report = Report {
-                requested: &camera_owned,
-                actual: CameraReport {
-                    name: &camera_owned.name,
-                    format: &negotiated_owned,
-                },
-                recorded: ReportRecorded {
-                    frames_written: frames,
-                    duration: Duration::from_millis(duration_ms),
-                    frame_rate_average: crate::config::camera::FrameRateFConfig(avg_fps),
-                    frame_interval_min: Duration::from_millis(if frames > 1 {
-                        min_interval
-                    } else {
-                        0
-                    }),
-                    frame_interval_max: Duration::from_millis(max_interval),
-                    frame_interval_p90: Duration::from_millis(
-                        interval_digest.estimate_quantile(0.9).unwrap_or(0.0) as u64,
-                    ),
-                    frames_dropped: dropped_clone.load(std::sync::atomic::Ordering::Relaxed),
-                    jpeg_encode,
-                },
-                system: system_info(),
-            };
-            // serde_yaml пишет валидные plain-скаляры ("64x48",
-            // "30fps") без кавычек.
-            match serde_yaml::to_string(&report) {
-                Ok(yaml) => {
-                    if let Err(e) = std::fs::write(&report_path, yaml) {
-                        log::error!("dvr: report write failed for {:?}: {}", report_path, e);
-                    }
-                }
-                Err(e) => log::error!("dvr: report serialize failed: {}", e),
             }
             // Один лог на запись: латентность «захват → кадр на диске»
             // и длительность перекодирования.
@@ -489,10 +249,6 @@ impl Drop for Recorder {
 }
 
 /// Округление до одного знака (для отчёта).
-fn round1(x: f64) -> f32 {
-    ((x * 10.0).round() / 10.0) as f32
-}
-
 pub(crate) fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -523,62 +279,6 @@ mod tests {
         assert!(
             lazy_regex::regex_is_match!(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.\d{3}$", &prefix),
             "bad timestamp prefix: {prefix}"
-        );
-    }
-
-    #[test]
-    fn report_duration_serialization() {
-        use super::ReportRecorded;
-        use crate::config::camera::FrameRateFConfig;
-        let rec = ReportRecorded {
-            frames_written: 3,
-            frames_dropped: 0,
-            duration: std::time::Duration::from_millis(72_500),
-            frame_rate_average: FrameRateFConfig(27.59),
-            frame_interval_min: std::time::Duration::from_millis(33),
-            frame_interval_max: std::time::Duration::from_millis(1_500),
-            frame_interval_p90: std::time::Duration::from_millis(40),
-            jpeg_encode: None,
-        };
-        let yaml = serde_yaml::to_string(&rec).unwrap();
-        assert!(
-            yaml.contains("duration: 1m 12s 500ms"),
-            "unexpected duration serialization:\n{yaml}"
-        );
-        assert!(yaml.contains("frame-interval-min: 33ms"), "\n{yaml}");
-        assert!(yaml.contains("frame-interval-max: 1s 500ms"), "\n{yaml}");
-        assert!(yaml.contains("frame-interval-p90: 40ms"), "\n{yaml}");
-    }
-
-    #[test]
-    fn interval_digest_p90() {
-        // Малый ряд: оценка интерполирует между центроидами, но должна
-        // остаться внутри диапазона и далеко от выбросов.
-        let mut d = tdigest::TDigest::new_with_size(100);
-        for _ in 0..20 {
-            d.push(33.0);
-        }
-        d.push(500.0);
-        d.push(900.0);
-        d.flush();
-        let p90 = d.estimate_quantile(0.9).unwrap();
-        assert!((33.0..500.0).contains(&p90), "p90 = {p90}");
-        // Большой ряд: p90 должен сойтись к 33ms, а не к выбросам.
-        let mut big = tdigest::TDigest::new_with_size(100);
-        for _ in 0..10_000 {
-            big.push(33.0);
-        }
-        for v in [500.0, 900.0].iter().cycle().take(200) {
-            big.push(*v);
-        }
-        big.flush();
-        let p90 = big.estimate_quantile(0.9).unwrap();
-        assert!((30.0..40.0).contains(&p90), "p90 = {p90}");
-        // Пустой дайджест — None, отчёт пишет 0ms.
-        assert!(
-            tdigest::TDigest::new_with_size(100)
-                .estimate_quantile(0.9)
-                .is_none()
         );
     }
 
@@ -634,24 +334,7 @@ mod tests {
         }
         assert!(!state.load().ok);
 
-        // REC погас до finalize — ждём отчёт: он пишется самым последним
-        // действием writer-потока.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let report_path = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.to_string_lossy().ends_with("-report.yaml"));
-        let mut report_path = report_path;
-        while report_path.is_none() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            report_path = std::fs::read_dir(&dir)
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .find(|p| p.to_string_lossy().ends_with("-report.yaml"));
-        }
-
-        // Видеофайл есть (контейнер по умолчанию — MKV), рядом отчёт,
-        // других файлов нет.
+        // Видеофайл есть (контейнер по умолчанию — MKV), других файлов нет.
         let entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -662,17 +345,10 @@ mod tests {
                 .any(|p| p.extension().is_some_and(|e| e == "mkv")),
             "no mkv in {entries:?}"
         );
-        let report_path = report_path.expect("no report written");
-        let yaml = std::fs::read_to_string(&report_path).unwrap();
-        assert!(yaml.contains("requested:"), "report: {yaml}");
-        assert!(yaml.contains("actual:"), "report: {yaml}");
-        assert!(yaml.contains("recorded:"), "report: {yaml}");
-        assert!(yaml.contains("system:"), "report: {yaml}");
-        assert!(yaml.contains("jpeg-encode:"), "report: {yaml}");
         assert!(
             entries
                 .iter()
-                .all(|p| { p.extension().is_some_and(|e| e == "mkv") || p == &report_path }),
+                .all(|p| p.extension().is_some_and(|e| e == "mkv")),
             "unexpected files: {entries:?}"
         );
 

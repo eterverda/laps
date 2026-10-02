@@ -223,23 +223,6 @@ impl serde::Serialize for FrameRateConfig {
     }
 }
 
-/// Дробная частота кадров — для измеренных значений (avg fps записи).
-/// Печатается с двумя десятичными знаками (`60.00fps`, `29.97fps`).
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct FrameRateFConfig(pub f32);
-
-impl fmt::Display for FrameRateFConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:.2}fps", self.0)
-    }
-}
-
-impl serde::Serialize for FrameRateFConfig {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
-    }
-}
-
 /// A rectangular region of a video frame in normalized 0..1 coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViewportConfig {
@@ -327,14 +310,6 @@ mod tests {
         );
         assert!(serde_yaml::from_str::<ResolutionConfig>("1920 x 1080").is_err());
         assert!(serde_yaml::from_str::<ResolutionConfig>("1920").is_err());
-    }
-
-    #[test]
-    fn test_fps_float() {
-        assert_eq!(FrameRateFConfig(60.0).to_string(), "60.00fps");
-        assert_eq!(FrameRateFConfig(29.97).to_string(), "29.97fps");
-        let yaml = serde_yaml::to_string(&FrameRateFConfig(59.9)).unwrap();
-        assert_eq!(yaml.trim_end(), "59.90fps");
     }
 
     #[test]

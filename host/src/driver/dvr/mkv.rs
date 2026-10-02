@@ -155,6 +155,15 @@ impl MkvWriter {
         push_u(&mut entry, 0x83, 1, 1); // TrackType: video
         push_text(&mut entry, 0x86, 1, "V_MJPEG"); // CodecID
         push_elem(&mut entry, 0xE0, 1, &video); // Video
+        // Colour: BT.601, full range. Кадры — full-range JFIF; без
+        // декларации плееры угадывают studio swing для видео и растягивают
+        // mid-tones. Идёт после Video, как у libmatroska/ffmpeg.
+        let mut colour = Vec::new();
+        push_u(&mut colour, 0x55B1, 2, 6); // MatrixCoefficients: BT.601
+        push_u(&mut colour, 0x55B9, 2, 2); // Range: 2 = full
+        push_u(&mut colour, 0x55BA, 2, 6); // TransferCharacteristics: BT.601
+        push_u(&mut colour, 0x55BB, 2, 6); // Primaries: BT.601
+        push_elem(&mut entry, 0x55B0, 2, &colour); // Colour
         let mut tracks = Vec::new();
         push_elem(&mut tracks, 0xAE, 1, &entry); // TrackEntry
         let tracks_pos = writer.stream_position()?;
@@ -482,6 +491,12 @@ mod tests {
         let video_children = parse(&buf, video.start, video.start + video.len);
         assert_eq!(u_value(&buf, find(&video_children, 0xB0)), 1920);
         assert_eq!(u_value(&buf, find(&video_children, 0xBA)), 1080);
+
+        // Colour: BT.601, full range — плеер не угадывает диапазон.
+        let colour = find(&entry_children, 0x55B0);
+        let colour_children = parse(&buf, colour.start, colour.start + colour.len);
+        assert_eq!(u_value(&buf, find(&colour_children, 0x55B1)), 6); // matrix BT.601
+        assert_eq!(u_value(&buf, find(&colour_children, 0x55B9)), 2); // range full
 
         // Duration: от первого до последнего кадра, мс.
         let info = find(&seg_children, 0x1549A966);

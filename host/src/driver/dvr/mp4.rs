@@ -320,6 +320,17 @@ impl IsobmffCore {
         entry.extend_from_slice(&[0; 32]); // compressorname
         entry.extend_from_slice(&be16(0x0018)); // depth 24bpp
         entry.extend_from_slice(&be16(0xFFFF)); // pre_defined -1
+        // colr (nclx): BT.601, full range. JPEG-кадры у нас full-range
+        // JFIF; без декларации плееры угадывают studio swing для видео
+        // и растягивают mid-tones. Идёт после полей entry, codec-specific
+        // боксов у 'jpeg' нет.
+        let mut colr = Vec::new();
+        colr.extend_from_slice(b"nclx");
+        colr.extend_from_slice(&be16(6)); // colour_primaries: BT.601
+        colr.extend_from_slice(&be16(6)); // transfer_characteristics: BT.601
+        colr.extend_from_slice(&be16(6)); // matrix_coefficients: BT.601
+        colr.push(0x80); // full_range_flag = 1
+        push_box(&mut entry, b"colr", &colr);
         let mut jpeg_entry = Vec::new();
         push_box(&mut jpeg_entry, b"jpeg", &entry);
         let mut stsd = fullbox(0, 0);
@@ -580,13 +591,25 @@ mod tests {
         assert_eq!(bp::u32v(&buf, &mvhd, 12), TIMESCALE);
         assert_eq!(bp::u32v(&buf, &mvhd, 16), 99);
 
-        // stsd: sample entry 'jpeg', размеры кадра.
+        // stsd: sample entry 'jpeg', размеры кадра, colr — full range.
         let stbl = stbl_of(&buf, moov);
         let stsd = bp::find(&stbl, b"stsd");
         let entries = bp::parse(&buf, stsd.start + 8, stsd.start + stsd.len);
         let jpeg = bp::find(&entries, b"jpeg");
         assert_eq!(bp::u16v(&buf, jpeg, 24), 1920);
         assert_eq!(bp::u16v(&buf, jpeg, 26), 1080);
+        // colr: после 78 байт полей sample entry (6+2+2+2+12+2+2+4+4+4+2+32+2+2).
+        let colr_at = jpeg.start + 78;
+        assert_eq!(&buf[colr_at + 4..colr_at + 8], b"colr");
+        assert_eq!(
+            u32::from_be_bytes(buf[colr_at..colr_at + 4].try_into().unwrap()),
+            19
+        );
+        let p = colr_at + 8;
+        assert_eq!(&buf[p..p + 4], b"nclx");
+        assert_eq!(u16::from_be_bytes(buf[p + 4..p + 6].try_into().unwrap()), 6); // primaries
+        assert_eq!(u16::from_be_bytes(buf[p + 8..p + 10].try_into().unwrap()), 6); // matrix
+        assert_eq!(buf[p + 10] & 0x80, 0x80); // full range
 
         // stss: все кадры ключевые, явно перечислены.
         let stss = bp::find(&stbl, b"stss");

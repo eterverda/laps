@@ -9,6 +9,15 @@ pub enum Error {
     Unrecoverable(String),
 }
 
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Recoverable(e) => write!(f, "Recoverable({e})"),
+            Error::Unrecoverable(e) => write!(f, "Unrecoverable({e})"),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Decodes one raw camera frame into an egui image.
@@ -37,11 +46,14 @@ fn decode_pixeld_yuyv(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::C
         width,
         height,
     };
+    // UVC-камеры шлют BT.601 limited range (чёрный = Y16, белый = Y235);
+    // Limited растягивает studio swing до полного RGB, иначе чёрный
+    // приезжает в viewfinder как (16,16,16).
     yuv::yuyv422_to_rgba(
         &packed,
         bytemuck::cast_slice_mut(&mut pixels),
         width * 4,
-        yuv::YuvRange::Full,
+        yuv::YuvRange::Limited,
         yuv::YuvStandardMatrix::Bt601,
     )
     .map_err(|e| Error::Recoverable(format!("YUYV convert error: {e}")))?;
@@ -66,4 +78,31 @@ fn decode_pixels_mjpeg(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::
         .decode_into(bytemuck::cast_slice_mut(&mut pixels))
         .map_err(|e| Error::Recoverable(format!("MJPEG decode error: {e}")))?;
     Ok(pixels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_frame;
+    use crate::config::camera::PixelConfig;
+
+    /// YUYV limited: чёрный = Y16, белый = Y235 (U=V=128).
+    #[test]
+    fn yuyv_limited_range_black_is_zero() {
+        let mut raw = Vec::new();
+        for _ in 0..(2 * 2) / 2 {
+            raw.extend_from_slice(&[16, 128, 16, 128]); // Y0 U Y1 V
+        }
+        let img = decode_frame(PixelConfig::Yuyv, &raw, 2, 2).unwrap();
+        assert_eq!(img.pixels[0], egui::Color32::from_rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn yuyv_limited_range_white_is_255() {
+        let mut raw = Vec::new();
+        for _ in 0..(2 * 2) / 2 {
+            raw.extend_from_slice(&[235, 128, 235, 128]);
+        }
+        let img = decode_frame(PixelConfig::Yuyv, &raw, 2, 2).unwrap();
+        assert_eq!(img.pixels[0], egui::Color32::from_rgb(255, 255, 255));
+    }
 }

@@ -58,6 +58,19 @@ enum FeedState {
     Rec,
 }
 
+/// Статус кнопки статус-бара одной шкалой: что рисовать мелким текстом
+/// и каким цветом — вместо пары пересекающихся булевых (error влечёт
+/// !active). Каждая кнопка раскладывает шкалу в свои цвета.
+#[derive(Clone, Copy)]
+enum Status {
+    /// Покой: серый, текст — заявленный fps.
+    Idle,
+    /// Работает: цвет «активный» кнопки, текст — измеренный fps.
+    Active,
+    /// Включено, но поток мёртв: цвет «активный» (не серый!), текст «error».
+    Error,
+}
+
 pub struct Live {
     res: Option<Res>,
     webcams: HashMap<String, crate::driver::camera::Camera>,
@@ -298,12 +311,10 @@ impl Live {
                 // "-- fps" до замера, заявленный fps в покое. Кликабельна
                 // вся область.
                 let live_state = self.webcams.values().next().map(|w| w.capture_state());
-                let live_active = live_state == Some(CaptureState::Live);
-                let live_dead = live_state == Some(CaptureState::Dead);
-                // Starting: поток жив, камера инициализируется — для статуса
+                // Starting — поток жив, камера инициализируется: для статуса
                 // это «active», а не отвал (error рисуем только по Dead).
-                let starting = live_state == Some(CaptureState::Starting);
-                let live_show = live_active || (self.feed != FeedState::Off && !live_dead);
+                let live_show = live_state == Some(CaptureState::Live)
+                    || (self.feed != FeedState::Off && live_state != Some(CaptureState::Dead));
                 let rec_active = self.webcams.values().any(|w| w.record_state().ok);
                 let cfg_fps = self
                     .active_cameras
@@ -317,20 +328,28 @@ impl Live {
                     .map(|camera| camera.dvr.frame_rate.unwrap_or(camera.frame_rate));
                 let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
 
-                let (live_text, live_color) = if self.feed != FeedState::Off && live_dead {
-                    ("error".to_owned(), egui::Color32::WHITE)
-                } else if live_show {
-                    let text = if self.shown_fps > 0.0 {
-                        format!("{:.0}fps", self.shown_fps)
+                let live_status =
+                    if self.feed != FeedState::Off && live_state == Some(CaptureState::Dead) {
+                        Status::Error
+                    } else if live_show {
+                        Status::Active
                     } else {
-                        "--fps".to_owned()
+                        Status::Idle
                     };
-                    (text, egui::Color32::WHITE)
-                } else {
-                    (
-                        cfg_fps.map(|f| f.to_string()).unwrap_or_default(),
-                        egui::Color32::DARK_GRAY,
-                    )
+                let live_color = match live_status {
+                    Status::Idle => egui::Color32::DARK_GRAY,
+                    _ => egui::Color32::WHITE,
+                };
+                let live_text = match live_status {
+                    Status::Error => "error".to_owned(),
+                    Status::Active => {
+                        if self.shown_fps > 0.0 {
+                            format!("{:.0}fps", self.shown_fps)
+                        } else {
+                            "--fps".to_owned()
+                        }
+                    }
+                    Status::Idle => cfg_fps.map(|f| f.to_string()).unwrap_or_default(),
                 };
                 let live_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
                     grid::whole_cols(view::content_width(ui.ctx(), " LIVE", &live_text)),
@@ -342,23 +361,35 @@ impl Live {
                     action = Action::ToggleLive;
                 }
 
-                let rec_color = if rec_active {
-                    egui::Color32::RED
+                let rec_status = if self.feed == FeedState::Rec
+                    && !rec_active
+                    && live_state != Some(CaptureState::Starting)
+                {
+                    Status::Error
+                } else if rec_active {
+                    Status::Active
                 } else {
-                    egui::Color32::DARK_GRAY
+                    Status::Idle
                 };
-                let rec_text = if self.feed == FeedState::Rec {
-                    if !rec_active && !starting {
-                        "error".to_owned()
-                    } else if rec_fps.unwrap_or_default() > 0.0 {
-                        format!("{:.0}fps", rec_fps.unwrap())
-                    } else {
-                        "--fps".to_owned()
+                let rec_color = match rec_status {
+                    Status::Idle => egui::Color32::DARK_GRAY,
+                    _ => egui::Color32::RED,
+                };
+                let rec_text = match rec_status {
+                    Status::Error => "error".to_owned(),
+                    // feed == Rec (Active или переходный Idle): замерили —
+                    // fps, нет — "--fps".
+                    _ if self.feed == FeedState::Rec => {
+                        if rec_fps.unwrap_or_default() > 0.0 {
+                            format!("{:.0}fps", rec_fps.unwrap())
+                        } else {
+                            "--fps".to_owned()
+                        }
                     }
-                } else if rec_active && rec_fps.unwrap_or_default() > 0.0 {
-                    format!("{:.0}fps", rec_fps.unwrap())
-                } else {
-                    dvr_fps.map(|f| f.to_string()).unwrap_or_default()
+                    Status::Active if rec_fps.unwrap_or_default() > 0.0 => {
+                        format!("{:.0}fps", rec_fps.unwrap())
+                    }
+                    _ => dvr_fps.map(|f| f.to_string()).unwrap_or_default(),
                 };
                 let rec_rect = live_rect
                     .right_bottom()

@@ -125,6 +125,17 @@ impl CameraConfig {
             && self.frame_rate.0 == fps
             && format_matches
     }
+
+    /// Эффективный fps записи: `dvr.frame-rate`, но не выше
+    /// `camera.frame-rate` стрима — кадров больше, чем отдаёт камера, в
+    /// записи всё равно не будет. Если `dvr.frame-rate` не задан или
+    /// превышает камерный, берётся `camera.frame-rate`.
+    pub fn dvr_frame_rate(&self) -> FrameRateConfig {
+        self.dvr
+            .frame_rate
+            .filter(|dvr_fps| dvr_fps.0 <= self.frame_rate.0)
+            .unwrap_or(self.frame_rate)
+    }
 }
 
 impl fmt::Display for CameraConfig {

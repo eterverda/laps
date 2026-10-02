@@ -20,9 +20,11 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
                │ RGBA frame
    ┌───────────┴────────────┐
    │ driver                 │
-   │ - webcam (nokhwa)      │  capture thread: MJPEG passthrough /
+   │ - capture (trait)      │  FrameSource → Pipeline → FrameSink:
+   │   nokhwa backend       │  pull, один декод на кадр, fan-out
+   │ - webcam (pipeline)    │  capture thread: jpeg-passthrough /
    │ - dvr (own muxers)     │  YUYV decode → ColorImage slot
-   │   MKV (EBML+Cues)      │  recorder: writer thread, MJPEG blobs
+   │   MKV (EBML+Cues)      │  recorder: writer thread, jpeg-кадры
    │   MOV/MP4 (ISOBMFF)    │  → container, no re-encode
    └────────────────────────┘
 ```
@@ -50,9 +52,17 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 
 ## Video Capture
 
-- **nokhwa** 0.10 (V4L2 on Linux, AVFoundation on macOS, MSMF on Windows)
-- MJPEG cameras: frame trimmed to SOI..EOI (`memchr` FFD9 search), JPEG
-  blob goes to DVR as-is; decode to RGBA only for screen (**zune-jpeg**)
+- **Layers** (`docs/capture-backend-plan.md`): `driver/capture` trait
+  (`Capture`/`CaptureSession`/`FrameSink`, MJPEG + YUYV only) —
+  FrameSource; `webcam` — pipeline (pull, один декод на кадр, fan-out,
+  троттлинг DVR); UI и DVR — sink'и. Backend — **nokhwa** 0.10 (V4L2 on
+  Linux, AVFoundation on macOS, MSMF on Windows), архивирована, за
+  трейтом; замена — этапами по плану, pure Rust, без cc
+- Терминология: один кадр — `jpeg` (`FrameData::Jpeg`), формат потока —
+  `MJPEG`, файл с кадрами — `mjpeg`-поток
+- jpeg-камеры: источник считает длину кадра (FFD9-поиск, `memchr`),
+  буфер не копируется — DVR пишет срез `buf[..len]`; decode to RGBA
+  только для экрана (**zune-jpeg**)
 - YUYV cameras: decode via **yuv** crate (dev-profile opt-level = 2)
 - Per-frame latency hot spots: nokhwa buffer copy and decode; hot crates
   get `opt-level` bumps in dev profile (`zune-jpeg`/`zune-core` = 3,

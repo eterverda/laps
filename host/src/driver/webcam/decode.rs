@@ -2,6 +2,10 @@ pub enum Error {
     /// Skip this frame and keep capturing.
     Recoverable(String),
     /// Stop the capture thread.
+    /// Пока не конструируется: PixelConfig исчерпывающе покрыт двумя
+    /// вариантами, ветки "unsupported format" больше нет. Вариант сохранён
+    /// как семантика для будущих декодеров.
+    #[allow(dead_code)]
     Unrecoverable(String),
 }
 
@@ -9,19 +13,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Decodes one raw camera frame into an egui image.
 pub fn decode_frame(
-    frame_format: nokhwa::utils::FrameFormat,
+    frame_format: crate::config::camera::PixelConfig,
     raw: &[u8],
     width: u32,
     height: u32,
 ) -> Result<egui::ColorImage> {
     let pixels = match frame_format {
-        nokhwa::utils::FrameFormat::MJPEG => decode_pixels_mjpeg(raw, width, height)?,
-        nokhwa::utils::FrameFormat::YUYV => decode_pixeld_yuyv(raw, width, height)?,
-        other => {
-            return Err(Error::Unrecoverable(format!(
-                "unsupported frame format: {other:?}"
-            )));
-        }
+        crate::config::camera::PixelConfig::Mjpeg => decode_pixels_mjpeg(raw, width, height)?,
+        crate::config::camera::PixelConfig::Yuyv => decode_pixeld_yuyv(raw, width, height)?,
     };
     Ok(egui::ColorImage {
         size: [width as usize, height as usize],

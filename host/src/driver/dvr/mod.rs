@@ -86,12 +86,12 @@ struct Report<'a> {
     system: ReportSystem,
 }
 
-/// Реально согласованный формат (nokhwa CameraFormat) для отчёта.
+/// Реально согласованный формат (capture::CaptureFormat) для отчёта.
 /// `name` — имя из конфига, которым мы матчили камеру (в согласованном
 /// формате имени нет).
 struct CameraReport<'a> {
     name: &'a str,
-    format: &'a nokhwa::utils::CameraFormat,
+    format: &'a crate::driver::capture::CaptureFormat,
 }
 
 impl serde::Serialize for CameraReport<'_> {
@@ -102,19 +102,11 @@ impl serde::Serialize for CameraReport<'_> {
         st.serialize_field("name", self.name)?;
         st.serialize_field(
             "resolution",
-            &format!("{}x{}", fmt.resolution().width(), fmt.resolution().height()),
+            &format!("{}x{}", fmt.resolution.width, fmt.resolution.height),
         )?;
-        st.serialize_field("frame-rate", &format!("{}fps", fmt.frame_rate()))?;
-        st.serialize_field("format", &pixel_format_str(fmt.format()))?;
+        st.serialize_field("frame-rate", &format!("{}fps", fmt.frame_rate.0))?;
+        st.serialize_field("format", &fmt.format.as_str().to_lowercase())?;
         st.end()
-    }
-}
-
-fn pixel_format_str(format: nokhwa::utils::FrameFormat) -> String {
-    match format {
-        nokhwa::utils::FrameFormat::MJPEG => "mjpeg".to_owned(),
-        nokhwa::utils::FrameFormat::YUYV => "yuyv".to_owned(),
-        other => format!("{other:?}").to_lowercase(),
     }
 }
 
@@ -235,9 +227,9 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// не держит, detach безопасен).
 pub struct Recorder {
     state: SharedRecordState,
-    sender: Option<crossbeam_channel::Sender<(Vec<u8>, u64)>>,
+    sender: Option<crossbeam_channel::Sender<(crate::driver::capture::FrameData, u64)>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// Дропы в канале (try_send failed), считает push_frame, читает
+    /// Дропы в канале (try_send failed), считает push, читает
     /// writer-поток для отчёта.
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -245,15 +237,16 @@ pub struct Recorder {
 impl Recorder {
     pub fn start(
         options: &Options,
-        negotiated: &nokhwa::utils::CameraFormat,
+        negotiated: &crate::driver::capture::CaptureFormat,
         state: &SharedRecordState,
     ) -> io::Result<Self> {
+        use crate::driver::capture::FrameData;
         std::fs::create_dir_all(&options.dir)?;
         let stem = format!("{}-{}-mjpeg", timestamp_prefix(), options.camera_id);
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
-        let width = negotiated.resolution().width();
-        let height = negotiated.resolution().height();
+        let width = negotiated.resolution.width;
+        let height = negotiated.resolution.height;
         let format = options.camera.format;
         let report_path = options.dir.join(format!("{stem}-report.yaml"));
         let extension = match options.camera.dvr.container {
@@ -269,7 +262,7 @@ impl Recorder {
         };
         state.store(RecordState { ok: true, fps: 0.0 });
         let writer_path = path.clone();
-        let (sender, receiver) = crossbeam_channel::bounded::<(Vec<u8>, u64)>(CHANNEL_CAP);
+        let (sender, receiver) = crossbeam_channel::bounded::<(FrameData, u64)>(CHANNEL_CAP);
         let state_clone = state.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let dropped_clone = dropped.clone();
@@ -298,11 +291,25 @@ impl Recorder {
             let mut enc_digest = tdigest::TDigest::new_with_size(100);
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((data, ts)) = receiver.recv() {
-                let frame = match format {
-                    PixelConfig::Mjpeg => data,
-                    PixelConfig::Yuyv => {
+                // Перекодированный jpeg текущего кадра: живёт до конца
+                // итерации, освобождается после write_frame.
+                let encoded: Option<Vec<u8>>;
+                let frame: &[u8] = match &data {
+                    FrameData::Jpeg { buf, len } => {
+                        let Some(len) = len else {
+                            log::warn!("dvr: frame without EOI, skipped");
+                            continue;
+                        };
+                        &buf[..*len]
+                    }
+                    FrameData::Rgba { rgba } => {
                         let t0 = Instant::now();
-                        let jpeg = match encode_rgba_to_jpeg(&data, width, height) {
+                        // Владение у rgba — в writer-потоке, копий нет.
+                        let jpeg = match encode_rgba_to_jpeg(
+                            bytemuck::cast_slice(&rgba.pixels),
+                            width,
+                            height,
+                        ) {
                             Ok(jpeg) => jpeg,
                             Err(e) => {
                                 log::error!("dvr: jpeg encode failed, recording aborted: {}", e);
@@ -319,10 +326,18 @@ impl Recorder {
                         enc_max_ms = enc_max_ms.max(ms);
                         enc_min_ms = enc_min_ms.min(ms);
                         enc_digest.push(ms as f64);
-                        jpeg
+                        // jpeg живёт до write_frame в этом scope; хвост
+                        // храним во временной переменной.
+                        encoded = Some(jpeg);
+                        encoded.as_ref().unwrap()
+                    }
+                    FrameData::Yuyv { .. } => {
+                        // Инвариант pipeline: до sink'ов Yuyv не доходит.
+                        log::error!("dvr: raw YUYV frame reached writer, skipped");
+                        continue;
                     }
                 };
-                if let Err(e) = writer.write_frame(&frame, ts) {
+                if let Err(e) = writer.write_frame(frame, ts) {
                     log::error!("dvr: write failed, recording aborted: {}", e);
                     state_clone.store(RecordState {
                         ok: false,
@@ -435,16 +450,17 @@ impl Recorder {
         })
     }
 
-    /// Из capture-потока. `ts` — момент поступления кадра на запись, мс
-    /// с Unix-эпохи. Writer мёртв — кадр просто выбрасывается
-    /// (состояние уже отражено в RecordState, UI показал). Переполнение
-    /// канала = дроп кадра + warn (захват важнее записи).
-    pub fn push_frame(&self, jpeg: Vec<u8>, ts: u64) {
+    /// Из pipeline. `ts` — момент захвата кадра, мс с Unix-эпохи
+    /// (Instant→epoch конверсия у якоря в pipeline). Writer мёртв — кадр
+    /// просто выбрасывается (состояние уже отражено в RecordState, UI
+    /// показал). Переполнение канала = дроп кадра + warn (захват важнее
+    /// записи).
+    pub fn push(&self, data: crate::driver::capture::FrameData, ts: u64) {
         if !self.state.load().ok {
             return;
         }
         if let Some(sender) = &self.sender {
-            if sender.try_send((jpeg, ts)).is_err() {
+            if sender.try_send((data, ts)).is_err() {
                 self.dropped
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::warn!("dvr: frame dropped (writer busy)");
@@ -576,12 +592,24 @@ mod tests {
             camera_id: "camera-1".to_owned(),
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Yuyv),
         };
-        let negotiated =
-            nokhwa::utils::CameraFormat::new_from(64, 48, nokhwa::utils::FrameFormat::YUYV, 30);
+        let negotiated = crate::driver::capture::CaptureFormat {
+            resolution: crate::config::camera::ResolutionConfig {
+                width: 64,
+                height: 48,
+            },
+            frame_rate: crate::config::camera::FrameRateConfig(30),
+            format: PixelConfig::Yuyv,
+        };
         {
             let recorder = super::Recorder::start(&options, &negotiated, &state).unwrap();
             for _ in 0..3 {
-                recorder.push_frame(vec![0u8; 64 * 48 * 4], super::epoch_millis());
+                let pixels = vec![egui::Color32::BLACK; 64 * 48];
+                recorder.push(
+                    crate::driver::capture::FrameData::Rgba {
+                        rgba: std::sync::Arc::new(egui::ColorImage::new([64, 48], pixels)),
+                    },
+                    super::epoch_millis(),
+                );
             }
         } // drop: writer дописывает файл в фоне
 

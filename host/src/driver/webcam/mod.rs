@@ -3,13 +3,15 @@ pub mod decode;
 pub mod fps;
 
 use crate::config::camera::{CameraConfig, FrameRateConfig, PixelConfig};
-use crate::driver::dvr::{RecordState, SharedRecordState};
+use crate::driver::capture::{
+    self, Capture, CaptureSession, Frame, FrameData, FrameError, FrameSink,
+};
+use crate::driver::dvr::{Options, RecordState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
-use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{CameraFormat, CameraInfo, RequestedFormat, RequestedFormatType};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Состояние камеры (capture-потока).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,36 +26,16 @@ pub enum CaptureState {
 
 /// Общий для потока и UI хэндл состояния камеры.
 pub type SharedCaptureState = Arc<AtomicCell<CaptureState>>;
-use std::time::{Duration, Instant};
-
-/// nokhwa на V4L2 отдаёт `frame_raw()` — это весь mmap-буфер (его ёмкость,
-/// равная размеру несжатого кадра), а не реальную длину кадра: драйвер
-/// пишет jpeg в начало, а после EOI остаётся неиспользуемый хвост со
-/// старыми данными. MJPEG-кадр — это ровно SOI..EOI; без обрезки в файл
-/// попадает мусор, а jpegparse в GStreamer теряет синхронизацию.
-/// Поиск EOI — через SIMD-поиск паттерна FFD9 (memmem): в entropy-данных
-/// FF заэскейпен как FF00, поэтому первое вхождение FFD9 после SOI — EOI.
-fn trim_mjpeg(frame: &[u8]) -> Option<&[u8]> {
-    let start = if frame.starts_with(&[0xFF, 0xD8]) {
-        0
-    } else {
-        frame.windows(2).position(|w| w == [0xFF, 0xD8])?
-    };
-    let end = memchr::memmem::find(&frame[start..], b"\xff\xd9")? + start + 2;
-    Some(&frame[start..end])
-}
 
 /// HARD HACK / ДИСКЛЕЙМЕР. Камера может отдавать кадры быстрее, чем
 /// запрошено: macOS (AVFoundation) часто открывает поток на 60 fps при
 /// запросе 30, драйвер вправе игнорировать запрошенный fps вообще. Вместо
-/// форков биндингов nokhwa мы троттлим поток прямо в capture-потоке, но
-/// только на пути в DVR (Live view обновляется на полном fps камеры) и
-/// только когда эффективный fps записи ≤ 30 (dvr.frame-rate, иначе
-/// camera.frame-rate): при запросе больше 30 каждый кадр пишется как есть.
-/// Троттлинг — простой: кадр отправляется в DVR не чаще, чем раз в 25 мс.
-/// Интервал 25 мс (а не 33.3 мс) выбран так, чтобы при ровном 60 fps
-/// источника записывался примерно каждый второй кадр, то есть ~30 fps,
-/// не боясь пограничного джиттера.
+/// форков биндингов мы троттлим поток на входе DVR-sink, но только когда
+/// эффективный fps записи ≤ 30 (dvr.frame-rate, иначе camera.frame-rate):
+/// при запросе больше 30 каждый кадр пишется как есть. Live view
+/// обновляется на полном fps камеры. Интервал 25 мс (а не 33.3 мс) выбран
+/// так, чтобы при ровном 60 fps источника записывался примерно каждый
+/// второй кадр, то есть ~30 fps, не боясь пограничного джиттера.
 const RECORD_THROTTLE_MIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Возвращает true, если кадр нужно отправить в DVR. Для эффективного
@@ -71,89 +53,128 @@ fn should_record_frame(fps: FrameRateConfig, last_recorded_frame: &mut Instant) 
     }
 }
 
-type ImageSlot = Arc<Mutex<Option<egui::ColorImage>>>;
+type ImageSlot = Arc<Mutex<Option<Arc<egui::ColorImage>>>>;
 
 /// Команды из UI-потока в capture-поток (управление записью).
 enum Command {
-    StartRecording(crate::driver::dvr::Options),
+    StartRecording(Options),
     StopRecording,
 }
 
-/// Recorder живёт внутри capture-потока, но создаётся по команде, а не
-/// при старте захвата: так CAM и REC можно включать независимо.
-fn start_recorder(
-    options: &crate::driver::dvr::Options,
-    negotiated: &nokhwa::utils::CameraFormat,
-    state: &SharedRecordState,
-) -> Option<crate::driver::dvr::Recorder> {
-    // Формат и контейнер ветвятся внутри Recorder::start.
-    let result = crate::driver::dvr::Recorder::start(options, negotiated, state);
-    match result {
-        Ok(recorder) => Some(recorder),
-        Err(e) => {
-            log::error!("dvr: recording unavailable: {}", e);
-            None
+/// UI-sink. Latest-wins (P3a): хранит последний кадр, egui-поток забирает
+/// его по своему темпу; медленный UI пропускает кадры, но capture-поток
+/// его не ждёт — обратного давления нет.
+struct UiSink {
+    slot: ImageSlot,
+    on_frame: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl FrameSink for UiSink {
+    fn on_frame(&mut self, frame: Frame) {
+        match frame.data {
+            FrameData::Rgba { rgba } => {
+                *self.slot.lock().unwrap() = Some(rgba);
+                (self.on_frame)();
+            }
+            _ => log::warn!("ui sink: unexpected non-RGBA frame"),
         }
     }
 }
 
-fn sort_and_dedup(formats: &mut Vec<CameraFormat>) {
-    formats.sort_by(|a, b| {
-        a.resolution()
-            .width()
-            .cmp(&b.resolution().width())
-            .then_with(|| a.resolution().height().cmp(&b.resolution().height()))
-            .then_with(|| a.frame_rate().cmp(&b.frame_rate()))
-    });
-    formats.dedup_by(|a, b| {
-        a.resolution().width() == b.resolution().width()
-            && a.resolution().height() == b.resolution().height()
-            && a.frame_rate() == b.frame_rate()
-            && a.format() == b.format()
-    });
+/// DVR-sink: держит Recorder, троттлит избыточный поток (HARD HACK выше),
+/// конвертирует Instant→epoch millis якорем. Recorder живёт независимо от
+/// жизни pipeline: drop sink'а (как и раньше drop recorder'а в потоке)
+/// отпускает writer в фоновую финализацию.
+struct DvrSink {
+    recorder: Option<crate::driver::dvr::Recorder>,
+    /// Эффективный fps записи (dvr.frame-rate, иначе camera.frame-rate).
+    fps: FrameRateConfig,
+    last_recorded_frame: Instant,
+    negotiated: capture::CaptureFormat,
+    state: SharedRecordState,
+    /// Якорь Instant→epoch millis (ставится до цикла кадров).
+    anchor: (Instant, u64),
 }
 
-#[cfg(target_os = "macos")]
-fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
-    use nokhwa_bindings_macos::AVCaptureDevice;
-    let index = cam.index().clone();
-    let device = AVCaptureDevice::new(&index).map_err(|e| e.to_string())?;
-    let mut formats = device.supported_formats().map_err(|e| e.to_string())?;
-    sort_and_dedup(&mut formats);
-    Ok(formats)
+impl DvrSink {
+    fn new(
+        fps: FrameRateConfig,
+        negotiated: capture::CaptureFormat,
+        state: SharedRecordState,
+    ) -> Self {
+        Self {
+            recorder: None,
+            fps,
+            last_recorded_frame: Instant::now(),
+            negotiated,
+            state,
+            anchor: (Instant::now(), crate::driver::dvr::epoch_millis()),
+        }
+    }
+
+    fn set_fps(&mut self, fps: FrameRateConfig) {
+        self.fps = fps;
+    }
+
+    /// Файл создаётся здесь, а не в writer-потоке: ошибка (диск полон,
+    /// нет прав) логируется, RecordState остаётся false — как раньше.
+    fn start(&mut self, options: &Options) {
+        self.set_fps(FrameRateConfig(options.camera.dvr_frame_rate().0));
+        match crate::driver::dvr::Recorder::start(options, &self.negotiated, &self.state) {
+            Ok(recorder) => self.recorder = Some(recorder),
+            Err(e) => {
+                log::error!("dvr: recording unavailable: {}", e);
+                self.recorder = None;
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        // drop: writer finalize'ит файл в фоне.
+        self.recorder = None;
+    }
+
+    fn epoch_millis(&self, t: Instant) -> u64 {
+        self.anchor.1 + t.saturating_duration_since(self.anchor.0).as_millis() as u64
+    }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn list_formats_for_cam(cam: &CameraInfo) -> Result<Vec<CameraFormat>, String> {
-    let index = cam.index().clone();
-    let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
-    let mut camera = nokhwa::Camera::new(index, format).map_err(|e| e.to_string())?;
-    let mut formats = camera
-        .compatible_camera_formats()
-        .map_err(|e| e.to_string())?;
-    sort_and_dedup(&mut formats);
-    Ok(formats)
+impl FrameSink for DvrSink {
+    fn on_frame(&mut self, frame: Frame) {
+        if self.recorder.is_none() {
+            return;
+        }
+        if !should_record_frame(self.fps, &mut self.last_recorded_frame) {
+            return;
+        }
+        let ts = self.epoch_millis(frame.timestamp);
+        match frame.data {
+            // Jpeg: passthrough, буфер не копируется (P4).
+            FrameData::Jpeg { .. } | FrameData::Rgba { .. } => {
+                self.recorder.as_ref().unwrap().push(frame.data, ts)
+            }
+            // Инвариант pipeline: до sink'ов Yuyv не доходит.
+            FrameData::Yuyv { .. } => log::error!("dvr sink: raw YUYV frame, skipped"),
+        }
+    }
+
+    fn on_stop(&mut self) {
+        self.stop();
+    }
 }
 
 pub fn list_cameras() -> Result<Vec<CameraConfig>, String> {
-    let mut cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(|e| e.to_string())?;
-    cameras.sort_by_key(|a| a.human_name());
+    let mut devices = capture::Backend::list_devices()?;
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
     let mut descriptions = Vec::new();
-    for cam in cameras {
-        let formats = list_formats_for_cam(&cam).unwrap_or_default();
-        for fmt in formats {
-            // Other formats (GRAY, RGB, ...) are not offered in descriptions.
-            let pixel_format = match fmt.format() {
-                nokhwa::utils::FrameFormat::YUYV => PixelConfig::Yuyv,
-                nokhwa::utils::FrameFormat::MJPEG => PixelConfig::Mjpeg,
-                _ => continue,
-            };
+    for dev in devices {
+        for fmt in dev.formats {
             descriptions.push(CameraConfig::new(
-                cam.human_name(),
-                fmt.resolution().width(),
-                fmt.resolution().height(),
-                fmt.frame_rate(),
-                pixel_format,
+                &dev.name,
+                fmt.resolution.width,
+                fmt.resolution.height,
+                fmt.frame_rate.0,
+                fmt.format,
             ));
         }
     }
@@ -183,7 +204,7 @@ impl Webcam {
 
     /// Запустить запись. Команда применится перед следующим кадром;
     /// ошибка создания файла уйдёт в лог, RecordState останется false.
-    pub fn start_recording(&self, options: crate::driver::dvr::Options) {
+    pub fn start_recording(&self, options: Options) {
         if self
             .commands
             .try_send(Command::StartRecording(options))
@@ -217,30 +238,27 @@ impl Webcam {
 
         let thread = thread::spawn(move || {
             // Перебор устройств и форматов — io, не должно висеть на UI-потоке.
-            let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
-                Ok(c) => c,
+            let devices = match capture::Backend::list_devices() {
+                Ok(d) => d,
                 Err(e) => {
-                    log::error!("failed to query cameras: {}", e);
+                    log::error!("failed to list devices: {}", e);
                     return;
                 }
             };
 
-            let (info, matched_fmt) = match cameras.into_iter().find_map(|cam| {
-                let fmt = match list_formats_for_cam(&cam) {
-                    Ok(f) => f,
-                    Err(_) => return None,
-                };
-                fmt.into_iter()
+            let (name, matched) = match devices.into_iter().find_map(|dev| {
+                dev.formats
+                    .into_iter()
                     .find(|f| {
                         desc.matches(
-                            &cam.human_name(),
-                            f.resolution().width(),
-                            f.resolution().height(),
-                            f.frame_rate(),
-                            &f.format().to_string(),
+                            &dev.name,
+                            f.resolution.width,
+                            f.resolution.height,
+                            f.frame_rate.0,
+                            f.format.as_str(),
                         )
                     })
-                    .map(|f| (cam, f))
+                    .map(|f| (dev.name, f))
             }) {
                 Some(found) => found,
                 None => {
@@ -249,54 +267,39 @@ impl Webcam {
                 }
             };
 
-            log::info!(
-                "starting capture from [{}] {} at {:?}",
-                info.index(),
-                info.human_name(),
-                matched_fmt
-            );
+            log::info!("starting capture from {} at {:?}", name, matched);
 
-            let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
-                nokhwa::utils::CameraFormat::new_from(
-                    matched_fmt.resolution().width(),
-                    matched_fmt.resolution().height(),
-                    matched_fmt.format(),
-                    matched_fmt.frame_rate(),
-                ),
-            ));
-            let mut camera = match nokhwa::Camera::new(info.index().clone(), format) {
-                Ok(cam) => cam,
+            // open резолвит устройство по имени заново (P5): между
+            // перечислением и открытием камеру могли переткнуть.
+            let mut session = match capture::Backend::open(&desc) {
+                Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open camera: {}", e);
                     return;
                 }
             };
-
-            if let Err(e) = camera.open_stream() {
-                log::error!("failed to open stream: {}", e);
-                return;
-            }
             state_clone.store(CaptureState::Live);
 
-            let fmt = camera.camera_format();
+            let fmt = session.negotiated();
             log::info!("capture stream opened, format: {:?}", fmt);
 
-            let width = fmt.resolution().width();
-            let height = fmt.resolution().height();
-            let frame_format = fmt.format();
-            // The camera may open at a higher frame rate than requested (e.g. 60 fps
-            // when 30 was asked for). Keep the negotiated stream as-is and drop excess
-            // frames below so recording/display run at the requested rate.
-            let mut fps = FrameRateConfig(matched_fmt.frame_rate());
-
-            // Recorder появляется и исчезает по командам из UI.
-            let mut recorder: Option<crate::driver::dvr::Recorder> = None;
+            let width = fmt.resolution.width;
+            let height = fmt.resolution.height;
+            // The camera may open at a higher frame rate than requested
+            // (e.g. 60 fps when 30 was asked for). Keep the negotiated
+            // stream as-is and drop excess frames in the DVR sink so
+            // recording runs at the requested rate; live view is not
+            // throttled.
+            let mut ui_sink = UiSink {
+                slot: slot_clone,
+                on_frame: Arc::new(on_frame),
+            };
+            let mut dvr_sink = DvrSink::new(matched.frame_rate, fmt, record_clone);
 
             // Для определения ошибки захвата используем не счётчик,
             // потому что frame() может виснуть на несколько секунд,
             // поэтому критерий — время без единого кадра.
-            let mut errors_since: Option<std::time::Instant> = None;
-            let mut last_recorded_frame = Instant::now();
+            let mut errors_since: Option<Instant> = None;
 
             loop {
                 if !running_clone.load(Ordering::Relaxed) {
@@ -308,27 +311,18 @@ impl Webcam {
                 // блокирует до ~периода кадра, задержка незаметна.
                 for cmd in commands_rx.try_iter() {
                     match cmd {
-                        Command::StartRecording(options) => {
-                            recorder = start_recorder(&options, &fmt, &record_clone);
-                            fps = options
-                                .camera
-                                .dvr
-                                .frame_rate
-                                .unwrap_or(options.camera.frame_rate);
-                        }
-                        Command::StopRecording => {
-                            recorder = None; // drop: writer finalize'ит в фоне
-                        }
+                        Command::StartRecording(options) => dvr_sink.start(&options),
+                        Command::StopRecording => dvr_sink.stop(),
                     }
                 }
 
-                let raw = match camera.frame_raw() {
-                    Ok(r) => {
+                let frame = match session.frame() {
+                    Ok(frame) => {
                         errors_since = None;
-                        r
+                        frame
                     }
-                    Err(e) => {
-                        let since = errors_since.get_or_insert_with(std::time::Instant::now);
+                    Err(FrameError::Recoverable(e)) => {
+                        let since = errors_since.get_or_insert_with(Instant::now);
                         if since.elapsed() >= Duration::from_secs(1) {
                             log::error!("camera lost: no frames for 1s ({}), stopping", e);
                             break;
@@ -339,54 +333,75 @@ impl Webcam {
                         thread::sleep(Duration::from_millis(16));
                         continue;
                     }
-                };
-
-                // MJPEG пишем до декода: кадр валиден сам по себе (SOI..EOI),
-                // а декод может отказать на кадре, который ffmpeg/GStreamer
-                // съели бы — экранный дроп не должен терять кадр в DVR.
-                // Троттлинг избыточного потока — см. HARD HACK выше.
-                if frame_format == nokhwa::utils::FrameFormat::MJPEG {
-                    if let Some(recorder) = &recorder {
-                        if should_record_frame(fps, &mut last_recorded_frame) {
-                            match trim_mjpeg(&raw) {
-                                Some(frame) => {
-                                    recorder.push_frame(
-                                        frame.to_vec(),
-                                        crate::driver::dvr::epoch_millis(),
-                                    );
-                                }
-                                None => log::warn!("dvr: frame without EOI, skipped"),
-                            }
-                        }
-                    }
-                }
-
-                let image = match decode::decode_frame(frame_format, raw.as_ref(), width, height) {
-                    Ok(image) => image,
-                    Err(DecodeError::Recoverable(e)) => {
-                        log::warn!("frame skipped: {}", e);
-                        continue;
-                    }
-                    Err(DecodeError::Unrecoverable(e)) => {
-                        log::error!("capture stopping: {}", e);
+                    Err(FrameError::Unrecoverable(e)) => {
+                        log::error!("camera lost: {}, stopping", e);
                         break;
                     }
                 };
+                let ts = frame.timestamp;
 
-                // YUYV в DVR уходит декодированным RGBA. Троттлинг
-                // избыточного потока — см. HARD HACK выше; Live view всё
-                // равно обновляется на полном fps.
-                if frame_format != nokhwa::utils::FrameFormat::MJPEG {
-                    if let Some(recorder) = &recorder {
-                        if should_record_frame(fps, &mut last_recorded_frame) {
-                            let rgba: &[u8] = bytemuck::cast_slice(&image.pixels);
-                            recorder.push_frame(rgba.to_vec(), crate::driver::dvr::epoch_millis());
+                // Конверсия + fan-out по подпискам sink'ов (P3/P4).
+                // Единственный декод на кадр: Jpeg → RGBA для UI,
+                // Yuyv → RGBA для обоих sink'ов.
+                match frame.data {
+                    FrameData::Jpeg { buf, len } => {
+                        // Декод до перемещения буфера: borrow, не копия.
+                        // Пишем в DVR до применения результата декода:
+                        // jpeg-кадр валиден сам по себе (SOI..EOI), а декод
+                        // может отказать на кадре, который плеер съел бы —
+                        // экранный дроп не должен терять кадр в записи.
+                        let decoded = decode::decode_frame(PixelConfig::Mjpeg, &buf, width, height);
+                        dvr_sink.on_frame(Frame {
+                            timestamp: ts,
+                            data: FrameData::Jpeg { buf, len },
+                        });
+                        match decoded {
+                            Ok(image) => ui_sink.on_frame(Frame {
+                                timestamp: ts,
+                                data: FrameData::Rgba {
+                                    rgba: Arc::new(image),
+                                },
+                            }),
+                            Err(DecodeError::Recoverable(e)) => {
+                                log::warn!("frame skipped: {}", e);
+                            }
+                            Err(DecodeError::Unrecoverable(e)) => {
+                                log::error!("capture stopping: {}", e);
+                                break;
+                            }
                         }
                     }
+                    FrameData::Yuyv { buf } => {
+                        match decode::decode_frame(PixelConfig::Yuyv, &buf, width, height) {
+                            Ok(image) => {
+                                let frame = Frame {
+                                    timestamp: ts,
+                                    data: FrameData::Rgba {
+                                        rgba: Arc::new(image),
+                                    },
+                                };
+                                dvr_sink.on_frame(frame.clone());
+                                ui_sink.on_frame(frame);
+                            }
+                            Err(DecodeError::Recoverable(e)) => {
+                                log::warn!("frame skipped: {}", e);
+                            }
+                            Err(DecodeError::Unrecoverable(e)) => {
+                                log::error!("capture stopping: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                    // Нативный RGBA от будущих бэкендов: без декода.
+                    FrameData::Rgba { rgba } => {
+                        let frame = Frame {
+                            timestamp: ts,
+                            data: FrameData::Rgba { rgba },
+                        };
+                        dvr_sink.on_frame(frame.clone());
+                        ui_sink.on_frame(frame);
+                    }
                 }
-
-                *slot_clone.lock().unwrap() = Some(image);
-                on_frame();
             }
 
             // Поток умирает (штатный стоп или потеря камеры) — гасим CAM,
@@ -394,11 +409,13 @@ impl Webcam {
             // сам: writer-поток — единственный владелец RecordState.
             state_clone.store(CaptureState::Dead);
 
-            if let Err(e) = camera.stop_stream() {
-                log::error!("failed to stop stream: {}", e);
-            }
-            // Recorder дропается здесь: файл финализируется в фоновом
-            // writer-потоке (Recorder::drop его не джойнит).
+            // Recorder дропается здесь (через on_stop sink'а): файл
+            // финализируется в фоновом writer-потоке. Session дропается
+            // здесь: Drop бэкенда делает stop_stream.
+            dvr_sink.on_stop();
+            ui_sink.on_stop();
+            drop(dvr_sink);
+            drop(ui_sink);
         });
 
         Self {
@@ -425,11 +442,14 @@ impl Webcam {
         if let Some(image) = image {
             match &mut self.texture {
                 Some(texture) => {
-                    texture.set(image, egui::TextureOptions::NEAREST);
+                    texture.set((*image).clone(), egui::TextureOptions::NEAREST);
                 }
                 None => {
-                    self.texture =
-                        Some(ctx.load_texture("camera", image, egui::TextureOptions::NEAREST));
+                    self.texture = Some(ctx.load_texture(
+                        "camera",
+                        (*image).clone(),
+                        egui::TextureOptions::NEAREST,
+                    ));
                 }
             }
         }

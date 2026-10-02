@@ -222,3 +222,127 @@ pub fn content_width(ctx: &egui::Context, text: &str, bottom: &str) -> f32 {
     }
     width
 }
+
+/// Угол полосы: определяет, с какой стороны обрезочка (с внешней) и
+/// как читать пришедший rect. Полоса никуда сама не тянется —
+/// прижатие к краям экрана делает вызывающий код через rect.
+#[derive(Clone, Copy)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    // Для нижних полос (подписи внизу экрана) — пока не используются.
+    #[allow(dead_code)]
+    BottomLeft,
+    #[allow(dead_code)]
+    BottomRight,
+}
+
+/// Фон-полоса высотой в одну клетку: обрезочка (1 клетка) с внешней
+/// стороны и плашка. Rect приходит снаружи и должен уже включать всё:
+/// обрезочку и по клетке поля с каждой стороны текста. Текст вызывающий
+/// код рисует сам в замыкании — оно получает rect контента (плашка без
+/// по клетке слева и справа; по вертикали отступов нет).
+pub struct Stripe {
+    color: egui::Color32,
+    corner: Corner,
+}
+
+impl Stripe {
+    pub fn new(color: egui::Color32, corner: Corner) -> Self {
+        Self { color, corner }
+    }
+
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        contents: impl FnOnce(&mut egui::Ui, egui::Rect),
+    ) {
+        let content = stripe(ui, rect, self.color, self.corner, 1);
+        contents(ui, content);
+    }
+}
+
+/// То же, что Stripe, но высотой в две клетки и с обрезочкой в две
+/// клетки (шрифт x2) — под заголовки уровня LAPS.
+pub struct StripeX2 {
+    color: egui::Color32,
+    corner: Corner,
+}
+
+impl StripeX2 {
+    pub fn new(color: egui::Color32, corner: Corner) -> Self {
+        Self { color, corner }
+    }
+
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        contents: impl FnOnce(&mut egui::Ui, egui::Rect),
+    ) {
+        let content = stripe(ui, rect, self.color, self.corner, 2);
+        contents(ui, content);
+    }
+}
+
+/// Общая разметка полосы: `rows` — высота в клетках (1 у Stripe, 2 у
+/// StripeX2), ширина обрезочки — столько же клеток с внешней стороны.
+/// Возвращает rect контента. На размеры окна не смотрим никогда —
+/// пришедший rect — единственный источник геометрии.
+///
+/// Фон — один заполненный полигон (плашка + обрезочка): два соседних
+/// примитива (rect + глиф) на дробном зуме давали волосинку фона на
+/// стыке, а глиф-строка — швы между глифами. Обрезочка — диагональный
+/// срез к внешнему нижнему краю, как у глифов \u{e0bc}/\u{e0be}.
+fn stripe(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    color: egui::Color32,
+    corner: Corner,
+    rows: isize,
+) -> egui::Rect {
+    use super::grid::IntoCell;
+    // Обрезочка с внешней стороны: у левых полос справа, у правых слева.
+    let (cut, plate) = match corner {
+        Corner::TopLeft | Corner::BottomLeft => {
+            let cut = rect
+                .right_top()
+                .into_cell()
+                .translate(-rows, 0)
+                .extrude(rows, rows);
+            (cut, rect.with_max_x(cut.left()))
+        }
+        Corner::TopRight | Corner::BottomRight => {
+            let cut = rect.left_top().into_cell().extrude(rows, rows);
+            (cut, rect.with_min_x(cut.right()))
+        }
+    };
+
+    // Плашка и обрезочка — одна трапеция: общий контур без единого стыка.
+    // Обрезочка — треугольник: диагональ от внешнего верхнего угла к
+    // внешнему нижнему, по пропорции ячейки 1:2 (вся ширина обрезки на
+    // всю высоту полосы).
+    let outline = match corner {
+        Corner::TopLeft | Corner::BottomLeft => vec![
+            plate.min,
+            egui::pos2(cut.max.x, cut.min.y),
+            egui::pos2(cut.min.x, cut.max.y),
+            plate.left_bottom(),
+        ],
+        Corner::TopRight | Corner::BottomRight => {
+            vec![cut.min, plate.right_top(), plate.right_bottom(), cut.max]
+        }
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        outline,
+        color,
+        egui::Stroke::NONE,
+    ));
+
+    // Контент: по клетке поля слева и справа от текста; по вертикали
+    // отступов нет.
+    plate
+        .with_min_x(plate.min.x + super::grid::cell_x(1))
+        .with_max_x(plate.max.x - super::grid::cell_x(1))
+}

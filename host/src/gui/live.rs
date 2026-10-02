@@ -25,8 +25,13 @@ fn viewfinder_cols(count: usize) -> isize {
     viewfinder_rows(count) * 8 / 3
 }
 
-/// Фон плашки заголовка — colorSecondaryDark из laps-bar.
-const TITLE_BG: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x7F, 0xA9);
+/// Фон плашки заголовка LAPS и даты — colorSecondaryLight из laps-bar.
+const TITLE_BG_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x8C, 0xAD, 0xD1);
+/// Фон временной плашки заголовка — colorSecondaryDark из laps-bar.
+const TITLE_BG_DARK: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x7F, 0xA9);
+
+const DATE_FORMAT: &str = "[year]-[month]-[day] [weekday format:mn]";
+const TIME_FORMAT: &str = "[hour]:[minute]:[second].[subsecond digits:3]";
 
 struct Res;
 
@@ -57,7 +62,8 @@ pub struct Live {
     res: Option<Res>,
     webcams: HashMap<String, crate::driver::camera::Camera>,
     feed: FeedState,
-    clock: clock::Clock,
+    date_clock: clock::Clock,
+    time_clock: clock::Clock,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
     active_cameras: HashMap<String, CameraConfig>,
@@ -96,7 +102,8 @@ impl Live {
             res: None,
             webcams: HashMap::new(),
             feed: FeedState::Off,
-            clock: clock::Clock::new(),
+            date_clock: clock::Clock::new(DATE_FORMAT),
+            time_clock: clock::Clock::new(TIME_FORMAT),
             setup,
             assignments,
             active_cameras,
@@ -186,22 +193,42 @@ impl Live {
 
                 let bottom_right = grid::cell_at(ui.max_rect().max);
 
-                let title_rect = grid::cell(0, 0).translate(1, 0).extrude(9, 2);
-                ui.painter().text(
-                    title_rect.right_top().into_cell().extrude(2, 2).left_top(),
-                    egui::Align2::LEFT_TOP,
-                    "\u{e0bc}",
-                    style::FONT_REGULAR_X2,
-                    TITLE_BG,
+                // Полный rect полосы: 2 обрезочка + 1 поле + 8 текст + 1 поле.
+                let title_rect = grid::cell(0, 0).extrude(12, 2);
+                view::StripeX2::new(TITLE_BG_LIGHT, view::Corner::TopLeft).show(
+                    ui,
+                    title_rect,
+                    |ui, rect| {
+                        ui.painter().text(
+                            rect.left_top(),
+                            egui::Align2::LEFT_TOP,
+                            "LAPS",
+                            style::FONT_REGULAR_X2,
+                            egui::Color32::BLACK,
+                        );
+                    },
                 );
-                ui.painter()
-                    .rect_filled(title_rect.with_min_x(0.0), 0.0, TITLE_BG);
-                ui.painter().text(
-                    title_rect.left_top(),
-                    egui::Align2::LEFT_TOP,
-                    "LAPS",
-                    style::FONT_REGULAR_X2,
-                    egui::Color32::BLACK,
+
+                // Справа — два однострочных заголовка друг под другом: дата
+                // (ряд 0) и время с ms (ряд 1). Полные rect'ы полос:
+                // 1 обрезочка + 1 поле + текст + 1 поле. Текст рисуют
+                // часы в замыкании.
+                let right = bottom_right.col;
+                let date_rect = grid::cell(right - 16, 0).extrude(16, 1);
+                let time_rect = grid::cell(right - 15, 1).extrude(15, 1);
+                view::Stripe::new(TITLE_BG_LIGHT, view::Corner::TopRight).show(
+                    ui,
+                    date_rect,
+                    |ui, rect| {
+                        self.date_clock.show(ui, rect, egui::Color32::BLACK);
+                    },
+                );
+                view::Stripe::new(TITLE_BG_DARK, view::Corner::TopRight).show(
+                    ui,
+                    time_rect,
+                    |ui, rect| {
+                        self.time_clock.show(ui, rect, egui::Color32::BLACK);
+                    },
                 );
 
                 if columns > 0 {
@@ -371,12 +398,6 @@ impl Live {
                     egui::Direction::RightToLeft,
                     grid::cell_y(bottom_right.row - 1 - BOTTOM_BAR_ROWS),
                 );
-
-                let text_rect = grid::cell(bottom_right.col, bottom_right.row)
-                    .translate(0, -1)
-                    .translate(-1, 0)
-                    .extrude(-25, -1);
-                self.clock.show(ui, text_rect);
             });
 
         match action {

@@ -1,3 +1,2 @@
-pub mod capture;
+pub mod camera;
 pub mod dvr;
-pub mod webcam;

@@ -36,7 +36,7 @@ fn main() {
             log::info!("Hello Laps!");
             println!("Hello Laps!");
         }
-        Some(Commands::ListCameras) => match driver::webcam::list_cameras() {
+        Some(Commands::ListCameras) => match driver::camera::list_cameras() {
             Ok(descriptions) => {
                 for desc in descriptions {
                     println!("{}", desc);

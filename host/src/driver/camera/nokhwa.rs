@@ -1,11 +1,16 @@
 //! Реализация capture-трейта поверх nokhwa (все платформы).
 //!
 //! nokhwa заархивирована и является переходным бэкендом: интерфейс
-//! (`super`) от неё не зависит, замена — отдельным модулем
+//! (`super::capture`) от неё не зависит, замена — отдельным модулем
 //! (docs/capture-backend-plan.md). macOS-специфичное перечисление
 //! форматов через AVCaptureDevice живёт здесь же, за cfg.
+//!
+//! Правило слоя: бэкенд не импортирует pipeline-части модуля camera
+//! (mod.rs) — только контракты из capture.rs.
 
-use super::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
+use super::capture::{
+    Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
+};
 use crate::config::camera::CameraConfig;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};

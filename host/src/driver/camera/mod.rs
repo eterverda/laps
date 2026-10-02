@@ -1,12 +1,23 @@
+//! Камера: источник кадров (capture.rs + бэкенды), pipeline (этот файл)
+//! и общие утилиты (fps.rs). `Camera` — фасад для GUI: владеет
+//! capture-потоком, slot'ом и текстурой.
+//!
+//! Правило слоя: бэкенды (`nokhwa.rs`, позже v4l2/mf/avf) импортируют
+//! только контракты из capture.rs и не трогают pipeline-части.
+
 use self::decode::Error as DecodeError;
+pub mod capture;
 pub mod decode;
 pub mod fps;
+mod nokhwa;
 
-use crate::config::camera::{CameraConfig, FrameRateConfig, PixelConfig};
-use crate::driver::capture::{
-    self, Capture, CaptureSession, Frame, FrameData, FrameError, FrameSink,
+pub use capture::{
+    Capture, CaptureFormat, CaptureSession, Frame, FrameData, FrameError, FrameSink,
 };
-use crate::driver::dvr::{Options, RecordState, SharedRecordState};
+pub use nokhwa::NokhwaCapture as Backend;
+
+use crate::config::camera::{CameraConfig, PixelConfig};
+use crate::driver::dvr::{DvrSink, Options, RecordState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,33 +38,7 @@ pub enum CaptureState {
 /// Общий для потока и UI хэндл состояния камеры.
 pub type SharedCaptureState = Arc<AtomicCell<CaptureState>>;
 
-/// HARD HACK / ДИСКЛЕЙМЕР. Камера может отдавать кадры быстрее, чем
-/// запрошено: macOS (AVFoundation) часто открывает поток на 60 fps при
-/// запросе 30, драйвер вправе игнорировать запрошенный fps вообще. Вместо
-/// форков биндингов мы троттлим поток на входе DVR-sink, но только когда
-/// эффективный fps записи ≤ 30 (dvr.frame-rate, иначе camera.frame-rate):
-/// при запросе больше 30 каждый кадр пишется как есть. Live view
-/// обновляется на полном fps камеры. Интервал 25 мс (а не 33.3 мс) выбран
-/// так, чтобы при ровном 60 fps источника записывался примерно каждый
-/// второй кадр, то есть ~30 fps, не боясь пограничного джиттера.
-const RECORD_THROTTLE_MIN_INTERVAL: Duration = Duration::from_millis(25);
-
-/// Возвращает true, если кадр нужно отправить в DVR. Для эффективного
-/// fps записи ≤ 30 дропаем кадры, пришедшие раньше 25 мс после последнего
-/// записанного; при fps > 30 каждый кадр проходит.
-fn should_record_frame(fps: FrameRateConfig, last_recorded_frame: &mut Instant) -> bool {
-    if fps.0 > 30 {
-        return true;
-    }
-    if last_recorded_frame.elapsed() >= RECORD_THROTTLE_MIN_INTERVAL {
-        *last_recorded_frame = Instant::now();
-        true
-    } else {
-        false
-    }
-}
-
-type ImageSlot = Arc<Mutex<Option<Arc<capture::Frame>>>>;
+type ImageSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 
 /// Команды из UI-потока в capture-поток (управление записью).
 enum Command {
@@ -61,18 +46,18 @@ enum Command {
     StopRecording,
 }
 
-/// UI-sink. Latest-wins (P3a): хранит последний кадр, egui-поток забирает
-/// его по своему темпу; медленный UI пропускает кадры, но capture-поток
-/// его не ждёт — обратного давления нет.
-struct UiSink {
+/// Latest-wins sink (P3a): хранит ровно последний кадр, потребитель
+/// забирает по своему темпу; медленный потребитель пропускает кадры, но
+/// capture-поток его не ждёт — обратного давления нет.
+struct LatestSink {
     slot: ImageSlot,
     on_frame: Arc<dyn Fn() + Send + Sync>,
 }
 
-impl FrameSink for UiSink {
-    fn on_frame(&mut self, frame: Arc<capture::Frame>) {
+impl FrameSink for LatestSink {
+    fn on_frame(&mut self, frame: Arc<Frame>) {
         match &frame.data {
-            capture::FrameData::Rgba { .. } => {
+            FrameData::Rgba { .. } => {
                 *self.slot.lock().unwrap() = Some(frame);
                 (self.on_frame)();
             }
@@ -81,91 +66,8 @@ impl FrameSink for UiSink {
     }
 }
 
-/// DVR-sink: держит Recorder, троттлит избыточный поток (HARD HACK выше),
-/// конвертирует Instant→epoch millis якорем. Recorder живёт независимо от
-/// жизни pipeline: drop sink'а (как и раньше drop recorder'а в потоке)
-/// отпускает writer в фоновую финализацию.
-struct DvrSink {
-    recorder: Option<crate::driver::dvr::Recorder>,
-    /// Эффективный fps записи (dvr.frame-rate, иначе camera.frame-rate).
-    fps: FrameRateConfig,
-    last_recorded_frame: Instant,
-    negotiated: capture::CaptureFormat,
-    state: SharedRecordState,
-    /// Якорь Instant→epoch millis (ставится до цикла кадров).
-    anchor: (Instant, u64),
-}
-
-impl DvrSink {
-    fn new(
-        fps: FrameRateConfig,
-        negotiated: capture::CaptureFormat,
-        state: SharedRecordState,
-    ) -> Self {
-        Self {
-            recorder: None,
-            fps,
-            last_recorded_frame: Instant::now(),
-            negotiated,
-            state,
-            anchor: (Instant::now(), crate::driver::dvr::epoch_millis()),
-        }
-    }
-
-    fn set_fps(&mut self, fps: FrameRateConfig) {
-        self.fps = fps;
-    }
-
-    /// Файл создаётся здесь, а не в writer-потоке: ошибка (диск полон,
-    /// нет прав) логируется, RecordState остаётся false — как раньше.
-    fn start(&mut self, options: &Options) {
-        self.set_fps(FrameRateConfig(options.camera.dvr_frame_rate().0));
-        match crate::driver::dvr::Recorder::start(options, &self.negotiated, &self.state) {
-            Ok(recorder) => self.recorder = Some(recorder),
-            Err(e) => {
-                log::error!("dvr: recording unavailable: {}", e);
-                self.recorder = None;
-            }
-        }
-    }
-
-    fn stop(&mut self) {
-        // drop: writer finalize'ит файл в фоне.
-        self.recorder = None;
-    }
-
-    fn epoch_millis(&self, t: Instant) -> u64 {
-        self.anchor.1 + t.saturating_duration_since(self.anchor.0).as_millis() as u64
-    }
-}
-
-impl FrameSink for DvrSink {
-    fn on_frame(&mut self, frame: Arc<capture::Frame>) {
-        if self.recorder.is_none() {
-            return;
-        }
-        if !should_record_frame(self.fps, &mut self.last_recorded_frame) {
-            return;
-        }
-        let ts = self.epoch_millis(frame.timestamp);
-        match &frame.data {
-            // Известные к записи варианты; буфер не копируется (P4).
-            FrameData::Jpeg { .. } | FrameData::Rgba { .. } => {
-                self.recorder.as_ref().unwrap().push(frame, ts)
-            }
-            // Yuyv и любые будущие варианты сюда не должны доходить
-            // (инвариант pipeline) — принципиально неизвестное отвергаем.
-            other => log::error!("dvr sink: unexpected frame variant {other:?}, skipped"),
-        }
-    }
-
-    fn on_stop(&mut self) {
-        self.stop();
-    }
-}
-
 pub fn list_cameras() -> Result<Vec<CameraConfig>, String> {
-    let mut devices = capture::Backend::list_devices()?;
+    let mut devices = Backend::list_devices()?;
     devices.sort_by(|a, b| a.name.cmp(&b.name));
     let mut descriptions = Vec::new();
     for dev in devices {
@@ -182,7 +84,7 @@ pub fn list_cameras() -> Result<Vec<CameraConfig>, String> {
     Ok(descriptions)
 }
 
-pub struct Webcam {
+pub struct Camera {
     slot: ImageSlot,
     texture: Option<egui::TextureHandle>,
     running: Arc<AtomicBool>,
@@ -193,7 +95,7 @@ pub struct Webcam {
     ui_latency: Arc<Mutex<fps::FrameStats>>,
 }
 
-impl Webcam {
+impl Camera {
     /// Стрим открыт, поток камеры жив.
     pub fn capture_state(&self) -> CaptureState {
         self.camera.load()
@@ -237,7 +139,7 @@ impl Webcam {
         }));
         let record_clone = Arc::clone(&record);
         let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
-        // Латентность live считается на ВЫХОДЕ — в Webcam::update (момент
+        // Латентность live считается на ВЫХОДЕ — в Camera::update (момент
         // отдачи кадра в egui-текстуру), а не при складывании в slot:
         // замер включает ожидание repaint. UI-поток пишет, capture-поток
         // логает один раз в конце сеанса.
@@ -246,7 +148,7 @@ impl Webcam {
 
         let thread = thread::spawn(move || {
             // Перебор устройств и форматов — io, не должно висеть на UI-потоке.
-            let devices = match capture::Backend::list_devices() {
+            let devices = match Backend::list_devices() {
                 Ok(d) => d,
                 Err(e) => {
                     log::error!("failed to list devices: {}", e);
@@ -279,7 +181,7 @@ impl Webcam {
 
             // open резолвит устройство по имени заново (P5): между
             // перечислением и открытием камеру могли переткнуть.
-            let mut session = match capture::Backend::open(&desc) {
+            let mut session = match Backend::open(&desc) {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open camera: {}", e);
@@ -298,7 +200,7 @@ impl Webcam {
             // stream as-is and drop excess frames in the DVR sink so
             // recording runs at the requested rate; live view is not
             // throttled.
-            let mut ui_sink = UiSink {
+            let mut ui_sink = LatestSink {
                 slot: slot_clone,
                 on_frame: Arc::new(on_frame),
             };
@@ -494,7 +396,7 @@ impl Webcam {
     }
 }
 
-impl Drop for Webcam {
+impl Drop for Camera {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         // Джойним capture-поток: он ждёт текущий кадр и stop_stream.

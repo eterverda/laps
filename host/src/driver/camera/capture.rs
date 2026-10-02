@@ -1,8 +1,7 @@
-//! Слой источника кадров: трейт [`Capture`] поверх платформенных бэкендов.
-//!
-//! Сейчас единственный бэкенд — nokhwa (`nokhwa.rs`, зависимость
-//! архивирована; замена по docs/capture-backend-plan.md). Пайплайн и
-//! sink'и зависят только от этого модуля.
+//! Контракты слоя источника: трейты [`Capture`]/[`CaptureSession`]/
+//! [`FrameSink`], типы кадра. Реализации-бэкенды — соседние модули
+//! (`nokhwa.rs`, позже v4l2/mf/avf); выбор бэкенда — в `mod.rs`
+//! родительского модуля. Pipeline и sink'и зависят только от этого файла.
 //!
 //! Терминология: один кадр — `jpeg` ([`FrameData::Jpeg`]); формат потока
 //! камеры — `MJPEG` (`PixelConfig::Mjpeg`); совокупность jpeg-кадров в
@@ -99,7 +98,3 @@ pub trait FrameSink {
     /// Pipeline завершается (камера потеряна, стоп) — sink подчищается.
     fn on_stop(&mut self) {}
 }
-
-pub mod nokhwa;
-
-pub use nokhwa::NokhwaCapture as Backend;

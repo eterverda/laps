@@ -20,12 +20,13 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
                │ RGBA frame
    ┌───────────┴────────────┐
    │ driver                 │
-   │ - capture (trait)      │  FrameSource → Pipeline → FrameSink:
-   │   nokhwa backend       │  pull, один декод на кадр, fan-out
-   │ - webcam (pipeline)    │  capture thread: jpeg-passthrough /
-   │ - dvr (own muxers)     │  YUYV decode → ColorImage slot
-   │   MKV (EBML+Cues)      │  recorder: writer thread, jpeg-кадры
-   │   MOV/MP4 (ISOBMFF)    │  → container, no re-encode
+   │ - camera               │  FrameSource → Pipeline → FrameSink:
+   │   capture.rs (traits)  │  pull, один декод на кадр, fan-out
+   │   nokhwa backend       │  capture thread: jpeg-passthrough /
+   │   Camera (facade+pipe) │  YUYV decode → ColorImage slot
+   │ - dvr (own muxers)     │  recorder: writer thread, jpeg-кадры
+   │   MKV (EBML+Cues)      │  → container, no re-encode
+   │   MOV/MP4 (ISOBMFF)    │
    └────────────────────────┘
 ```
 
@@ -52,12 +53,13 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 
 ## Video Capture
 
-- **Layers** (`docs/capture-backend-plan.md`): `driver/capture` trait
-  (`Capture`/`CaptureSession`/`FrameSink`, MJPEG + YUYV only) —
-  FrameSource; `webcam` — pipeline (pull, один декод на кадр, fan-out,
-  троттлинг DVR); UI и DVR — sink'и. Backend — **nokhwa** 0.10 (V4L2 on
-  Linux, AVFoundation on macOS, MSMF on Windows), архивирована, за
-  трейтом; замена — этапами по плану, pure Rust, без cc
+- **Layers** (`docs/capture-backend-plan.md`): `driver/camera` — один
+  модуль на домен: `capture.rs` (трейты `Capture`/`CaptureSession`/
+  `FrameSink`, типы кадра) — FrameSource; `mod.rs` — pipeline + `Camera`
+  (фасад для GUI); `nokhwa.rs` — бэкенд (архивирована, за трейтом;
+  замена — этапами по плану, pure Rust, без cc). Бэкенды импортируют
+  только `capture.rs`. `DvrSink` — в `dvr/sink.rs` (зависимость
+  `dvr → camera::capture`).
 - Терминология: один кадр — `jpeg` (`FrameData::Jpeg`), формат потока —
   `MJPEG`, файл с кадрами — `mjpeg`-поток
 - jpeg-камеры: источник считает длину кадра (FFD9-поиск, `memchr`),
@@ -177,7 +179,7 @@ cargo run
 - **Per-frame buffer reuse (pool)** — capture allocates ~8 MB RGBA
   (`zeroed_vec`) + ~125 KB JPEG copy per frame (~240 MB/s churn per
   camera). Plan: small generic `Pool` (40 lines, no new deps); DVR channel
-  carries pooled buffers recycled by writer; pixel pool per webcam (2-3
+  carries pooled buffers recycled by writer; pixel pool per camera (2-3
   buffers), `decode_frame` takes `&mut [u8]`, UI returns buffer to pool
   after `texture.set`; drop `zeroed_vec` (decode_into overwrites fully).
   Expected: -1..3 ms CPU per frame (memset + mmap/page-fault churn), no

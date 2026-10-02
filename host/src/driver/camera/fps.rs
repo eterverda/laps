@@ -102,12 +102,12 @@ impl Default for FrameStats {
 
 impl FrameStats {
     /// Штатная точка входа: задержка от таймстемпа кадра до «сейчас».
-    pub fn on_frame(&mut self, frame: &crate::driver::capture::Frame) {
+    pub fn on_frame(&mut self, frame: &crate::driver::camera::capture::Frame) {
         self.on_frame_at(frame, Instant::now());
     }
 
     /// Задержка от таймстемпа кадра до заданного момента (для тестов).
-    pub fn on_frame_at(&mut self, frame: &crate::driver::capture::Frame, now: Instant) {
+    pub fn on_frame_at(&mut self, frame: &crate::driver::camera::capture::Frame, now: Instant) {
         self.on_process(now.saturating_duration_since(frame.timestamp));
     }
 
@@ -267,8 +267,8 @@ mod tests {
 
     mod frame_stats {
         use super::*;
-        use crate::driver::capture::{Frame, FrameData};
-        use crate::driver::webcam::fps::FrameStats;
+        use crate::driver::camera::capture::{Frame, FrameData};
+        use crate::driver::camera::fps::FrameStats;
 
         fn ms(n: u64) -> Duration {
             Duration::from_millis(n)

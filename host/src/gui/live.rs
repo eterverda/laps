@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
-use crate::driver::webcam::CaptureState;
+use crate::driver::camera::CaptureState;
 use crate::gui::grid::IntoCell;
 use crate::model::pilot::Pilot;
 use std::collections::HashMap;
@@ -55,7 +55,7 @@ enum FeedState {
 
 pub struct Live {
     res: Option<Res>,
-    webcams: HashMap<String, crate::driver::webcam::Webcam>,
+    webcams: HashMap<String, crate::driver::camera::Camera>,
     feed: FeedState,
     clock: clock::Clock,
     setup: Setup,
@@ -63,7 +63,7 @@ pub struct Live {
     active_cameras: HashMap<String, CameraConfig>,
     // Показываемый fps: считаем на UI по забранным кадрам, только по
     // первой камере (как и остальные цифры статуса).
-    shown: crate::driver::webcam::fps::FpsCounter,
+    shown: crate::driver::camera::fps::FpsCounter,
     /// Последний измеренный fps; 0.0 = замера ещё не было, UI покажет
     /// "-- fps". Пауза кадров значение не затирает.
     shown_fps: f32,
@@ -100,7 +100,7 @@ impl Live {
             setup,
             assignments,
             active_cameras,
-            shown: crate::driver::webcam::fps::FpsCounter::default(),
+            shown: crate::driver::camera::fps::FpsCounter::default(),
             shown_fps: 0.0,
         }
     }
@@ -394,7 +394,7 @@ impl Live {
             // per `request_repaint` (outstanding = 1), and the second pass
             // always finds an empty slot. A tiny delay gives a single pass
             // per camera frame.
-            let webcam = crate::driver::webcam::Webcam::start(camera.clone(), move || {
+            let webcam = crate::driver::camera::Camera::start(camera.clone(), move || {
                 ctx.request_repaint_after(std::time::Duration::from_millis(1));
             });
             self.webcams.insert(id.clone(), webcam);

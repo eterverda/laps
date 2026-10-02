@@ -121,7 +121,11 @@ impl Camera {
     /// Остановить запись; файл финализируется в фоне. Команда
     /// применится между кадрами, затем — drop recorder'а.
     pub fn stop_recording(&self) {
-        if self.commands.try_send(RecordCommand::StopRecording).is_err() {
+        if self
+            .commands
+            .try_send(RecordCommand::StopRecording)
+            .is_err()
+        {
             log::warn!("dvr: stop_recording ignored (capture thread gone)");
         }
     }
@@ -152,6 +156,7 @@ impl Camera {
                 Ok(d) => d,
                 Err(e) => {
                     log::error!("failed to list devices: {}", e);
+                    state_clone.store(CaptureState::Dead);
                     return;
                 }
             };
@@ -173,6 +178,7 @@ impl Camera {
                 Some(found) => found,
                 None => {
                     log::error!("no matching camera format for {}", desc);
+                    state_clone.store(CaptureState::Dead);
                     return;
                 }
             };
@@ -185,6 +191,7 @@ impl Camera {
                 Ok(s) => s,
                 Err(e) => {
                     log::error!("failed to open camera: {}", e);
+                    state_clone.store(CaptureState::Dead);
                     return;
                 }
             };
@@ -225,7 +232,7 @@ impl Camera {
                 // блокирует до ~периода кадра, задержка незаметна.
                 for cmd in commands_rx.try_iter() {
                     match cmd {
-                        RecordCommand::StartRecording(options) => dvr_sink.start(&options),
+                        RecordCommand::StartRecording(params) => dvr_sink.start(&params),
                         RecordCommand::StopRecording => dvr_sink.stop(),
                     }
                 }
@@ -252,73 +259,17 @@ impl Camera {
                         break;
                     }
                 };
-                let ts = frame.timestamp;
 
-                // Конверсия + fan-out по подпискам sink'ов (P3/P4).
-                // Единственный декод на кадр: Jpeg → RGBA для UI,
-                // Yuyv → RGBA для обоих sink'ов.
-                match frame.data {
-                    FrameData::Jpeg { buf, len } => {
-                        // Декод до перемещения буфера: borrow, не копия.
-                        // Пишем в DVR до применения результата декода:
-                        // jpeg-кадр валиден сам по себе (SOI..EOI), а декод
-                        // может отказать на кадре, который плеер съел бы —
-                        // экранный дроп не должен терять кадр в записи.
-                        let t0 = Instant::now();
-                        let decoded = decode::decode_frame(PixelConfig::Mjpeg, &buf, width, height);
-                        decode_jpeg.on_process(t0.elapsed());
-                        dvr_sink.on_frame(Arc::new(Frame {
-                            timestamp: ts,
-                            data: FrameData::Jpeg { buf, len },
-                        }));
-                        match decoded {
-                            Ok(image) => {
-                                ui_sink.on_frame(Arc::new(Frame {
-                                    timestamp: ts,
-                                    data: FrameData::Rgba { rgba: image },
-                                }));
-                            }
-                            Err(DecodeError::Recoverable(e)) => {
-                                log::warn!("frame skipped: {}", e);
-                            }
-                            Err(DecodeError::Unrecoverable(e)) => {
-                                log::error!("capture stopping: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    FrameData::Yuyv { buf } => {
-                        let t0 = Instant::now();
-                        let decoded = decode::decode_frame(PixelConfig::Yuyv, &buf, width, height);
-                        decode_yuyv.on_process(t0.elapsed());
-                        match decoded {
-                            Ok(image) => {
-                                // Один декод — обоим sink'ам бампом счётчика.
-                                let frame = Arc::new(Frame {
-                                    timestamp: ts,
-                                    data: FrameData::Rgba { rgba: image },
-                                });
-                                dvr_sink.on_frame(frame.clone());
-                                ui_sink.on_frame(frame);
-                            }
-                            Err(DecodeError::Recoverable(e)) => {
-                                log::warn!("frame skipped: {}", e);
-                            }
-                            Err(DecodeError::Unrecoverable(e)) => {
-                                log::error!("capture stopping: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    // Нативный RGBA от будущих бэкендов: без декода.
-                    FrameData::Rgba { rgba } => {
-                        let frame = Arc::new(Frame {
-                            timestamp: ts,
-                            data: FrameData::Rgba { rgba },
-                        });
-                        dvr_sink.on_frame(frame.clone());
-                        ui_sink.on_frame(frame);
-                    }
+                if !dispatch_frame(
+                    frame,
+                    width,
+                    height,
+                    &mut dvr_sink,
+                    &mut ui_sink,
+                    &mut decode_jpeg,
+                    &mut decode_yuyv,
+                ) {
+                    break;
                 }
             }
 
@@ -373,7 +324,7 @@ impl Camera {
         let new_frame = image.is_some();
 
         if let Some(frame) = image {
-            let capture::FrameData::Rgba { rgba } = &frame.data else {
+            let FrameData::Rgba { rgba } = &frame.data else {
                 unreachable!("ui slot holds only RGBA frames");
             };
             match &mut self.texture {
@@ -393,6 +344,208 @@ impl Camera {
         }
 
         (self.texture.as_ref(), new_frame)
+    }
+}
+
+/// Конверсия + fan-out по подпискам sink'ов (P3/P4). Единственный декод
+/// на кадр: Jpeg → RGBA для UI, Yuyv → RGBA для обоих sink'ов. Вынесено
+/// из тела цикла для тестируемости без камеры.
+/// false — декод потребовал остановки потока (Unrecoverable).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_frame(
+    frame: Frame,
+    width: u32,
+    height: u32,
+    dvr_sink: &mut DvrSink,
+    ui_sink: &mut LatestSink,
+    decode_jpeg: &mut fps::FrameStats,
+    decode_yuyv: &mut fps::FrameStats,
+) -> bool {
+    let ts = frame.timestamp;
+    match frame.data {
+        FrameData::Jpeg { buf, len } => {
+            // Декод до перемещения буфера: borrow, не копия. Пишем в DVR
+            // до применения результата декода: jpeg-кадр валиден сам по
+            // себе (SOI..EOI), а декод может отказать на кадре, который
+            // плеер съел бы — экранный дроп не должен терять кадр в записи.
+            let t0 = Instant::now();
+            let decoded = decode::decode_frame(PixelConfig::Mjpeg, &buf, width, height);
+            decode_jpeg.on_process(t0.elapsed());
+            dvr_sink.on_frame(Arc::new(Frame {
+                timestamp: ts,
+                data: FrameData::Jpeg { buf, len },
+            }));
+            match decoded {
+                Ok(image) => {
+                    ui_sink.on_frame(Arc::new(Frame {
+                        timestamp: ts,
+                        data: FrameData::Rgba { rgba: image },
+                    }));
+                }
+                Err(DecodeError::Recoverable(e)) => {
+                    log::warn!("frame skipped: {}", e);
+                }
+                Err(DecodeError::Unrecoverable(e)) => {
+                    log::error!("capture stopping: {}", e);
+                    return false;
+                }
+            }
+        }
+        FrameData::Yuyv { buf } => {
+            let t0 = Instant::now();
+            let decoded = decode::decode_frame(PixelConfig::Yuyv, &buf, width, height);
+            decode_yuyv.on_process(t0.elapsed());
+            match decoded {
+                Ok(image) => {
+                    // Один декод — обоим sink'ам бампом счётчика.
+                    let frame = Arc::new(Frame {
+                        timestamp: ts,
+                        data: FrameData::Rgba { rgba: image },
+                    });
+                    dvr_sink.on_frame(frame.clone());
+                    ui_sink.on_frame(frame);
+                }
+                Err(DecodeError::Recoverable(e)) => {
+                    log::warn!("frame skipped: {}", e);
+                }
+                Err(DecodeError::Unrecoverable(e)) => {
+                    log::error!("capture stopping: {}", e);
+                    return false;
+                }
+            }
+        }
+        // Нативный RGBA от будущих бэкендов: без декода.
+        FrameData::Rgba { rgba } => {
+            let frame = Arc::new(Frame {
+                timestamp: ts,
+                data: FrameData::Rgba { rgba },
+            });
+            dvr_sink.on_frame(frame.clone());
+            ui_sink.on_frame(frame);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::camera::{FrameRateConfig, ResolutionConfig};
+
+    fn yuyv_frame(w: u32, h: u32) -> Frame {
+        Frame {
+            timestamp: Instant::now(),
+            data: FrameData::Yuyv {
+                buf: vec![128u8; (w * h * 2) as usize],
+            },
+        }
+    }
+
+    /// Невалидный jpeg-кадр (голые SOI/EOI): dispatch не валидирует
+    /// контент — DVR получает байты как есть, декод честно падает
+    /// Recoverable, UI не обновляется, поток живёт.
+    fn broken_jpeg_frame() -> Frame {
+        Frame {
+            timestamp: Instant::now(),
+            data: FrameData::Jpeg {
+                buf: vec![0xFF, 0xD8, 0xFF, 0xD9],
+                len: Some(4),
+            },
+        }
+    }
+
+    /// Pipeline без камеры: Yuyv-кадр конвертируется один раз и попадает
+    /// в оба sink'а; jpeg-кадр идёт в DVR как есть и декодируется в UI.
+    /// DVR на fps>60-конфиге (троттлинг выключен): записанные кадры
+    /// считаем по появлению файла.
+    #[test]
+    fn dispatch_routes_frames_to_sinks() {
+        let slot: ImageSlot = Arc::default();
+        let mut ui = LatestSink {
+            slot: Arc::clone(&slot),
+            on_frame: Arc::new(|| {}),
+        };
+        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
+            ok: false,
+            fps: 0.0,
+        }));
+        let dir = std::env::temp_dir().join(format!("laps-pipe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let negotiated = CaptureFormat {
+            resolution: ResolutionConfig {
+                width: 8,
+                height: 8,
+            },
+            frame_rate: FrameRateConfig(60),
+            format: PixelConfig::Yuyv,
+        };
+        let mut dvr = DvrSink::new(FrameRateConfig(60), negotiated, Arc::clone(&state));
+        dvr.start(&RecordParams {
+            dir: dir.clone(),
+            camera_id: "camera-1".to_owned(),
+            camera: CameraConfig::new("Test", 8, 8, 60, PixelConfig::Yuyv),
+        });
+        assert!(state.load().ok, "recorder must be live");
+
+        let mut dj = fps::FrameStats::default();
+        let mut dy = fps::FrameStats::default();
+        assert!(dispatch_frame(
+            yuyv_frame(8, 8),
+            8,
+            8,
+            &mut dvr,
+            &mut ui,
+            &mut dj,
+            &mut dy
+        ));
+        assert!(
+            matches!(
+                &slot.lock().unwrap().as_ref().map(|f| &f.data),
+                Some(FrameData::Rgba { .. })
+            ),
+            "ui sink must hold decoded RGBA"
+        );
+
+        assert!(dispatch_frame(yuyv_frame(8, 8), 8, 8, &mut dvr, &mut ui, &mut dj, &mut dy));
+        assert!(
+            matches!(
+                &slot.lock().unwrap().as_ref().map(|f| &f.data),
+                Some(FrameData::Rgba { .. })
+            ),
+            "ui sink must hold decoded RGBA from jpeg"
+        );
+
+        // latest-wins: следующий кадр заменяет предыдущий.
+        let first = Arc::clone(slot.lock().unwrap().as_ref().unwrap());
+        assert!(dispatch_frame(
+            yuyv_frame(8, 8),
+            8,
+            8,
+            &mut dvr,
+            &mut ui,
+            &mut dj,
+            &mut dy
+        ));
+        let second = Arc::clone(slot.lock().unwrap().as_ref().unwrap());
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "slot must replace, not queue"
+        );
+
+        drop(dvr); // канал закрыт → writer finalize'ит файл в фоне
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mkv = loop {
+            let found = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .any(|p| p.extension().is_some_and(|e| e == "mkv"));
+            if found || Instant::now() > deadline {
+                break found;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(mkv, "dvr sink must write the container");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

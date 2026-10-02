@@ -248,7 +248,7 @@ impl Drop for Recorder {
     }
 }
 
-/// Округление до одного знака (для отчёта).
+/// Миллисекунды с Unix-эпохи (для меток файла DVR).
 pub(crate) fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

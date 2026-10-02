@@ -41,9 +41,10 @@ pub enum FrameError {
     Unrecoverable(String),
 }
 
-/// Кадр: таймстемп + контент. Таймстемп штампует бэкенд каждый кадр —
-/// из низлежащих данных устройства, если они есть (V4L2
-/// `v4l2_buffer.timestamp`, приведённый к Instant), иначе время прихода.
+/// Кадр: таймстемп + контент. Таймстемп — момент захвата: бэкенд
+/// штампует по приходу кадра (nokhwa); бэкенды с доступом к часам
+/// устройства (V4L2 `v4l2_buffer.timestamp`) вправе ставить device time,
+/// приведённую к Instant.
 #[derive(Debug)]
 pub struct Frame {
     pub timestamp: Instant,

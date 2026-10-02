@@ -1,7 +1,7 @@
-//! DVR-sink: `FrameSink`-адаптер над Recorder. Живёт в dvr, а не в camera:
-//! он знает про Recorder/Options/RecordState, и зависимость направлена
-//! `dvr → camera::capture` (контракт sink'а), а не наоборот. Camera
-//! pipeline владеет экземпляром и дёргает start/stop по командам UI.
+//! DVR-sink: реализация `FrameSink` над Recorder. Контракт `FrameSink`
+//! живёт в `camera::capture` (трейт), реализация — здесь, в dvr, рядом
+//! с Recorder и политикой троттлинга; композиция — в pipeline camera,
+//! который создаёт DvrSink и дёргает start/stop по командам UI.
 
 use super::{RecordParams, Recorder, SharedRecordState};
 use crate::config::camera::FrameRateConfig;
@@ -95,18 +95,16 @@ impl DvrSink {
 
 impl FrameSink for DvrSink {
     fn on_frame(&mut self, frame: Arc<Frame>) {
-        if self.recorder.is_none() {
+        let Some(recorder) = &self.recorder else {
             return;
-        }
+        };
         if !should_record_frame(self.fps, &mut self.last_recorded_frame) {
             return;
         }
         let ts = self.epoch_millis(frame.timestamp);
         match &frame.data {
             // Известные к записи варианты; буфер не копируется (P4).
-            FrameData::Jpeg { .. } | FrameData::Rgba { .. } => {
-                self.recorder.as_ref().unwrap().push(frame, ts)
-            }
+            FrameData::Jpeg { .. } | FrameData::Rgba { .. } => recorder.push(frame, ts),
             // Yuyv и любые будущие варианты сюда не должны доходить
             // (инвариант pipeline) — принципиально неизвестное отвергаем.
             other => log::error!("dvr sink: unexpected frame variant {other:?}, skipped"),

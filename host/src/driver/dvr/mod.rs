@@ -5,6 +5,7 @@
 //! принадлежит writer-потоку (старт/окна fps/ошибка/выход) — вторых
 //! писателей быть не должно.
 
+mod encode;
 mod mkv;
 mod mov;
 mod mp4;
@@ -41,24 +42,6 @@ pub(crate) trait VideoWriter: Send {
     fn sync_data(&mut self) -> io::Result<()>;
     /// Потребляет писателя: таблицы/индекс, патчи заголовков, fsync.
     fn finalize(self: Box<Self>) -> io::Result<()>;
-}
-
-/// Кодирует RGBA в JPEG. Для YUYV-источников capture-поток уже
-/// декодировал кадр в RGBA; здесь он готовится к записи в MJPEG-контейнер.
-const JPEG_QUALITY: u8 = 60;
-
-fn encode_rgba_to_jpeg(rgba: &[u8], width: u32, height: u32) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let encoder = jpeg_encoder::Encoder::new(&mut buf, JPEG_QUALITY);
-    encoder
-        .encode(
-            rgba,
-            width as u16,
-            height as u16,
-            jpeg_encoder::ColorType::Rgba,
-        )
-        .map_err(|e| io::Error::other(format!("jpeg encode: {e}")))?;
-    Ok(buf)
 }
 
 /// Каталог записей по умолчанию, относительно рабочей директории.
@@ -314,7 +297,7 @@ impl Recorder {
                     FrameData::Rgba { rgba } => {
                         let t0 = Instant::now();
                         // Кадр общий (Arc), пиксели только заимствуем.
-                        let jpeg = match encode_rgba_to_jpeg(
+                        let jpeg = match encode::encode_rgba_to_jpeg(
                             bytemuck::cast_slice(&rgba.pixels),
                             width,
                             height,

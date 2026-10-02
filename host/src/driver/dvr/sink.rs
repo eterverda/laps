@@ -22,17 +22,23 @@ const RECORD_THROTTLE_MIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Возвращает true, если кадр нужно отправить в DVR. Для эффективного
 /// fps записи ≤ 30 дропаем кадры, пришедшие раньше 25 мс после последнего
-/// записанного; при fps > 30 каждый кадр проходит.
-fn should_record_frame(fps: FrameRateConfig, last_recorded_frame: &mut Instant) -> bool {
+/// записанного; при fps > 30 каждый кадр проходит. Сравниваются ДЕЛЬТЫ
+/// таймстемпов кадров (не Instant::now()): сегодня штампы — время прихода
+/// (nokhwa), бэкенды с device time (V4L2) автоматически дадут пейсинг по
+/// сетке устройства, без пакетной выдачи буферов в решениях.
+fn should_record_frame(
+    fps: FrameRateConfig,
+    frame_ts: Instant,
+    next_eligible: &mut Instant,
+) -> bool {
     if fps.0 > 30 {
         return true;
     }
-    if last_recorded_frame.elapsed() >= RECORD_THROTTLE_MIN_INTERVAL {
-        *last_recorded_frame = Instant::now();
-        true
-    } else {
-        false
+    if frame_ts < *next_eligible {
+        return false;
     }
+    *next_eligible = frame_ts + RECORD_THROTTLE_MIN_INTERVAL;
+    true
 }
 
 /// Держит Recorder, троттлит избыточный поток (HARD HACK выше),
@@ -43,7 +49,10 @@ pub struct DvrSink {
     recorder: Option<Recorder>,
     /// Эффективный fps записи (dvr.frame-rate, иначе camera.frame-rate).
     fps: FrameRateConfig,
-    last_recorded_frame: Instant,
+    /// Момент, с которого следующий кадр можно писать (последний
+    /// записанный + 25 мс). Стартовое now(): первый кадр записи штампится
+    /// позже и проходит всегда — спец-значения не нужны.
+    next_eligible: Instant,
     negotiated: crate::driver::camera::CaptureFormat,
     state: SharedRecordState,
     /// Якорь Instant→epoch millis (ставится до цикла кадров).
@@ -59,7 +68,7 @@ impl DvrSink {
         Self {
             recorder: None,
             fps,
-            last_recorded_frame: Instant::now(),
+            next_eligible: Instant::now(),
             negotiated,
             state,
             anchor: (Instant::now(), super::epoch_millis()),
@@ -74,6 +83,7 @@ impl DvrSink {
     /// нет прав) логируется, RecordState остаётся false — как раньше.
     pub fn start(&mut self, params: &RecordParams) {
         self.set_fps(FrameRateConfig(params.camera.dvr_frame_rate().0));
+        self.next_eligible = Instant::now(); // первый кадр записи проходит всегда
         match Recorder::start(params, &self.negotiated, &self.state) {
             Ok(recorder) => self.recorder = Some(recorder),
             Err(e) => {
@@ -98,7 +108,7 @@ impl FrameSink for DvrSink {
         let Some(recorder) = &self.recorder else {
             return;
         };
-        if !should_record_frame(self.fps, &mut self.last_recorded_frame) {
+        if !should_record_frame(self.fps, frame.timestamp, &mut self.next_eligible) {
             return;
         }
         let ts = self.epoch_millis(frame.timestamp);

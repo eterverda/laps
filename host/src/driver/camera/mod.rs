@@ -441,19 +441,6 @@ mod tests {
         }
     }
 
-    /// Невалидный jpeg-кадр (голые SOI/EOI): dispatch не валидирует
-    /// контент — DVR получает байты как есть, декод честно падает
-    /// Recoverable, UI не обновляется, поток живёт.
-    fn broken_jpeg_frame() -> Frame {
-        Frame {
-            timestamp: Instant::now(),
-            data: FrameData::Jpeg {
-                buf: vec![0xFF, 0xD8, 0xFF, 0xD9],
-                len: Some(4),
-            },
-        }
-    }
-
     /// Pipeline без камеры: Yuyv-кадр конвертируется один раз и попадает
     /// в оба sink'а; jpeg-кадр идёт в DVR как есть и декодируется в UI.
     /// DVR на fps>60-конфиге (троттлинг выключен): записанные кадры

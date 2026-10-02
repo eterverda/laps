@@ -21,10 +21,10 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
    ┌───────────┴────────────┐
    │ driver                 │
    │ - camera               │  FrameSource → Pipeline → FrameSink:
-   │   capture.rs (traits)  │  pull, один декод на кадр, fan-out
+   │   capture.rs (traits)  │  pull, one decode per frame, fan-out
    │   nokhwa backend       │  capture thread: jpeg-passthrough /
    │   Camera (facade+pipe) │  YUYV decode → ColorImage slot
-   │ - dvr (own muxers)     │  recorder: writer thread, jpeg-кадры
+   │ - dvr (own muxers)     │  recorder: writer thread, jpeg frames
    │   MKV (EBML+Cues)      │  → container, no re-encode
    │   MOV/MP4 (ISOBMFF)    │
    └────────────────────────┘
@@ -33,7 +33,9 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 ## UI
 
 - **egui** + **eframe** 0.36 — immediate mode GUI
-- Own grid layout: 160×45 cells of 8×16 pt; all widgets snapped to the grid
+- Own grid layout: 160×45 cells of 16×32 pt (cell is twice the screen
+  pixel size: text rasterizes at 2× resolution, on-screen look unchanged);
+  all widgets snapped to the grid
 - Own zooming and theming; egui auto-zoom (`zoom_with_keyboard`) disabled,
   theme pinned to dark, native window decorations untouched
 - One camera frame → one texture → N viewfinders via UV viewport cropping
@@ -53,18 +55,21 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 
 ## Video Capture
 
-- **Layers** (`docs/capture-backend-plan.md`): `driver/camera` — один
-  модуль на домен: `capture.rs` (трейты `Capture`/`CaptureSession`/
-  `FrameSink`, типы кадра) — FrameSource; `mod.rs` — pipeline + `Camera`
-  (фасад для GUI); `nokhwa.rs` — бэкенд (архивирована, за трейтом;
-  замена — этапами по плану, pure Rust, без cc). Бэкенды импортируют
-  только `capture.rs`. `DvrSink` — в `dvr/sink.rs` (зависимость
+- **Layers** (`docs/capture-backend-plan.md`): `driver/camera` — one
+  module per domain: `capture.rs` (traits `Capture`/`CaptureSession`/
+  `FrameSink`, frame types `Frame`/`FrameData`/`CaptureFormat`/
+  `DeviceInfo`) — FrameSource; `mod.rs` — pipeline + `Camera` facade
+  for GUI; `nokhwa.rs` — backend (archived, behind the trait;
+  replacement staged per the plan, pure Rust, no cc). Backends import
+  only `capture.rs`. `DvrSink` lives in `dvr/sink.rs` (dependency
   `dvr → camera::capture`).
-- Терминология: один кадр — `jpeg` (`FrameData::Jpeg`), формат потока —
-  `MJPEG`, файл с кадрами — `mjpeg`-поток
-- jpeg-камеры: источник считает длину кадра (FFD9-поиск, `memchr`),
-  буфер не копируется — DVR пишет срез `buf[..len]`; decode to RGBA
-  только для экрана (**zune-jpeg**)
+- Terminology: one frame — `jpeg` (`FrameData::Jpeg { buf, len }`),
+  stream format — `MJPEG`, a file of frames — an `mjpeg` stream.
+  `len` is the SOI..EOI frame length computed by the source (FFD9
+  search); `None` — no EOI (broken frame: to screen, not to file)
+- MJPEG cameras: the source computes the frame length (FFD9 search,
+  `memchr`), the buffer is not copied — DVR writes the `buf[..len]`
+  slice; decoded to RGBA for the screen only (**zune-jpeg**)
 - YUYV cameras: decode via **yuv** crate (dev-profile opt-level = 2)
 - Per-frame latency hot spots: nokhwa buffer copy and decode; hot crates
   get `opt-level` bumps in dev profile (`zune-jpeg`/`zune-core`/`jpeg-rusturbo` = 3,

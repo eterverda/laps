@@ -273,7 +273,7 @@ impl Live {
                             graph_rect,
                             0.0,
                             egui::Color32::TRANSPARENT,
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(48)),
+                            egui::Stroke::new(2.0, egui::Color32::from_gray(48)),
                             egui::StrokeKind::Inside,
                         );
                         let laps_rect = graph_rect

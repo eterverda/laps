@@ -7,7 +7,7 @@ pub fn marker_grid(ui: &mut egui::Ui, step: impl Into<egui::Vec2>) {
     let x_count = (size.x / step.x).floor() as i32;
     let y_count = (size.y / step.y).floor() as i32;
     let half = 5.0;
-    let stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x0f));
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x0f));
 
     for x in 0..=x_count {
         for y in 0..=y_count {
@@ -41,7 +41,7 @@ pub fn dashed_line(ui: &mut egui::Ui, axis: egui::Direction, coordinate: f32) {
     };
     ui.painter().add(egui::epaint::Shape::dashed_line(
         &[start, end],
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x0f)),
+        egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x0f)),
         8.0,
         4.0,
     ));
@@ -62,13 +62,13 @@ pub fn solid_line(ui: &mut egui::Ui, axis: egui::Direction, coordinate: f32) {
     };
     ui.painter().line_segment(
         [start, end],
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x0f)),
+        egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x0f)),
     );
 }
 
 #[inline]
 pub fn dashed_rect(ui: &mut egui::Ui, rect: egui::Rect) {
-    let stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x0f));
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x0f));
     let dash_length = 8.0;
     let gap_length = 4.0;
 
@@ -104,7 +104,7 @@ pub fn dashed_rect(ui: &mut egui::Ui, rect: egui::Rect) {
 
 #[inline]
 pub fn hatch_rect(ui: &mut egui::Ui, rect: egui::Rect) {
-    let stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(0x07));
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x07));
     let step = 12.0;
     let w = rect.width();
     let h = rect.height();

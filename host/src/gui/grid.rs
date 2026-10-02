@@ -1,6 +1,6 @@
 use std::ops::Div;
 
-pub const CELL_SIZE: egui::Vec2 = egui::vec2(8.0, 16.0);
+pub const CELL_SIZE: egui::Vec2 = egui::vec2(16.0, 32.0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Cell {

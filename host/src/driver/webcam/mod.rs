@@ -190,6 +190,7 @@ pub struct Webcam {
     camera: SharedCaptureState,
     record: SharedRecordState,
     commands: crossbeam_channel::Sender<Command>,
+    ui_latency: Arc<Mutex<fps::FrameStats>>,
 }
 
 impl Webcam {
@@ -236,6 +237,12 @@ impl Webcam {
         }));
         let record_clone = Arc::clone(&record);
         let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
+        // Латентность live считается на ВЫХОДЕ — в Webcam::update (момент
+        // отдачи кадра в egui-текстуру), а не при складывании в slot:
+        // замер включает ожидание repaint. UI-поток пишет, capture-поток
+        // логает один раз в конце сеанса.
+        let ui_latency = Arc::new(Mutex::new(fps::FrameStats::default()));
+        let ui_latency_thread = Arc::clone(&ui_latency);
 
         let thread = thread::spawn(move || {
             // Перебор устройств и форматов — io, не должно висеть на UI-потоке.
@@ -301,6 +308,10 @@ impl Webcam {
             // потому что frame() может виснуть на несколько секунд,
             // поэтому критерий — время без единого кадра.
             let mut errors_since: Option<Instant> = None;
+            // Длительности фаз декода (не латентность от начала кадра):
+            // по одному декоду на кадр, формат известен до вызова.
+            let mut decode_jpeg = fps::FrameStats::default();
+            let mut decode_yuyv = fps::FrameStats::default();
 
             loop {
                 if !running_clone.load(Ordering::Relaxed) {
@@ -351,16 +362,20 @@ impl Webcam {
                         // jpeg-кадр валиден сам по себе (SOI..EOI), а декод
                         // может отказать на кадре, который плеер съел бы —
                         // экранный дроп не должен терять кадр в записи.
+                        let t0 = Instant::now();
                         let decoded = decode::decode_frame(PixelConfig::Mjpeg, &buf, width, height);
+                        decode_jpeg.on_process(t0.elapsed());
                         dvr_sink.on_frame(Arc::new(Frame {
                             timestamp: ts,
                             data: FrameData::Jpeg { buf, len },
                         }));
                         match decoded {
-                            Ok(image) => ui_sink.on_frame(Arc::new(Frame {
-                                timestamp: ts,
-                                data: FrameData::Rgba { rgba: image },
-                            })),
+                            Ok(image) => {
+                                ui_sink.on_frame(Arc::new(Frame {
+                                    timestamp: ts,
+                                    data: FrameData::Rgba { rgba: image },
+                                }));
+                            }
                             Err(DecodeError::Recoverable(e)) => {
                                 log::warn!("frame skipped: {}", e);
                             }
@@ -371,7 +386,10 @@ impl Webcam {
                         }
                     }
                     FrameData::Yuyv { buf } => {
-                        match decode::decode_frame(PixelConfig::Yuyv, &buf, width, height) {
+                        let t0 = Instant::now();
+                        let decoded = decode::decode_frame(PixelConfig::Yuyv, &buf, width, height);
+                        decode_yuyv.on_process(t0.elapsed());
+                        match decoded {
                             Ok(image) => {
                                 // Один декод — обоим sink'ам бампом счётчика.
                                 let frame = Arc::new(Frame {
@@ -414,6 +432,20 @@ impl Webcam {
             ui_sink.on_stop();
             drop(dvr_sink);
             drop(ui_sink);
+
+            // Один лог на сеанс: мин/среднее/макс/p90 латентности
+            // «захват → кадр отрисован» (замер на выходе, в рисовалке).
+            if let Some(stats) = ui_latency_thread.lock().unwrap().snapshot() {
+                log::info!("live: frame-to-display latency: {stats}");
+            }
+            for (phase, stats) in [
+                ("jpeg→rgba decode", &mut decode_jpeg),
+                ("yuyv→rgba decode", &mut decode_yuyv),
+            ] {
+                if let Some(s) = stats.snapshot() {
+                    log::info!("live: {phase} duration: {s}");
+                }
+            }
         });
 
         Self {
@@ -424,6 +456,7 @@ impl Webcam {
             camera: state,
             record,
             commands: commands_tx,
+            ui_latency,
         }
     }
 
@@ -453,6 +486,8 @@ impl Webcam {
                     ));
                 }
             }
+            // Замер латентности на выходе: кадр реально отдан в текстуру.
+            self.ui_latency.lock().unwrap().on_frame(&frame);
         }
 
         (self.texture.as_ref(), new_frame)

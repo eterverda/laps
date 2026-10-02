@@ -70,6 +70,81 @@ impl FpsCounter {
     }
 }
 
+/// Статистика кадровых задержек и длительностей фаз: num/min/avg/max/p90.
+/// Два источника замеров:
+///
+/// - `on_frame(&Frame)` — латентность: от таймстемпа кадра до «сейчас"
+///   (захват → диск, захват → экран);
+/// - `on_process(Duration)` — длительность фазы (yuyv→rgba, rgba→jpeg,
+///   jpeg→rgba), НЕ от начала кадра.
+///
+/// p90 — t-digest: память O(1) на длину сеанса. Пишут потоки-замерщики,
+/// логает один раз при завершении владелец через snapshot().
+pub struct FrameStats {
+    num: u64,
+    sum: Duration,
+    min: Duration,
+    max: Duration,
+    p90: tdigest::TDigest,
+}
+
+impl Default for FrameStats {
+    fn default() -> Self {
+        Self {
+            num: 0,
+            sum: Duration::ZERO,
+            min: Duration::MAX,
+            max: Duration::ZERO,
+            p90: tdigest::TDigest::new_with_size(100),
+        }
+    }
+}
+
+impl FrameStats {
+    /// Штатная точка входа: задержка от таймстемпа кадра до «сейчас».
+    pub fn on_frame(&mut self, frame: &crate::driver::capture::Frame) {
+        self.on_frame_at(frame, Instant::now());
+    }
+
+    /// Задержка от таймстемпа кадра до заданного момента (для тестов).
+    pub fn on_frame_at(&mut self, frame: &crate::driver::capture::Frame, now: Instant) {
+        self.on_process(now.saturating_duration_since(frame.timestamp));
+    }
+
+    /// Длительность фазы обработки (декод/перекод) — НЕ латентность
+    /// от начала кадра.
+    pub fn on_process(&mut self, dur: Duration) {
+        self.num += 1;
+        self.sum += dur;
+        self.min = self.min.min(dur);
+        self.max = self.max.max(dur);
+        self.p90.push(dur.as_secs_f64());
+    }
+
+    /// None, если замеров не было — лог не нужен. Снимок состояния:
+    /// накопитель можно продолжать использовать. Возвращает inline-yaml
+    /// объект «{min: 12ms, avg: 19.3ms, max: 87ms, p90: 31ms}» — `ms` —
+    /// суффикс каждого значения, avg — с десятыми (форматной строкой,
+    /// без serde) как непрозрачный impl Display.
+    pub fn snapshot(&mut self) -> Option<impl std::fmt::Display> {
+        if self.num == 0 {
+            return None;
+        }
+        self.p90.flush();
+        let quantile =
+            |q: f64| Duration::from_secs_f64(self.p90.estimate_quantile(q).unwrap_or(0.0));
+        let avg_ms = self.sum.as_secs_f64() * 1000.0 / self.num as f64;
+        Some(format!(
+            "{{num: {}, min: {}ms, avg: {:.1}ms, max: {}ms, p90: {}ms}}",
+            self.num,
+            self.min.as_millis(),
+            avg_ms,
+            self.max.as_millis(),
+            quantile(0.9).as_millis(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +263,120 @@ mod tests {
         assert_eq!(counter.fps(), None);
         counter.on_frame_at(at(base, 2_000_000 + 9 * 33_333));
         assert_eq!(counter.fps(), Some(30));
+    }
+
+    mod frame_stats {
+        use super::*;
+        use crate::driver::capture::{Frame, FrameData};
+        use crate::driver::webcam::fps::FrameStats;
+
+        fn ms(n: u64) -> Duration {
+            Duration::from_millis(n)
+        }
+
+        /// Кадр с заданным таймстемпом (контент для статистики не важен).
+        fn frame_at(ts: Instant) -> Frame {
+            Frame {
+                timestamp: ts,
+                data: FrameData::Rgba {
+                    rgba: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+                },
+            }
+        }
+
+        fn render(stats: &mut FrameStats) -> String {
+            stats.snapshot().map(|s| s.to_string()).unwrap_or_default()
+        }
+
+        #[test]
+        fn empty_returns_none() {
+            let mut stats = FrameStats::default();
+            assert!(stats.snapshot().is_none());
+        }
+
+        #[test]
+        fn single_record_all_equal() {
+            let base = Instant::now();
+            let mut stats = FrameStats::default();
+            stats.on_frame_at(&frame_at(base), base + ms(42));
+            assert_eq!(
+                render(&mut stats),
+                "{num: 1, min: 42ms, avg: 42.0ms, max: 42ms, p90: 42ms}"
+            );
+        }
+
+        #[test]
+        fn min_avg_max_track_values() {
+            let base = Instant::now();
+            let mut stats = FrameStats::default();
+            for lat in [10, 20, 30, 40] {
+                stats.on_frame_at(&frame_at(base), base + ms(lat));
+            }
+            // p90 на 4 замерах нестабилен — проверяем только min/avg/max.
+            assert!(
+                render(&mut stats).starts_with("{num: 4, min: 10ms, avg: 25.0ms, max: 40ms, p90: ")
+            );
+        }
+
+        #[test]
+        fn avg_has_tenths() {
+            let base = Instant::now();
+            let mut stats = FrameStats::default();
+            stats.on_frame_at(&frame_at(base), base + ms(10));
+            stats.on_frame_at(&frame_at(base), base + ms(11));
+            assert!(render(&mut stats).contains("avg: 10.5ms"));
+        }
+
+        #[test]
+        fn on_process_records_phase_duration() {
+            // Длительность фазы — НЕ латентность от начала кадра:
+            // on_process берёт готовый Duration и кладёт его как есть.
+            let mut stats = FrameStats::default();
+            stats.on_process(ms(4));
+            stats.on_process(ms(8));
+            let s = render(&mut stats);
+            assert!(s.starts_with("{num: 2, min: 4ms, avg: 6.0ms, max: 8ms, p90: "));
+        }
+
+        #[test]
+        fn p90_close_to_empirical_quantile() {
+            let base = Instant::now();
+            let mut stats = FrameStats::default();
+            // 100 замеров 10..=109 мс: эмпирический p90 ≈ 99-100 мс.
+            for i in 0..100 {
+                stats.on_frame_at(&frame_at(base), base + ms(10 + i));
+            }
+            let p90 = render(&mut stats);
+            let p90: u64 = p90
+                .strip_prefix("{num: 100, min: 10ms, avg: 59.5ms, max: 109ms, p90: ")
+                .unwrap()
+                .trim_end_matches("ms}")
+                .parse()
+                .unwrap();
+            assert!((95..=104).contains(&p90), "p90 out of tolerance: {p90}");
+        }
+
+        #[test]
+        fn record_at_measures_until_given_now() {
+            let base = Instant::now();
+            let mut stats = FrameStats::default();
+            stats.on_frame_at(&frame_at(base), base + ms(7));
+            stats.on_frame_at(&frame_at(base), base + ms(9));
+            assert!(
+                render(&mut stats).starts_with("{num: 2, min: 7ms, avg: 8.0ms, max: 9ms, p90: ")
+            );
+        }
+
+        #[test]
+        fn snapshot_does_not_consume() {
+            let base = Instant::now();
+            let mut stats = FrameStats::default();
+            stats.on_frame_at(&frame_at(base), base + ms(5));
+            assert!(stats.snapshot().is_some());
+            // Накопитель жив: продолжаем писать после снимка.
+            stats.on_frame_at(&frame_at(base), base + ms(15));
+            assert!(render(&mut stats).starts_with("{num: 2, min: 5ms,"));
+            assert!(render(&mut stats).contains("max: 15ms"));
+        }
     }
 }

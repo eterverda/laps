@@ -292,6 +292,12 @@ impl Recorder {
             let mut enc_min_ms: u64 = u64::MAX;
             // Времена кодирования — t-digest для p90 в отчёте.
             let mut enc_digest = tdigest::TDigest::new_with_size(100);
+            // Латентность кадра: от его таймстемпа до окончания записи
+            // в файл (включая ожидание в канале). Один лог при финализации.
+            let mut latency = crate::driver::webcam::fps::FrameStats::default();
+            // Длительность перекодирования rgba→jpeg (фаза, не латентность).
+            // Ручные enc_* выше — для yaml-отчёта, этот счётчик — для лога.
+            let mut encode = crate::driver::webcam::fps::FrameStats::default();
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((frame, ts)) = receiver.recv() {
                 // Перекодированный jpeg текущего кадра: живёт до конца
@@ -324,7 +330,9 @@ impl Recorder {
                             }
                         };
                         enc_frames += 1;
-                        let ms = t0.elapsed().as_millis() as u64;
+                        let dur = t0.elapsed();
+                        encode.on_process(dur);
+                        let ms = dur.as_millis() as u64;
                         enc_total_ms += ms;
                         enc_max_ms = enc_max_ms.max(ms);
                         enc_min_ms = enc_min_ms.min(ms);
@@ -358,6 +366,9 @@ impl Recorder {
                 }
                 last_ts = ts;
                 frames += 1;
+                // Кадр (Arc) ещё жив: замер от его таймстемпа до конца
+                // записи.
+                latency.on_frame(&frame);
                 fps_counter.on_frame();
                 // Пауза кадров не затирает последнее известное значение:
                 // записываем только свежий замер.
@@ -442,6 +453,14 @@ impl Recorder {
                     }
                 }
                 Err(e) => log::error!("dvr: report serialize failed: {}", e),
+            }
+            // Один лог на запись: латентность «захват → кадр на диске»
+            // и длительность перекодирования.
+            if let Some(stats) = latency.snapshot() {
+                log::info!("dvr: frame-to-disk latency: {stats}");
+            }
+            if let Some(stats) = encode.snapshot() {
+                log::info!("dvr: rgba→jpeg encode duration: {stats}");
             }
         });
         log::info!("dvr: recording to {:?}", path);

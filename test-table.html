@@ -136,7 +136,7 @@
                 border: 4px dashed #ff0000;
             }
             .dashed-16.blue {
-                border: 4px dashed #3333ff;
+                border: 4px dashed #5599ff;
             }
             .dashed-16.green {
                 border: 4px dashed #00cc00;
@@ -165,7 +165,7 @@
                 border: 4px solid #ff0000;
             }
             .solid-43.blue {
-                border: 4px solid #3333ff;
+                border: 4px solid #5599ff;
             }
             .solid-43.green {
                 border: 4px solid #00cc00;
@@ -183,7 +183,7 @@
                 color: #ff0000;
             }
             .label.blue {
-                color: #3333ff;
+                color: #5599ff;
             }
             .label.green {
                 color: #00cc00;
@@ -204,6 +204,11 @@
                 font-size: 1.8vw;
                 color: #fff;
             }
+            /* В GL-режиме время рисуется в канвас волн — DOM-тикер остаётся
+               невидимым якорем раскладки (от него меряем позицию текста). */
+            body.gl-ok .ticker {
+                visibility: hidden;
+            }
 
 
         </style>
@@ -222,7 +227,7 @@
                     <div class="solid-43 red">
                         <div class="label red">R1</div>
                         <div class="ticker-wrap">
-                            <div class="ticker" id="ticker-r1"></div>
+                            <div class="ticker" id="ticker-r1">0000-00-00 00:00:00.000</div>
                         </div>
                     </div>
                 </div>
@@ -232,7 +237,7 @@
                     <div class="solid-43 blue">
                         <div class="label blue">R3</div>
                         <div class="ticker-wrap">
-                            <div class="ticker" id="ticker-r3"></div>
+                            <div class="ticker" id="ticker-r3">0000-00-00 00:00:00.000</div>
                         </div>
                     </div>
                 </div>
@@ -242,7 +247,7 @@
                     <div class="solid-43 green">
                         <div class="label green">R4</div>
                         <div class="ticker-wrap">
-                            <div class="ticker" id="ticker-r4"></div>
+                            <div class="ticker" id="ticker-r4">0000-00-00 00:00:00.000</div>
                         </div>
                     </div>
                 </div>
@@ -252,7 +257,7 @@
                     <div class="solid-43 yellow">
                         <div class="label yellow">R6</div>
                         <div class="ticker-wrap">
-                            <div class="ticker" id="ticker-r6"></div>
+                            <div class="ticker" id="ticker-r6">0000-00-00 00:00:00.000</div>
                         </div>
                     </div>
                 </div>
@@ -274,9 +279,9 @@
             }
 
             // Точечные волны в стиле заставки AC IV: Black Flag (вид из глаз, к горизонту)
-            // Два бэкенда: WebGL (основной — точки растеризует GPU, главный тред
-            // почти свободен) и Canvas 2D со спрайтовым атласом (фолбэк, если
-            // WebGL вдруг недоступен).
+            // и время поверх них. Оба рисуются одним WebGL-контекстом: геометрия
+            // предвычислена, в кадре — uniform + drawArrays. Без WebGL ничего
+            // не рисуется (см. createWaves).
             const CAM_H = 3.0;
             const Z_NEAR = 1,
                 Z_FAR = 46;
@@ -284,6 +289,29 @@
             // Порядок полей зашит в шейдер (смещения атрибутов) и в цикл 2D-фолбэка:
             // [sx, sy0, scale, aFog, p1, p2, p3, p4]
             const WAVE_STRIDE = 8;
+
+            // --- Время в GL: атлас глифов (цифры + разделители), 16 ячеек ---
+            const TIME_CHARS = "0123456789.-: ";
+            const TIME_LEN = 23; // "YYYY-MM-DD HH:MM:SS.mmm"
+            const TIME_CELLS = 16; // ячеек в атласе по горизонтали
+            const GLYPH_CELL = 64; // px, атлас рисуется 1 раз на все слои
+            let timeAtlas = null;
+            function getTimeAtlas() {
+                if (timeAtlas) return timeAtlas;
+                const c = document.createElement("canvas");
+                c.width = GLYPH_CELL * TIME_CELLS;
+                c.height = GLYPH_CELL;
+                const a = c.getContext("2d");
+                a.fillStyle = "#fff";
+                a.font = '48px "SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
+                a.textAlign = "center";
+                a.textBaseline = "middle";
+                for (let i = 0; i < TIME_CHARS.length; i++) {
+                    a.fillText(TIME_CHARS[i], i * GLYPH_CELL + GLYPH_CELL / 2, GLYPH_CELL / 2 + 2);
+                }
+                timeAtlas = c;
+                return c;
+            }
 
             // Мир статичен: сетка, джиттер, поворот камеры и проекция считаются
             // один раз на ресайз в типизированный массив. От времени зависят
@@ -416,6 +444,78 @@
                     gl.uniform3f(uColor, colR, colG, colB);
 
                     const buf = gl.createBuffer();
+
+                    // --- время: 23 глифа-спрайта из атласа; позиции статичны
+                    // (моноширинный, длина строки постоянна), в кадре меняются
+                    // только индексы глифов — bufferSubData на 23 float'а.
+                    const TVS = [
+                        "attribute vec2 aTPos;", // центр квадрата символа, device px
+                        "attribute float aGlyph;",
+                        "uniform vec2 uTRes;", // размер канваса, device px
+                        "uniform float uTCell;", // размер квадрата символа, device px
+                        "varying float vGlyph;",
+                        "void main() {",
+                        "  vGlyph = aGlyph;",
+                        "  gl_Position = vec4(aTPos.x / uTRes.x * 2.0 - 1.0, 1.0 - aTPos.y / uTRes.y * 2.0, 0.0, 1.0);",
+                        "  gl_PointSize = uTCell;",
+                        "}",
+                    ].join("\n");
+                    const TFS = [
+                        "precision mediump float;",
+                        "varying float vGlyph;",
+                        "uniform sampler2D uTex;",
+                        "void main() {",
+                        "  vec2 uv = vec2((vGlyph + gl_PointCoord.x) / 16.0, gl_PointCoord.y);",
+                        "  float a = texture2D(uTex, uv).a;",
+                        "  a = min(1.0, a * 1.7);", // ярче: AA-края быстрее насыщаются до чистого белого
+                        "  gl_FragColor = vec4(a, a, a, a);", // белый premultiplied
+                        "}",
+                    ].join("\n");
+                    const tProg = gl.createProgram();
+                    gl.attachShader(tProg, shader(gl.VERTEX_SHADER, TVS));
+                    gl.attachShader(tProg, shader(gl.FRAGMENT_SHADER, TFS));
+                    gl.linkProgram(tProg);
+                    if (!gl.getProgramParameter(tProg, gl.LINK_STATUS)) throw new Error("link text");
+                    const tLocPos = gl.getAttribLocation(tProg, "aTPos");
+                    const tLocGlyph = gl.getAttribLocation(tProg, "aGlyph");
+                    const uTRes = gl.getUniformLocation(tProg, "uTRes");
+                    const uTCell = gl.getUniformLocation(tProg, "uTCell");
+                    const uTex = gl.getUniformLocation(tProg, "uTex");
+
+                    const tex = gl.createTexture();
+                    gl.bindTexture(gl.TEXTURE_2D, tex);
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, getTimeAtlas());
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+                    const tPosBuf = gl.createBuffer();
+                    const tGlyphBuf = gl.createBuffer();
+                    const glyphCPU = new Float32Array(TIME_LEN);
+                    gl.bindBuffer(gl.ARRAY_BUFFER, tGlyphBuf);
+                    gl.bufferData(gl.ARRAY_BUFFER, glyphCPU, gl.DYNAMIC_DRAW);
+                    let tCell = 0;
+
+                    function layoutText() {
+                        // DOM-тикер невидим, но стоит в раскладке — меряем у него
+                        // позицию и метрики. offsetParent — .cell (.solid-43 имеет
+                        // top:0), колонка 4:3 центрирована → центр X = центр ячейки.
+                        const t = canvas.closest(".cell").querySelector(".ticker");
+                        if (!t) return;
+                        const centerX = (w / 2) * dpr;
+                        const centerY = (t.offsetTop + t.offsetHeight / 2) * dpr;
+                        const advance = (t.offsetWidth / TIME_LEN) * dpr;
+                        tCell = Math.ceil(t.offsetHeight * dpr);
+                        const pos = new Float32Array(TIME_LEN * 2);
+                        const left = centerX - (advance * TIME_LEN) / 2;
+                        for (let i = 0; i < TIME_LEN; i++) {
+                            pos[i * 2] = left + (i + 0.5) * advance;
+                            pos[i * 2 + 1] = centerY;
+                        }
+                        gl.bindBuffer(gl.ARRAY_BUFFER, tPosBuf);
+                        gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+                    }
                     let w = 0,
                         h = 0,
                         dpr = 1,
@@ -442,35 +542,68 @@
                         gl.vertexAttribPointer(locMeta, 2, gl.FLOAT, false, B, 8); // scale, aFog
                         gl.enableVertexAttribArray(locPh);
                         gl.vertexAttribPointer(locPh, 4, gl.FLOAT, false, B, 16); // p1..p4
+                        layoutText();
                         draw(lastT);
                     }
                     resize();
                     new ResizeObserver(resize).observe(canvas);
 
-                    function draw(t) {
+                    let lastText = null;
+                    function draw(t, text) {
                         lastT = t;
                         gl.viewport(0, 0, canvas.width, canvas.height);
                         gl.clearColor(0, 0, 0, 0);
                         gl.clear(gl.COLOR_BUFFER_BIT);
+                        // точки волн
+                        gl.useProgram(prog);
+                        // указатели атрибутов — глобальное состояние контекста,
+                        // текстовый проект ниже их перезаписывает — ставим каждый кадр
+                        const B = WAVE_STRIDE * 4;
+                        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+                        gl.vertexAttribPointer(locPos, 2, gl.FLOAT, false, B, 0);
+                        gl.vertexAttribPointer(locMeta, 2, gl.FLOAT, false, B, 8);
+                        gl.vertexAttribPointer(locPh, 4, gl.FLOAT, false, B, 16);
                         gl.uniform2f(uRes, w, h);
                         gl.uniform1f(uT, t * 0.001);
                         gl.uniform1f(uDpr, dpr);
                         gl.drawArrays(gl.POINTS, 0, count);
+                        // время поверх точек
+                        if (text && text !== lastText) {
+                            lastText = text;
+                            for (let i = 0; i < TIME_LEN; i++) {
+                                glyphCPU[i] = TIME_CHARS.indexOf(text[i]);
+                            }
+                            gl.bindBuffer(gl.ARRAY_BUFFER, tGlyphBuf);
+                            gl.bufferSubData(gl.ARRAY_BUFFER, 0, glyphCPU);
+                        }
+                        gl.useProgram(tProg);
+                        gl.uniform2f(uTRes, canvas.width, canvas.height);
+                        gl.uniform1f(uTCell, tCell);
+                        gl.uniform1i(uTex, 0);
+                        gl.activeTexture(gl.TEXTURE0);
+                        gl.bindTexture(gl.TEXTURE_2D, tex);
+                        gl.bindBuffer(gl.ARRAY_BUFFER, tPosBuf);
+                        gl.enableVertexAttribArray(tLocPos);
+                        gl.vertexAttribPointer(tLocPos, 2, gl.FLOAT, false, 0, 0);
+                        gl.bindBuffer(gl.ARRAY_BUFFER, tGlyphBuf);
+                        gl.enableVertexAttribArray(tLocGlyph);
+                        gl.vertexAttribPointer(tLocGlyph, 1, gl.FLOAT, false, 0, 0);
+                        gl.drawArrays(gl.POINTS, 0, TIME_LEN);
                     }
 
-                    return { draw, resize };
+                    return { draw, resize, isGL: true };
                 } catch (e) {
                     return null;
                 }
             }
 
             function createWaves(canvas, color, phase, yaw) {
-                // Без WebGL волны не рисуем совсем: либо GL-контекст создался,
-                // либо слой — заглушка.
+                // Без WebGL волны и время не рисуем совсем: либо GL-контекст
+                // создался, либо слой — заглушка.
                 try {
-                    return createWavesGL(canvas, color, phase, yaw) || { draw() {}, resize() {} };
+                    return createWavesGL(canvas, color, phase, yaw) || { draw() {}, resize() {}, isGL: false };
                 } catch (e) {
-                    return { draw() {}, resize() {} };
+                    return { draw() {}, resize() {}, isGL: false };
                 }
             }
 
@@ -524,7 +657,7 @@
             const canvases = document.querySelectorAll(".cell .waves");
             const waveLayers = [
                 createWaves(canvases[0], "#ff0000", 0.0, 0.55),
-                createWaves(canvases[1], "#3333ff", 2.1, -0.5),
+                createWaves(canvases[1], "#5599ff", 2.1, -0.5),
                 createWaves(canvases[2], "#00cc00", 4.2, 0.62),
                 createWaves(canvases[3], "#ffbf00", 5.5, -0.58),
             ];
@@ -570,13 +703,14 @@
                 window.setFullscreen = () => {};
             }
 
-            let lastTickerKey = "";
+            // GL жив — DOM-тикеры прячем (их место занимает GL-текст); нет —
+            // пишем время в DOM как раньше.
+            const glOK = waveLayers.length > 0 && !!waveLayers[0].isGL;
+            if (glOK) document.body.classList.add("gl-ok");
+
             function update(t) {
-                // Тикер ~10 раз/сек: гонять текстовый DOM каждый кадр незачем.
                 const text = formatRFC(new Date());
-                const key = text.slice(0, -2); // без миллисекунд
-                if (key !== lastTickerKey) {
-                    lastTickerKey = key;
+                if (!glOK) {
                     for (const id of ["r1", "r3", "r4", "r6"]) {
                         const el = document.getElementById("ticker-" + id);
                         if (el) el.textContent = text;
@@ -586,9 +720,9 @@
                 // все четыре; в статичном одиночном — только активный, остальные
                 // всё равно скрыты opacity:0.
                 if (viewState === 0 || t < animUntil) {
-                    for (const layer of waveLayers) layer.draw(t);
+                    for (const layer of waveLayers) layer.draw(t, text);
                 } else {
-                    waveLayers[viewState - 1].draw(t);
+                    waveLayers[viewState - 1].draw(t, text);
                 }
                 requestAnimationFrame(update);
             }

@@ -9,12 +9,19 @@ use self::decode::Error as DecodeError;
 pub mod capture;
 pub mod decode;
 pub mod fps;
+// Linux: the native ioctl backend. macOS/Windows: nokhwa.
+#[cfg(not(target_os = "linux"))]
 mod nokhwa;
+#[cfg(target_os = "linux")]
+mod v4l2;
 
 pub use capture::{
     Capture, CaptureFormat, CaptureSession, Frame, FrameData, FrameError, FrameSink,
 };
-pub use nokhwa::NokhwaCapture as Backend;
+#[cfg(not(target_os = "linux"))]
+use nokhwa::NokhwaCapture as Backend;
+#[cfg(target_os = "linux")]
+use v4l2::V4l2Capture as Backend;
 
 use crate::config::camera::{CameraConfig, PixelConfig};
 use crate::driver::dvr::{DvrSink, RecordParams, RecordState, SharedRecordState};
@@ -23,6 +30,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Ошибки слоя источника (перечисление/открытие устройств). Варианты
+/// различаются принадлежностью: системный сбой / диагноз нашего слоя /
+/// ошибка бэкенда как есть.
+#[derive(Debug)]
+pub enum Error {
+    /// Системный сбой (ioctl, открытие файла).
+    Io(std::io::Error),
+    /// Диагноз нашего слоя: по этому конфигу открыться нельзя —
+    /// устройство не найдено по имени или отказало в переговорах
+    /// формата. Текст различает причину.
+    Config(String),
+    /// Ошибка бэкенда, переданная как есть (без переклассификации).
+    #[allow(dead_code)] // nokhwa-ветка (macOS/Windows) под Linux не компилируется
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "{e}"),
+            Error::Config(msg) => write!(f, "{msg}"),
+            Error::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Other(e) => Some(&**e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
 
 /// Состояние камеры (capture-потока).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +115,7 @@ impl FrameSink for LatestSink {
     }
 }
 
-pub fn list_cameras() -> Result<Vec<CameraConfig>, String> {
+pub fn list_cameras() -> std::result::Result<Vec<CameraConfig>, Error> {
     let mut devices = Backend::list_devices()?;
     devices.sort_by(|a, b| a.name.cmp(&b.name));
     let mut descriptions = Vec::new();
@@ -217,6 +266,16 @@ impl Camera {
             // потому что frame() может виснуть на несколько секунд,
             // поэтому критерий — время без единого кадра.
             let mut errors_since: Option<Instant> = None;
+            // Capture-Backendside rate: tells a slow camera from a slow UI
+            // (ui_latency is measured on the egui side; a latest-wins
+            // slot masks slow consumption as slow capture).
+            let capture_t0 = Instant::now();
+            let mut capture_frames = 0u32;
+            // Интервалы между кадрами по их timestamp (драйверные, если
+            // бэкенд их отдаёт) — точный замер кадровой частоты источника
+            // без джиттера dequeue/планировщика.
+            let mut frame_interval = fps::FrameStats::default();
+            let mut last_timestamp: Option<Instant> = None;
             // Длительности фаз декода (не латентность от начала кадра):
             // по одному декоду на кадр, формат известен до вызова.
             let mut decode_jpeg = fps::FrameStats::default();
@@ -240,6 +299,11 @@ impl Camera {
                 let frame = match session.frame() {
                     Ok(frame) => {
                         errors_since = None;
+                        capture_frames += 1;
+                        if let Some(prev) = last_timestamp {
+                            frame_interval.on_process(frame.timestamp - prev);
+                        }
+                        last_timestamp = Some(frame.timestamp);
                         frame
                     }
                     Err(FrameError::Recoverable(e)) => {
@@ -286,6 +350,20 @@ impl Camera {
             drop(dvr_sink);
             drop(ui_sink);
 
+            // Capture-side session rate: if this is ~60 fps, whatever the
+            // UI-side stats say, the camera is not the bottleneck.
+            let capture_elapsed = capture_t0.elapsed();
+            log::info!(
+                "live: camera frames received: {} in {:?} -> {:.1} fps",
+                capture_frames,
+                capture_elapsed,
+                capture_frames as f32 / capture_elapsed.as_secs_f32().max(0.001)
+            );
+            // Интервалы между кадрами по timestamp'ам источника — точный
+            // замер кадровой частоты без джиттера dequeue/планировщика.
+            if let Some(stats) = frame_interval.snapshot() {
+                log::info!("live: camera frame interval: {stats}");
+            }
             // Один лог на сеанс: мин/среднее/макс/p90 латентности
             // «захват → кадр отрисован» (замер на выходе, в рисовалке).
             if let Some(stats) = ui_latency_thread.lock().unwrap().snapshot() {
@@ -493,7 +571,15 @@ mod tests {
             "ui sink must hold decoded RGBA"
         );
 
-        assert!(dispatch_frame(yuyv_frame(8, 8), 8, 8, &mut dvr, &mut ui, &mut dj, &mut dy));
+        assert!(dispatch_frame(
+            yuyv_frame(8, 8),
+            8,
+            8,
+            &mut dvr,
+            &mut ui,
+            &mut dj,
+            &mut dy
+        ));
         assert!(
             matches!(
                 &slot.lock().unwrap().as_ref().map(|f| &f.data),

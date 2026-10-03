@@ -5,14 +5,14 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 ## Architecture
 
 ```
-┌──────────────────────────────────────────┐
-│  UI Layer (egui + eRa)                │
-│  - Immediate mode, own cell grid layout  │
-│  - Own zoom (egui auto-zoom disabled)    │
-│  - Fira Code Nerd Font (2:1 cell aspect) │
-│  - Screens: live view; playback/review,  │
-│    planning, stats — planned             │
-└──────────────┬───────────────────────────┘
+┌───────────────────────────────────────────┐
+│  UI Layer (egui)                          │
+│  - Immediate mode, own cell grid layout   │
+│  - Own zoom (egui auto-zoom disabled)     │
+│  - Fira Code Nerd Font (2:1 cell aspect)  │
+│  - Screens: live view; playback/review,   │
+│    planning, stats — planned              │
+└──────────────┬────────────────────────────┘
                │
         ┌──────┴───────┐
         │ egui texture │
@@ -22,10 +22,10 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
    │ driver                 │
    │ - camera               │  FrameSource → Pipeline → FrameSink:
    │   capture.rs (traits)  │  pull, one decode per frame, fan-out
-   │   nokhwa backend       │  capture thread: jpeg-passthrough /
+   │   v4l2 backend         │  capture thread: jpeg-passthrough /
    │   Camera (facade+pipe) │  YUYV decode → ColorImage slot
-   │ - dvr (own muxers)     │  recorder: writer thread, jpeg frames
-   │   MKV (EBML+Cues)      │  → container, no re-encode
+   │ - dvr (own muxers)     │  recorder: writer thread, mjpeg
+   │   MKV (EBML+Cues)      │  passthrough / yuyv re-encode → container
    │   MOV/MP4 (ISOBMFF)    │
    └────────────────────────┘
 ```
@@ -39,6 +39,12 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Own zooming and theming; egui auto-zoom (`zoom_with_keyboard`) disabled,
   theme pinned to dark, native window decorations untouched
 - One camera frame → one texture → N viewfinders via UV viewport cropping
+- Widgets (all in `src/gui/`): `view::Stripe`/`StripeX2` — background
+  plates (cut-corner polygon, corner-hugging), text drawn by the caller
+  in a closure; `view::BigButton` — status buttons, hover covers the
+  drawn content; `viewfinder::ViewfinderFrame` — plate + label + name;
+  `Clock` — time by a format string, `[weekday format:mn]` at the end is
+  our placeholder (replaced with a Russian two-letter weekday, lowercase)
 - Assets embedded via `src/assets.rs` (fonts, testcard SVG, default setup.yaml)
 - **resvg** + **usvg** + **tiny-skia** — render testcard SVG to texture
   (used while camera is off/connecting/dead)
@@ -59,10 +65,21 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   module per domain: `capture.rs` (traits `Capture`/`CaptureSession`/
   `FrameSink`, frame types `Frame`/`FrameData`/`CaptureFormat`/
   `DeviceInfo`) — FrameSource; `mod.rs` — pipeline + `Camera` facade
-  for GUI; `nokhwa.rs` — backend (archived, behind the trait;
-  replacement staged per the plan, pure Rust, no cc). Backends import
-  only `capture.rs`. `DvrSink` lives in `dvr/sink.rs` (dependency
+  for GUI; `v4l2.rs` — Linux backend (raw ioctls via nix macros, ABI
+  structs by hand; pure Rust, no cc). Format enumeration never changes
+  device state (ENUM_* only, no S_FMT). ABI pinned by compile-time
+  size/offset asserts against linux/videodev2.h. Defenses: first frame
+  after STREAMON validated by preamble (drained if a fragment),
+  corrupted buffers rejected via `V4L2_BUF_FLAG_ERROR`, driver
+  timestamps used when filled (zero → dequeue moment). `nokhwa.rs` —
+  macOS/Windows backend (behind the trait). Backends import only
+  `capture.rs`. `DvrSink` lives in `dvr/sink.rs` (dependency
   `dvr → camera::capture`).
+- Errors: `camera::Error` (`Io` / `Config` / `Other`); `Other`
+  carries the backend error unaltered.
+  Each session logs capture-side fps and frame intervals
+  (`camera frames received`, `camera frame interval`) — UI-side fps
+  can mask capture problems, the pair separates them
 - Terminology: one frame — `jpeg` (`FrameData::Jpeg { buf, len }`),
   stream format — `MJPEG`, a file of frames — an `mjpeg` stream.
   `len` is the SOI..EOI frame length computed by the source (FFD9
@@ -71,9 +88,10 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   `memchr`), the buffer is not copied — DVR writes the `buf[..len]`
   slice; decoded to RGBA for the screen only (**zune-jpeg**)
 - YUYV cameras: decode via **yuv** crate (dev-profile opt-level = 2)
-- Per-frame latency hot spots: nokhwa buffer copy and decode; hot crates
-  get `opt-level` bumps in dev profile (`zune-jpeg`/`zune-core`/`jpeg-rusturbo` = 3,
-  `memchr` = 3, `epaint` = 2) instead of optimizing our own crate in dev
+- Per-frame latency hot spots: buffer copy and decode; hot crates
+  get `opt-level` bumps in dev profile (`zune-jpeg`/`jpeg-rusturbo`/
+  `jpeg-encoder`/`memchr` = 3, `yuv`/`epaint` = 2) instead of optimizing
+  our own crate in dev
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) and
   feed states (`FeedState`: Off/Live/Rec) signaled UI-ward via
   `crossbeam_utils::AtomicCell`
@@ -126,8 +144,8 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 - Default setup embedded from `assets/setup.yaml` and loaded once at app
   startup — no tests or other code may depend on its contents;
   config-loaded types carry the `Config` suffix (`CameraConfig`,
-  `PadConfig`, `DvrConfig`, …), except `Setup`. Don't rename nokhwa's own
-  `Camera`/`CameraFormat`/`CameraInfo`
+  `PadConfig`, `DvrConfig`, …), except `Setup`. Don't rename the
+  backend crates' own types (`nokhwa::Camera*` and friends)
 - Camera spec canonical string form: `C7-1 1920x1080 @ 30fps [MJPEG]`
   (`CameraConfig: Display/FromStr`, lazy-regex based)
 
@@ -176,7 +194,10 @@ cargo run
 
 - No external/system dependencies — everything via Cargo; ffmpeg is NOT
   required (containers are our own code)
-- Performance target: FullHD 60fps. GPU path not excluded by library choices
+- Performance target: FullHD 60fps (achieved: 60.0 sustained on a
+  thermally-throttled laptop). Benchmark hygiene: this machine
+  downclocks hard at ~95°C (Tctl) and with `powersave` governor —
+  check `sensors` before trusting decode/encode timings
 - Audio: out of scope for now
 
 ## Known Optimizations (not done yet)

@@ -8,13 +8,28 @@
 //! Правило слоя: бэкенд не импортирует pipeline-части модуля camera
 //! (mod.rs) — только контракты из capture.rs.
 
-use super::capture::{
-    Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
-};
+use super::capture::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
+use super::Error;
 use crate::config::camera::CameraConfig;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 use std::time::Instant;
+
+/// Map nokhwa's error onto CaptureError: open/stream failures are io,
+/// property (negotiation) rejections are Unsupported; everything else
+/// is passed through unaltered under Backend.
+fn capture_err(e: nokhwa::NokhwaError) -> Error {
+    use nokhwa::NokhwaError as E;
+    match e {
+        E::OpenDeviceError(_, msg) | E::OpenStreamError(msg) => {
+            Error::Io(std::io::Error::other(msg))
+        }
+        E::GetPropertyError { error, .. } | E::SetPropertyError { error, .. } => {
+            Error::Config(format!("unsupported: {error}"))
+        }
+        other => Error::Other(Box::new(other)),
+    }
+}
 
 pub struct NokhwaCapture;
 
@@ -24,32 +39,13 @@ pub struct NokhwaSession {
 }
 
 impl NokhwaCapture {
-    /// Резолвит имя в устройство заново: перечисляет и ищет по имени.
-    /// Точное совпадение предпочтительнее, иначе первое contains
-    /// (case-insensitive) — та же семантика, что в `CameraConfig::matches`.
-    /// Одинаковые близнецы неразличимы без серийника (см. V4L2-бэкенд
-    /// в docs/capture-backend-plan.md).
-    fn resolve_index(name: &str) -> Result<CameraIndex, String> {
-        let cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(|e| e.to_string())?;
-        let needle = name.to_lowercase();
-        cameras
-            .iter()
-            .find(|cam| cam.human_name() == name)
-            .or_else(|| {
-                cameras
-                    .iter()
-                    .find(|cam| cam.human_name().to_lowercase().contains(&needle))
-            })
-            .map(|cam| cam.index().clone())
-            .ok_or_else(|| format!("camera not found: {name}"))
-    }
-}
-
-impl Capture for NokhwaCapture {
     type Session = NokhwaSession;
 
-    fn list_devices() -> Result<Vec<DeviceInfo>, String> {
-        let cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto).map_err(|e| e.to_string())?;
+    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, Error> {
+        let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
+            Ok(cameras) => cameras,
+            Err(e) => return Err(capture_err(e)),
+        };
         let mut devices = Vec::new();
         for cam in cameras {
             // Устройство с отвалившимся перечислением форматов пропускаем
@@ -65,20 +61,51 @@ impl Capture for NokhwaCapture {
         Ok(devices)
     }
 
-    fn open(config: &CameraConfig) -> Result<Self::Session, String> {
-        let index = Self::resolve_index(&config.name)?;
-        let format =
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(CameraFormat::new_from(
-                config.resolution.width,
-                config.resolution.height,
-                to_frame_format(config.format),
-                config.frame_rate.0,
-            )));
-        let mut camera = nokhwa::Camera::new(index, format).map_err(|e| e.to_string())?;
-        camera.open_stream().map_err(|e| e.to_string())?;
-        let negotiated = to_capture_format(&camera.camera_format())
-            .ok_or_else(|| "negotiated unsupported pixel format".to_string())?;
-        Ok(NokhwaSession { camera, negotiated })
+    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, Error> {
+        // Open directly with the requested Exact format, trying matching
+        // devices in enumeration order — the first openable one wins.
+        let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
+            Ok(cameras) => cameras,
+            Err(e) => return Err(capture_err(e)),
+        };
+        let needle = config.name.to_lowercase();
+        let mut last_err = Error::Config(format!("camera not found: {}", config.name));
+        for cam in &cameras {
+            // Та же семантика, что в CameraConfig::matches: точное имя
+            // или contains (case-insensitive).
+            let name = cam.human_name();
+            if name != config.name && !name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
+                CameraFormat::new_from(
+                    config.resolution.width,
+                    config.resolution.height,
+                    to_frame_format(config.format),
+                    config.frame_rate.0,
+                ),
+            ));
+            let mut camera = match nokhwa::Camera::new(cam.index().clone(), format) {
+                Ok(camera) => camera,
+                Err(e) => {
+                    last_err = capture_err(e);
+                    continue;
+                }
+            };
+            if let Err(e) = camera.open_stream() {
+                return Err(capture_err(e));
+            }
+            let negotiated = match to_capture_format(&camera.camera_format()) {
+                Some(format) => format,
+                None => {
+                    return Err(CaptureError::Unsupported(
+                        "negotiated pixel format".to_string(),
+                    ))
+                }
+            };
+            return Ok(NokhwaSession { camera, negotiated });
+        }
+        Err(last_err)
     }
 }
 
@@ -87,18 +114,17 @@ impl CaptureSession for NokhwaSession {
         self.negotiated
     }
 
-    fn frame(&mut self) -> Result<Frame, FrameError> {
-        // nokhwa не отдаёт время захвата с устройства — штампуем по приходу.
+    fn frame(&mut self) -> std::result::Result<Frame, FrameError> {
+        // Stamp after frame_raw(): the call blocks until the next frame
+        // arrives, so stamping before the wait would inflate the measured
+        // latency by one frame period (same anchor as the v4l2 backend).
+        let buf = match self.camera.frame_raw() {
+            Ok(data) => data.into_owned(),
+            Err(e) => return Err(FrameError::Recoverable(e.to_string())),
+        };
         let timestamp = Instant::now();
-        let buf = self
-            .camera
-            .frame_raw()
-            .map(|data| data.into_owned())
-            .map_err(|e| FrameError::Recoverable(e.to_string()))?;
-        // nokhwa на V4L2 отдаёт весь mmap-буфер (его ёмкость равна размеру
-        // несжатого кадра), а не реальную длину кадра: драйвер пишет jpeg
-        // в начало, после EOI — хвост со старыми данными. Длина jpeg-кадра
-        // (SOI..EOI) — ответственность источника (P4); буфер не копируем.
+        // Буфер может быть больше самого кадра (ёмкость буфера vs
+        // длина кадра) — длина jpeg (SOI..EOI) вычисляется здесь.
         let data = match self.negotiated.format {
             crate::config::camera::PixelConfig::Mjpeg => FrameData::Jpeg {
                 len: jpeg_len(&buf),
@@ -171,21 +197,35 @@ fn sort_and_dedup(formats: &mut Vec<CameraFormat>) {
 }
 
 #[cfg(target_os = "macos")]
-fn list_formats_for_index(index: &CameraIndex) -> Result<Vec<CameraFormat>, String> {
+fn list_formats_for_index(
+    index: &CameraIndex,
+) -> std::result::Result<Vec<CameraFormat>, String> {
     use nokhwa_bindings_macos::AVCaptureDevice;
-    let device = AVCaptureDevice::new(index).map_err(|e| e.to_string())?;
-    let mut formats = device.supported_formats().map_err(|e| e.to_string())?;
+    let device = match AVCaptureDevice::new(index) {
+        Ok(device) => device,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut formats = match device.supported_formats() {
+        Ok(formats) => formats,
+        Err(e) => return Err(e.to_string()),
+    };
     sort_and_dedup(&mut formats);
     Ok(formats)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn list_formats_for_index(index: &CameraIndex) -> Result<Vec<CameraFormat>, String> {
+fn list_formats_for_index(
+    index: &CameraIndex,
+) -> std::result::Result<Vec<CameraFormat>, String> {
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
-    let mut camera = nokhwa::Camera::new(index.clone(), format).map_err(|e| e.to_string())?;
-    let mut formats = camera
-        .compatible_camera_formats()
-        .map_err(|e| e.to_string())?;
+    let mut camera = match nokhwa::Camera::new(index.clone(), format) {
+        Ok(camera) => camera,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut formats = match camera.compatible_camera_formats() {
+        Ok(formats) => formats,
+        Err(e) => return Err(e.to_string()),
+    };
     sort_and_dedup(&mut formats);
     Ok(formats)
 }

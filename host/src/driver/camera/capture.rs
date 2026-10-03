@@ -69,16 +69,18 @@ pub enum FrameData {
     Rgba { rgba: egui::ColorImage },
 }
 
+use super::Error;
+
 /// Фабрика сессий захвата. Два метода: перечисление устройств (с
 /// форматами, одним проходом) и открытие по `CameraConfig`.
 pub trait Capture {
     type Session: CaptureSession;
 
-    fn list_devices() -> Result<Vec<DeviceInfo>, String>;
+    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, Error>;
     /// Резолвит устройство по имени конфига свежим перечислением:
     /// индексы V4L2 нестабильны при переподключении, снимок
     /// `list_devices` — не ключ.
-    fn open(config: &CameraConfig) -> Result<Self::Session, String>;
+    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, Error>;
 }
 
 /// Открытая камера: negotiated-формат и блокирующее чтение кадров.
@@ -86,7 +88,7 @@ pub trait CaptureSession {
     /// Фактически согласованный формат (после open/stream-on).
     fn negotiated(&self) -> CaptureFormat;
     /// Блокирует до следующего кадра. Ошибки — через [`FrameError`].
-    fn frame(&mut self) -> Result<Frame, FrameError>;
+    fn frame(&mut self) -> std::result::Result<Frame, FrameError>;
 }
 
 /// Потребитель кадров pipeline. Инвариант: sink получает только `Jpeg`

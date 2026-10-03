@@ -7,8 +7,11 @@ use std::io;
 #[cfg(not(any(feature = "jpeg-rusturbo", feature = "jpeg-encoder")))]
 compile_error!("Enable feature `jpeg-rusturbo` (default) or `jpeg-encoder`");
 
+#[cfg(all(feature = "jpeg-rusturbo", feature = "jpeg-encoder"))]
+compile_error!("features `jpeg-rusturbo` and `jpeg-encoder` are mutually exclusive");
+
 /// Кодек выбирается cargo-фичей: `jpeg-rusturbo` (default) или
-/// `jpeg-encoder`. Фоллбэка нет — конфигурация явная.
+/// `jpeg-encoder`.
 #[cfg(feature = "jpeg-rusturbo")]
 pub fn encode_rgba_to_jpeg(rgba: &[u8], width: u32, height: u32) -> io::Result<Vec<u8>> {
     const QUALITY: u8 = 60;

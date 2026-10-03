@@ -101,8 +101,10 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 - **Passthrough**: camera already emits JPEG; recording = muxing blobs,
-  CPU cost ≈ 0. YUYV: RGBA re-encoded to JPEG (**jpeg-rusturbo**, SIMD; fallback — jpeg-encoder) in the
-  writer thread.
+  CPU cost ≈ 0. YUYV: RGBA re-encoded to JPEG in the writer thread; codec
+  is a compile-time alternative (`jpeg-rusturbo` by default — SIMD;
+  `--no-default-features --features jpeg-encoder` switches; the two
+  features are mutually exclusive)
 - **Containers** (per-camera setting in setup.yaml, `dvr.container`,
   default `mkv`):
   - `mkv` — Matroska/EBML, real per-frame millisecond timestamps

@@ -75,6 +75,7 @@ pub struct Live {
     res: Option<Res>,
     webcams: HashMap<String, crate::driver::camera::Camera>,
     feed: FeedState,
+    awake: Option<keepawake::KeepAwake>,
     date_clock: clock::Clock,
     time_clock: clock::Clock,
     setup: Setup,
@@ -115,6 +116,7 @@ impl Live {
             res: None,
             webcams: HashMap::new(),
             feed: FeedState::Off,
+            awake: None,
             date_clock: clock::Clock::new(DATE_FORMAT),
             time_clock: clock::Clock::new(TIME_FORMAT),
             setup,
@@ -479,13 +481,32 @@ impl Live {
             FeedState::Off => {
                 self.start_captures(ctx);
                 self.reset_shown_fps();
+                self.screen_awake();
                 self.feed = FeedState::Live;
             }
             FeedState::Live | FeedState::Rec => {
                 self.webcams.clear();
                 log::info!("webcams stopped");
+                self.awake = None;
                 self.feed = FeedState::Off;
             }
+        }
+    }
+
+    /// Запретить засыпание экрана на время эфира; ошибка inhibit — warn,
+    /// не причина отказа от показа.
+    fn screen_awake(&mut self) {
+        if self.awake.is_some() {
+            return;
+        }
+        match keepawake::Builder::default()
+            .display(true)
+            .reason("live view")
+            .app_name("Laps")
+            .create()
+        {
+            Ok(awake) => self.awake = Some(awake),
+            Err(e) => log::warn!("screen inhibit failed: {e}"),
         }
     }
 
@@ -495,6 +516,7 @@ impl Live {
                 self.start_captures(ctx);
                 self.start_recording_all();
                 self.reset_shown_fps();
+                self.screen_awake();
                 self.feed = FeedState::Rec;
             }
             FeedState::Live => {

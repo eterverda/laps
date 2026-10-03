@@ -274,90 +274,204 @@
             }
 
             // Точечные волны в стиле заставки AC IV: Black Flag (вид из глаз, к горизонту)
-            function createWaves(canvas, color, phase, yaw) {
-                const ctx = canvas.getContext("2d");
-                let w = 0,
-                    h = 0,
-                    lastT = 0;
+            // Два бэкенда: WebGL (основной — точки растеризует GPU, главный тред
+            // почти свободен) и Canvas 2D со спрайтовым атласом (фолбэк, если
+            // WebGL вдруг недоступен).
+            const CAM_H = 3.0;
+            const Z_NEAR = 1,
+                Z_FAR = 46;
+            const STEP_PX = 12; // экранный шаг между точками (по обеим осям)
+            // Порядок полей зашит в шейдер (смещения атрибутов) и в цикл 2D-фолбэка:
+            // [sx, sy0, scale, aFog, p1, p2, p3, p4]
+            const WAVE_STRIDE = 8;
 
-                // мир: камера на высоте CAM_H, повёрнута на YAW, взгляд к горизонту;
-                // Z_NEAR подобран так, что ближние волны уходят под нижний край кадра
-                const CAM_H = 3.0;
-                const Z_NEAR = 1,
-                    Z_FAR = 46;
-                const STEP_PX = 12; // экранный шаг между точками (по обеим осям)
-                const YAW = yaw;
-
-                function resize() {
-                    // В зуме cell масштабируется CSS-трансформом — рисуем
-                    // канвас с удвоенным разрешением, чтобы точки не плыли.
-                    const zoom = canvas.closest(".cell").classList.contains("zoomed") ? 2 : 1;
-                    const dpr = (window.devicePixelRatio || 1) * zoom;
-                    w = canvas.clientWidth;
-                    h = canvas.clientHeight;
-                    canvas.width = Math.round(w * dpr);
-                    canvas.height = Math.round(h * dpr);
-                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-                    draw(lastT);
-                }
-                resize();
-                new ResizeObserver(resize).observe(canvas);
-
-                function draw(t) {
-                    lastT = t;
-                    ctx.clearRect(0, 0, w, h);
-                    ctx.fillStyle = color;
-                    const tt = t * 0.001;
-                    const f = w * 0.7; // фокусное расстояние
-                    const cx = w * 0.5;
-                    const horizon = h * 0.25;
-                    const cosY = Math.cos(YAW),
-                        sinY = Math.sin(YAW);
-                    // Рисуем от дальних рядов к ближним. Шаг ряда dz подобран так, чтобы
-                    // на экране расстояние между рядами было ~STEP_PX, как между точками в ряду.
-                    for (let z = Z_FAR; z >= Z_NEAR; ) {
-                        const dz = Math.min(2.5, Math.max(0.05, (STEP_PX * z * z) / (CAM_H * f)));
-                        const fog = Math.pow(1 - (z - Z_NEAR) / (Z_FAR - Z_NEAR), 0.7); // 1 вблизи → 0 у горизонта
-                        const aFog = 0.25 + fog * 0.75;
-                        // мировой шаг ряда, дающий ~STEP_PX на экране
+            // Мир статичен: сетка, джиттер, поворот камеры и проекция считаются
+            // один раз на ресайз в типизированный массив. От времени зависят
+            // только сами волны (4 sin на точку) — в GL их считает вершинный шейдер.
+            function buildWaveGeometry(w, h, yaw, phase) {
+                const f = w * 0.7; // фокусное расстояние
+                const cx = w * 0.5;
+                const horizon = h * 0.25;
+                const cosY = Math.cos(yaw),
+                    sinY = Math.sin(yaw);
+                const out = [];
+                // Ряды от дальних к ближним. Шаг dz такой, чтобы на экране
+                // расстояние между рядами было ~STEP_PX, как между точками.
+                for (let z = Z_FAR; z >= Z_NEAR; ) {
+                    const dz = Math.min(2.5, Math.max(0.05, (STEP_PX * z * z) / (CAM_H * f)));
+                    const fo = Math.pow(1 - (z - Z_NEAR) / (Z_FAR - Z_NEAR), 0.7); // 1 вблизи → 0 у горизонта
+                    const aFog = 0.25 + fo * 0.75;
+                    // строки, где даже гребни прозрачнее 0.05, невидимы — не держим
+                    if (aFog >= 0.06) {
                         const dx = (STEP_PX * z) / f;
-                        // ширина ряда — через tan(yaw + половина FOV) с запасом 15%,
-                        // чтобы боковые кромки поля точек гарантированно были за экраном
-                        const xMax = z * Math.tan(Math.abs(YAW) + Math.atan(cx / f)) * 1.15;
+                        // ширина ряда — через tan(yaw + половина FOV) с запасом 15%
+                        const xMax = z * Math.tan(Math.abs(yaw) + Math.atan(cx / f)) * 1.15;
                         for (let x = -xMax; x <= xMax; x += dx) {
-                            // детерминированный джиттер (±20% шага) — слегка разбивает регулярную сетку
+                            // детерминированный джиттер (±20% шага)
                             const h1 = Math.sin(x * 127.1 + z * 311.7) * 43758.5453;
                             const h2 = Math.sin(x * 269.5 + z * 183.3) * 28081.3447;
                             const xj = x + (h1 - Math.floor(h1) - 0.5) * dx * 0.4;
                             const zj = z + (h2 - Math.floor(h2) - 0.5) * dz * 0.4;
-                            // поворот камеры вокруг вертикальной оси
                             const rx = xj * cosY + zj * sinY;
                             const rz = zj * cosY - xj * sinY;
                             if (rz < 1.2) continue;
                             const scale = f / rz;
-                            // волны: 4 компонента в разных направлениях — живая нерегулярная поверхность
-                            const y =
-                                0.5 * Math.sin(0.31 * xj + 0.83 * zj - tt * 1.7 + phase) +
-                                0.3 * Math.sin(-0.57 * xj + 0.42 * zj + tt * 1.13 + phase * 1.7) +
-                                0.22 * Math.sin(0.11 * xj - 0.97 * zj - tt * 0.71 + phase * 2.3) +
-                                0.14 * Math.sin(0.71 * xj + 0.29 * zj + tt * 2.3);
-                            const sx = cx + rx * scale;
-                            if (sx < -4 || sx > w + 4) continue;
-                            const sy = horizon + (CAM_H - y) * scale;
-                            if (sy < -4 || sy > h + 4) continue;
-                            const k = (y + 1.16) / 2.32; // 0..1: впадина..гребень
-                            const r = Math.min(3.0, Math.max(0.75, 0.0195 * scale));
-                            ctx.globalAlpha = (0.12 + k * 0.88) * aFog;
-                            ctx.beginPath();
-                            ctx.arc(sx, sy, r, 0, Math.PI * 2);
-                            ctx.fill();
+                            const sxv = cx + rx * scale;
+                            if (sxv < -8 || sxv > w + 8) continue;
+                            const sy0v = horizon + CAM_H * scale;
+                            // y волн всегда в [-1.16, 1.16] — отсекаем точки,
+                            // у которых sy не появится на экране ни при каком t
+                            const sBand = 1.16 * scale;
+                            if (sy0v + sBand < -8 || sy0v - sBand > h + 8) continue;
+                            out.push(
+                                sxv,
+                                sy0v,
+                                scale,
+                                aFog,
+                                0.31 * xj + 0.83 * zj + phase,
+                                -0.57 * xj + 0.42 * zj + phase * 1.7,
+                                0.11 * xj - 0.97 * zj + phase * 2.3,
+                                0.71 * xj + 0.29 * zj
+                            );
                         }
-                        z -= dz;
                     }
-                    ctx.globalAlpha = 1;
+                    z -= dz;
                 }
+                return { data: Float32Array.from(out), count: out.length / WAVE_STRIDE };
+            }
 
-                return { draw, resize };
+            // --- WebGL-бэкенд: точки на GPU, главный тред только зовёт drawArrays
+            function createWavesGL(canvas, color, phase, yaw) {
+                const gl = canvas.getContext("webgl", {
+                    alpha: true,
+                    premultipliedAlpha: true,
+                    antialias: false,
+                    depth: false,
+                    stencil: false,
+                    powerPreference: "low-power",
+                });
+                if (!gl) return null;
+                try {
+                    const hex = parseInt(color.slice(1), 16);
+                    const colR = ((hex >> 16) & 255) / 255,
+                        colG = ((hex >> 8) & 255) / 255,
+                        colB = (hex & 255) / 255;
+
+                    const VS = [
+                        "attribute vec2 aPos;", // sx, sy0 (CSS px)
+                        "attribute vec4 aPh;", // пространственные фазы волн p1..p4
+                        "attribute vec2 aMeta;", // scale, aFog
+                        "uniform vec2 uRes;", // размер канваса, CSS px
+                        "uniform float uT;",
+                        "uniform float uDpr;",
+                        "varying float vAlpha;",
+                        "void main() {",
+                        "  float y = 0.5 * sin(aPh.x - uT * 1.7) + 0.3 * sin(aPh.y + uT * 1.13)",
+                        "    + 0.22 * sin(aPh.z - uT * 0.71) + 0.14 * sin(aPh.w + uT * 2.3);",
+                        "  float sy = aPos.y - y * aMeta.x;",
+                        "  float k = (y + 1.16) * 0.43103448;", // / 2.32: 0..1 впадина..гребень
+                        "  float alpha = (0.12 + k * 0.88) * aMeta.y;",
+                        "  vAlpha = alpha > 0.05 ? min(alpha, 1.0) : 0.0;",
+                        "  gl_Position = vec4(aPos.x / uRes.x * 2.0 - 1.0, 1.0 - sy / uRes.y * 2.0, 0.0, 1.0);",
+                        "  gl_PointSize = clamp(0.0195 * aMeta.x, 0.75, 3.0) * 2.0 * uDpr;",
+                        "}",
+                    ].join("\n");
+                    const FS = [
+                        "precision mediump float;",
+                        "varying float vAlpha;",
+                        "uniform vec3 uColor;",
+                        "void main() {",
+                        "  float d = length(gl_PointCoord - vec2(0.5));",
+                        "  float m = smoothstep(0.5, 0.42, d);", // AA-кромка круга
+                        "  gl_FragColor = vec4(uColor * vAlpha * m, vAlpha * m);",
+                        "}",
+                    ].join("\n");
+
+                    function shader(type, src) {
+                        const s = gl.createShader(type);
+                        gl.shaderSource(s, src);
+                        gl.compileShader(s);
+                        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                            gl.deleteShader(s);
+                            throw new Error(gl.getShaderInfoLog(s) || "shader");
+                        }
+                        return s;
+                    }
+                    const prog = gl.createProgram();
+                    gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+                    gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+                    gl.linkProgram(prog);
+                    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error("link");
+                    gl.useProgram(prog);
+                    gl.enable(gl.BLEND);
+                    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // premultiplied
+
+                    const locPos = gl.getAttribLocation(prog, "aPos");
+                    const locPh = gl.getAttribLocation(prog, "aPh");
+                    const locMeta = gl.getAttribLocation(prog, "aMeta");
+                    const uRes = gl.getUniformLocation(prog, "uRes");
+                    const uT = gl.getUniformLocation(prog, "uT");
+                    const uDpr = gl.getUniformLocation(prog, "uDpr");
+                    const uColor = gl.getUniformLocation(prog, "uColor");
+                    gl.uniform3f(uColor, colR, colG, colB);
+
+                    const buf = gl.createBuffer();
+                    let w = 0,
+                        h = 0,
+                        dpr = 1,
+                        lastT = 0,
+                        count = 0;
+
+                    function resize() {
+                        // В зуме cell масштабируется CSS-трансформом — рисуем
+                        // канвас с удвоенным разрешением, чтобы точки не плыли.
+                        const zoom = canvas.closest(".cell").classList.contains("zoomed") ? 2 : 1;
+                        dpr = Math.min(2, (window.devicePixelRatio || 1) * zoom);
+                        w = canvas.clientWidth;
+                        h = canvas.clientHeight;
+                        canvas.width = Math.round(w * dpr);
+                        canvas.height = Math.round(h * dpr);
+                        const geo = buildWaveGeometry(w, h, yaw, phase);
+                        count = geo.count;
+                        gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+                        gl.bufferData(gl.ARRAY_BUFFER, geo.data, gl.STATIC_DRAW);
+                        const B = WAVE_STRIDE * 4;
+                        gl.enableVertexAttribArray(locPos);
+                        gl.vertexAttribPointer(locPos, 2, gl.FLOAT, false, B, 0);
+                        gl.enableVertexAttribArray(locMeta);
+                        gl.vertexAttribPointer(locMeta, 2, gl.FLOAT, false, B, 8); // scale, aFog
+                        gl.enableVertexAttribArray(locPh);
+                        gl.vertexAttribPointer(locPh, 4, gl.FLOAT, false, B, 16); // p1..p4
+                        draw(lastT);
+                    }
+                    resize();
+                    new ResizeObserver(resize).observe(canvas);
+
+                    function draw(t) {
+                        lastT = t;
+                        gl.viewport(0, 0, canvas.width, canvas.height);
+                        gl.clearColor(0, 0, 0, 0);
+                        gl.clear(gl.COLOR_BUFFER_BIT);
+                        gl.uniform2f(uRes, w, h);
+                        gl.uniform1f(uT, t * 0.001);
+                        gl.uniform1f(uDpr, dpr);
+                        gl.drawArrays(gl.POINTS, 0, count);
+                    }
+
+                    return { draw, resize };
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            function createWaves(canvas, color, phase, yaw) {
+                // Без WebGL волны не рисуем совсем: либо GL-контекст создался,
+                // либо слой — заглушка.
+                try {
+                    return createWavesGL(canvas, color, phase, yaw) || { draw() {}, resize() {} };
+                } catch (e) {
+                    return { draw() {}, resize() {} };
+                }
             }
 
             // Иконки режимов вида: мини-табличка 2x2 и цифры 1..4 в квадрате
@@ -385,10 +499,12 @@
             // Переходы анимированы: квадрант плавно зумится scale(2) из своего
             // угла (CSS transition на transform/opacity).
             let viewState = 0;
+            let animUntil = 0; // во время перехода (0.35s transition) рендерим все четыре
             const viewBtn = document.getElementById("view-btn");
 
             function setView(n) {
                 viewState = n;
+                animUntil = performance.now() + 400; // длительность CSS transition + запас
                 viewBtn.innerHTML = VIEW_SVGS[n];
                 viewBtn.title = n === 0 ? "View: all quadrants" : `View: quadrant ${n}`;
                 const box = document.getElementById("aspect-box");
@@ -454,14 +570,26 @@
                 window.setFullscreen = () => {};
             }
 
+            let lastTickerKey = "";
             function update(t) {
-                const now = new Date();
-                const text = formatRFC(now);
-                ["r1", "r3", "r4", "r6"].forEach((id) => {
-                    const el = document.getElementById("ticker-" + id);
-                    if (el) el.textContent = text;
-                });
-                for (const layer of waveLayers) layer.draw(t);
+                // Тикер ~10 раз/сек: гонять текстовый DOM каждый кадр незачем.
+                const text = formatRFC(new Date());
+                const key = text.slice(0, -2); // без миллисекунд
+                if (key !== lastTickerKey) {
+                    lastTickerKey = key;
+                    for (const id of ["r1", "r3", "r4", "r6"]) {
+                        const el = document.getElementById("ticker-" + id);
+                        if (el) el.textContent = text;
+                    }
+                }
+                // В режиме «все квадранты» и во время анимации перехода рендерим
+                // все четыре; в статичном одиночном — только активный, остальные
+                // всё равно скрыты opacity:0.
+                if (viewState === 0 || t < animUntil) {
+                    for (const layer of waveLayers) layer.draw(t);
+                } else {
+                    waveLayers[viewState - 1].draw(t);
+                }
                 requestAnimationFrame(update);
             }
             update(performance.now());

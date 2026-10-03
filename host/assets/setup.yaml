@@ -4,7 +4,7 @@ cameras:
     name: C7-1
     resolution: 1920x1080
     frame-rate: 60fps
-    format: mjpeg
+    format: yuyv
     dvr:
       container: mkv
       frame-rate: 30fps

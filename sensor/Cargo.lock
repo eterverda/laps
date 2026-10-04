@@ -846,7 +846,9 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "embedded-hal 1.0.0",
  "panic-halt",
+ "pio",
  "rp2040-boot2",
  "rp2040-hal",
 ]

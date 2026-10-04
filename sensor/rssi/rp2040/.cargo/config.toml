@@ -2,4 +2,8 @@
 target = "thumbv6m-none-eabi"
 
 [target.thumbv6m-none-eabi]
+# Прошивка через скрипт .cargo/flash.sh: ждёт BOOTSEL, монтирует RPI-RP2, шьёт.
+# Плата должна быть в BOOTSEL (зажать BOOTSEL при подключении USB).
+# Запускать только из каталога sensor/rssi/rp2040 (путь к скрипту — от него).
+runner = "sh .cargo/flash.sh"
 rustflags = ["-C", "link-arg=-Tlink.x"]

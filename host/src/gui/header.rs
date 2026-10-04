@@ -1,4 +1,67 @@
+use super::grid::{self, IntoCell};
+use super::style;
+use super::view::{self, Corner};
 use time::format_description::{Component, FormatItem};
+
+/// Фон плашки LAPS и даты — colorSecondaryLight из laps-bar.
+const TITLE_BG_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x8C, 0xAD, 0xD1);
+/// Фон временной плашки — colorSecondaryDark из laps-bar.
+const TITLE_BG_DARK: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x7F, 0xA9);
+
+const DATE_FORMAT: &str = "[year]-[month]-[day] [weekday format:mn]";
+const TIME_FORMAT: &str = "[hour]:[minute]:[second].[subsecond digits:3]";
+
+/// Заголовок экрана: LAPS слева, дата и время с ms справа. Виджету
+/// отдаётся rect во всю ширину контейнера и 2 клетки высотой — внутри
+/// он сам раскладывает левую и правую части по краям.
+pub struct Header {
+    date_clock: Clock,
+    time_clock: Clock,
+}
+
+impl Default for Header {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Header {
+    pub fn new() -> Self {
+        Self {
+            date_clock: Clock::new(DATE_FORMAT),
+            time_clock: Clock::new(TIME_FORMAT),
+        }
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        // Левый край: LAPS — полоса 12 клеток (2 обрезочка + 1 поле +
+        // 8 текст + 1 поле), две клетки высотой, от левого края rect'а.
+        let title_rect = rect.left_top().into_cell().extrude(12, 2);
+        view::StripeX2::new(TITLE_BG_LIGHT, Corner::TopLeft).show(ui, title_rect, |ui, rect| {
+            ui.painter().text(
+                rect.left_top(),
+                egui::Align2::LEFT_TOP,
+                "LAPS",
+                style::FONT_REGULAR_X2,
+                egui::Color32::BLACK,
+            );
+        });
+
+        // Правый край: дата (ряд 0) и время с ms (ряд 1) у правого края
+        // rect'а. Полные rect'ы полос: 1 обрезочка + 1 поле + текст +
+        // 1 поле; текст рисуют часы в замыкании.
+        let right = rect.right_top().into_cell().col;
+        let row = rect.left_top().into_cell().row;
+        let date_rect = grid::cell(right - 16, row).extrude(16, 1);
+        let time_rect = grid::cell(right - 15, row + 1).extrude(15, 1);
+        view::Stripe::new(TITLE_BG_LIGHT, Corner::TopRight).show(ui, date_rect, |ui, rect| {
+            self.date_clock.show(ui, rect, egui::Color32::BLACK);
+        });
+        view::Stripe::new(TITLE_BG_DARK, Corner::TopRight).show(ui, time_rect, |ui, rect| {
+            self.time_clock.show(ui, rect, egui::Color32::BLACK);
+        });
+    }
+}
 
 /// Плейсхолдер дня недели в форматной строке. Хак: `time` такого
 /// компонента не знает, поэтому Clock вырезает его перед парсингом, а
@@ -16,7 +79,7 @@ static RU_DAYS: [&str; 7] = ["пн", "вт", "ср", "чт", "пт", "сб", "в
 /// время, сняпленное ровно на границу деления (чистые `.000` у секундных
 /// форматов). Если repaint пришёл раньше своего тика (кадр камеры, ввод,
 /// ...), показывают точное время этого repaint.
-pub struct Clock {
+struct Clock {
     next_tick: Option<time::OffsetDateTime>,
     format: Box<[time::format_description::FormatItem<'static>]>,
     /// Самое мелкое деление формата, в миллисекундах.
@@ -26,7 +89,7 @@ pub struct Clock {
 }
 
 impl Clock {
-    pub fn new(format: &'static str) -> Self {
+    fn new(format: &'static str) -> Self {
         let (format, weekday) = match format.strip_suffix(WEEKDAY) {
             Some(head) => (head.trim_end(), true),
             None => (format, false),
@@ -41,7 +104,7 @@ impl Clock {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32) {
+    fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32) {
         let now =
             time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
 
@@ -93,7 +156,7 @@ impl Clock {
             rect.center(),
             egui::Align2::CENTER_CENTER,
             text,
-            super::style::FONT_REGULAR,
+            style::FONT_REGULAR,
             color,
         );
     }

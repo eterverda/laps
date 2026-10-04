@@ -43,7 +43,10 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   plates (cut-corner polygon, corner-hugging), text drawn by the caller
   in a closure; `view::BigButton` — status buttons, hover covers the
   drawn content; `viewfinder::ViewfinderFrame` — plate + label + name;
-  `Clock` — time by a format string, `[weekday format:mn]` at the end is
+  `header::Header` — LAPS + date/time for a full-width 2-row rect,
+  owns a private `Clock` (time by a format string; `[weekday format:mn]`
+  at the end is our placeholder, replaced with a Russian two-letter
+  weekday, lowercase)
   our placeholder (replaced with a Russian two-letter weekday, lowercase)
 - Assets embedded via `src/assets.rs` (fonts, testcard SVG, default setup.yaml)
 - **resvg** + **usvg** + **tiny-skia** — render testcard SVG to texture

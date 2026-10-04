@@ -1,7 +1,7 @@
 use crate::config::setup::Setup;
 use crate::model::pilot::Pilot;
 
-mod clock;
+mod header;
 mod grid;
 mod guidelines;
 mod live;

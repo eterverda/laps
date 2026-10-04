@@ -26,14 +26,6 @@ fn viewfinder_cols(count: usize) -> isize {
     viewfinder_rows(count) * 8 / 3
 }
 
-/// Фон плашки заголовка LAPS и даты — colorSecondaryLight из laps-bar.
-const TITLE_BG_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x8C, 0xAD, 0xD1);
-/// Фон временной плашки заголовка — colorSecondaryDark из laps-bar.
-const TITLE_BG_DARK: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x7F, 0xA9);
-
-const DATE_FORMAT: &str = "[year]-[month]-[day] [weekday format:mn]";
-const TIME_FORMAT: &str = "[hour]:[minute]:[second].[subsecond digits:3]";
-
 /// Таймер сессии: полные минуты и секунды, минуты не сбрасываются
 /// за час (78:00, 132:30 — штатно). Пусто, если сессии нет.
 fn session_timer(since: Option<Instant>) -> String {
@@ -61,12 +53,37 @@ impl Res {
 
 /// Состояние потока: Rec возможен только внутри Live (REC-on стартует
 /// захват и запись; LIVE-off гасит всё; REC тогглится независимо внутри
-/// захвата).
-#[derive(Clone, Copy, PartialEq)]
+/// захвата). В вариантах — момент старта: таймеры кнопок читают его
+/// отсюда, отдельных полей не требуется.
+#[derive(Clone, Copy)]
 enum FeedState {
     Off,
-    Live,
-    Rec,
+    Live {
+        since: Instant,
+    },
+    Rec {
+        live_since: Instant,
+        rec_since: Instant,
+    },
+}
+
+impl FeedState {
+    /// Момент старта эфира (таймер LIVE); в Rec эфир не прерывался.
+    fn live_since(&self) -> Option<Instant> {
+        match self {
+            FeedState::Off => None,
+            FeedState::Live { since } => Some(*since),
+            FeedState::Rec { live_since, .. } => Some(*live_since),
+        }
+    }
+
+    /// Момент старта записи (таймер REC).FpsCounter
+    fn rec_since(&self) -> Option<Instant> {
+        match self {
+            FeedState::Rec { rec_since, .. } => Some(*rec_since),
+            _ => None,
+        }
+    }
 }
 
 /// Статус кнопки статус-бара одной шкалой: что рисовать мелким текстом
@@ -86,13 +103,9 @@ pub struct Live {
     res: Option<Res>,
     webcams: HashMap<String, crate::driver::camera::Camera>,
     feed: FeedState,
-    /// Таймеры сессий для верхней строки кнопок (полные минуты: MM:SS).
-    live_since: Option<Instant>,
-    rec_since: Option<Instant>,
     /// Запрет засыпания экрана, пока идёт эфир.
     awake: Option<keepawake::KeepAwake>,
-    date_clock: clock::Clock,
-    time_clock: clock::Clock,
+    header: header::Header,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
     active_cameras: HashMap<String, CameraConfig>,
@@ -131,11 +144,8 @@ impl Live {
             res: None,
             webcams: HashMap::new(),
             feed: FeedState::Off,
-            live_since: None,
-            rec_since: None,
             awake: None,
-            date_clock: clock::Clock::new(DATE_FORMAT),
-            time_clock: clock::Clock::new(TIME_FORMAT),
+            header: header::Header::new(),
             setup,
             assignments,
             active_cameras,
@@ -225,43 +235,10 @@ impl Live {
 
                 let bottom_right = grid::cell_at(ui.max_rect().max);
 
-                // Полный rect полосы: 2 обрезочка + 1 поле + 8 текст + 1 поле.
-                let title_rect = grid::cell(0, 0).extrude(12, 2);
-                view::StripeX2::new(TITLE_BG_LIGHT, view::Corner::TopLeft).show(
-                    ui,
-                    title_rect,
-                    |ui, rect| {
-                        ui.painter().text(
-                            rect.left_top(),
-                            egui::Align2::LEFT_TOP,
-                            "LAPS",
-                            style::FONT_REGULAR_X2,
-                            egui::Color32::BLACK,
-                        );
-                    },
-                );
-
-                // Справа — два однострочных заголовка друг под другом: дата
-                // (ряд 0) и время с ms (ряд 1). Полные rect'ы полос:
-                // 1 обрезочка + 1 поле + текст + 1 поле. Текст рисуют
-                // часы в замыкании.
-                let right = bottom_right.col;
-                let date_rect = grid::cell(right - 16, 0).extrude(16, 1);
-                let time_rect = grid::cell(right - 15, 1).extrude(15, 1);
-                view::Stripe::new(TITLE_BG_LIGHT, view::Corner::TopRight).show(
-                    ui,
-                    date_rect,
-                    |ui, rect| {
-                        self.date_clock.show(ui, rect, egui::Color32::BLACK);
-                    },
-                );
-                view::Stripe::new(TITLE_BG_DARK, view::Corner::TopRight).show(
-                    ui,
-                    time_rect,
-                    |ui, rect| {
-                        self.time_clock.show(ui, rect, egui::Color32::BLACK);
-                    },
-                );
+                // Заголовок: rect во всю ширину контейнера, 2 клетки
+                // высотой; левую/правую части раскладывает сам виджет.
+                let header_rect = grid::cell(0, 0).extrude(bottom_right.col, 2);
+                self.header.show(ui, header_rect);
 
                 if columns > 0 {
                     for (i, (pad_id, pad)) in pads.into_iter().enumerate() {
@@ -333,7 +310,8 @@ impl Live {
                 // Starting — поток жив, камера инициализируется: для статуса
                 // это «active», а не отвал (error рисуем только по Dead).
                 let live_show = live_state == Some(CaptureState::Live)
-                    || (self.feed != FeedState::Off && live_state != Some(CaptureState::Dead));
+                    || (!matches!(self.feed, FeedState::Off)
+                        && live_state != Some(CaptureState::Dead));
                 let rec_active = self.webcams.values().any(|w| w.record_state().ok);
                 let cfg_fps = self
                     .active_cameras
@@ -347,14 +325,15 @@ impl Live {
                     .map(|camera| camera.dvr.frame_rate.unwrap_or(camera.frame_rate));
                 let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
 
-                let live_status =
-                    if self.feed != FeedState::Off && live_state == Some(CaptureState::Dead) {
-                        Status::Error
-                    } else if live_show {
-                        Status::Active
-                    } else {
-                        Status::Idle
-                    };
+                let live_status = if !matches!(self.feed, FeedState::Off)
+                    && live_state == Some(CaptureState::Dead)
+                {
+                    Status::Error
+                } else if live_show {
+                    Status::Active
+                } else {
+                    Status::Idle
+                };
                 let live_color = match live_status {
                     Status::Idle => egui::Color32::DARK_GRAY,
                     _ => egui::Color32::WHITE,
@@ -370,19 +349,23 @@ impl Live {
                     }
                     Status::Idle => cfg_fps.map(|f| f.to_string()).unwrap_or_default(),
                 };
-                let live_timer = session_timer(self.live_since);
-                let rec_timer = session_timer(self.rec_since);
+                let live_timer = session_timer(self.feed.live_since());
+                let rec_timer = session_timer(self.feed.rec_since());
                 let live_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
                     grid::whole_cols(view::content_width(ui.ctx(), " LIVE", &live_text)),
                     -2,
                 );
-                let live_response = view::BigButton::new(" LIVE", &live_timer, &live_text, live_color)
-                    .show(ui, live_rect, ui.make_persistent_id("status_live"));
+                let live_response =
+                    view::BigButton::new(" LIVE", &live_timer, &live_text, live_color).show(
+                        ui,
+                        live_rect,
+                        ui.make_persistent_id("status_live"),
+                    );
                 if live_response.clicked() {
                     action = Action::ToggleLive;
                 }
 
-                let rec_status = if self.feed == FeedState::Rec
+                let rec_status = if matches!(self.feed, FeedState::Rec { .. })
                     && !rec_active
                     && live_state != Some(CaptureState::Starting)
                 {
@@ -400,7 +383,7 @@ impl Live {
                     Status::Error => "error".to_owned(),
                     // feed == Rec (Active или переходный Idle): замерили —
                     // fps, нет — "--fps".
-                    _ if self.feed == FeedState::Rec => {
+                    _ if matches!(self.feed, FeedState::Rec { .. }) => {
                         if rec_fps.unwrap_or_default() > 0.0 {
                             format!("{:.0}fps", rec_fps.unwrap())
                         } else {
@@ -420,11 +403,8 @@ impl Live {
                         grid::whole_cols(view::content_width(ui.ctx(), "󰑊 REC", &rec_text)),
                         -2,
                     );
-                let rec_response = view::BigButton::new("󰑊 REC", &rec_timer, &rec_text, rec_color).show(
-                    ui,
-                    rec_rect,
-                    ui.make_persistent_id("status_rec"),
-                );
+                let rec_response = view::BigButton::new("󰑊 REC", &rec_timer, &rec_text, rec_color)
+                    .show(ui, rec_rect, ui.make_persistent_id("status_rec"));
                 if rec_response.clicked() {
                     action = Action::ToggleRec;
                 }
@@ -500,15 +480,14 @@ impl Live {
             FeedState::Off => {
                 self.start_captures(ctx);
                 self.reset_shown_fps();
-                self.live_since = Some(Instant::now());
                 self.screen_awake();
-                self.feed = FeedState::Live;
+                self.feed = FeedState::Live {
+                    since: Instant::now(),
+                };
             }
-            FeedState::Live | FeedState::Rec => {
+            FeedState::Live { .. } | FeedState::Rec { .. } => {
                 self.webcams.clear();
                 log::info!("webcams stopped");
-                self.live_since = None;
-                self.rec_since = None;
                 self.awake = None;
                 self.feed = FeedState::Off;
             }
@@ -538,22 +517,25 @@ impl Live {
                 self.start_captures(ctx);
                 self.start_recording_all();
                 self.reset_shown_fps();
-                self.live_since = Some(Instant::now());
-                self.rec_since = Some(Instant::now());
                 self.screen_awake();
-                self.feed = FeedState::Rec;
+                let now = Instant::now();
+                self.feed = FeedState::Rec {
+                    live_since: now,
+                    rec_since: now,
+                };
             }
-            FeedState::Live => {
+            FeedState::Live { since } => {
                 self.start_recording_all();
-                self.rec_since = Some(Instant::now());
-                self.feed = FeedState::Rec;
+                self.feed = FeedState::Rec {
+                    live_since: since,
+                    rec_since: Instant::now(),
+                };
             }
-            FeedState::Rec => {
+            FeedState::Rec { live_since, .. } => {
                 for webcam in self.webcams.values() {
                     webcam.stop_recording();
                 }
-                self.rec_since = None;
-                self.feed = FeedState::Live;
+                self.feed = FeedState::Live { since: live_since };
             }
         }
     }

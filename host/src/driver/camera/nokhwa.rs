@@ -8,8 +8,10 @@
 //! Правило слоя: бэкенд не импортирует pipeline-части модуля camera
 //! (mod.rs) — только контракты из capture.rs.
 
-use super::capture::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
 use super::Error;
+use super::capture::{
+    Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
+};
 use crate::config::camera::CameraConfig;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
@@ -38,7 +40,7 @@ pub struct NokhwaSession {
     negotiated: CaptureFormat,
 }
 
-impl NokhwaCapture {
+impl Capture for NokhwaCapture {
     type Session = NokhwaSession;
 
     fn list_devices() -> std::result::Result<Vec<DeviceInfo>, Error> {
@@ -98,9 +100,9 @@ impl NokhwaCapture {
             let negotiated = match to_capture_format(&camera.camera_format()) {
                 Some(format) => format,
                 None => {
-                    return Err(CaptureError::Unsupported(
-                        "negotiated pixel format".to_string(),
-                    ))
+                    return Err(Error::Config(
+                        "negotiated pixel format unsupported".to_string(),
+                    ));
                 }
             };
             return Ok(NokhwaSession { camera, negotiated });
@@ -197,9 +199,7 @@ fn sort_and_dedup(formats: &mut Vec<CameraFormat>) {
 }
 
 #[cfg(target_os = "macos")]
-fn list_formats_for_index(
-    index: &CameraIndex,
-) -> std::result::Result<Vec<CameraFormat>, String> {
+fn list_formats_for_index(index: &CameraIndex) -> std::result::Result<Vec<CameraFormat>, String> {
     use nokhwa_bindings_macos::AVCaptureDevice;
     let device = match AVCaptureDevice::new(index) {
         Ok(device) => device,
@@ -214,9 +214,7 @@ fn list_formats_for_index(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn list_formats_for_index(
-    index: &CameraIndex,
-) -> std::result::Result<Vec<CameraFormat>, String> {
+fn list_formats_for_index(index: &CameraIndex) -> std::result::Result<Vec<CameraFormat>, String> {
     let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
     let mut camera = match nokhwa::Camera::new(index.clone(), format) {
         Ok(camera) => camera,

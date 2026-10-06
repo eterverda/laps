@@ -1,9 +1,9 @@
 use crate::config::setup::Setup;
 use crate::model::pilot::Pilot;
 
-mod header;
 mod grid;
 mod guidelines;
+mod header;
 mod live;
 mod menu;
 mod style;
@@ -25,9 +25,16 @@ impl Navigator {
 }
 
 struct App {
+    remote_rx: std::sync::mpsc::Receiver<(
+        Vec<String>,
+        std::sync::mpsc::Sender<crate::remote::Response>,
+    )>,
     state: State,
     setup: Setup,
     assignments: std::collections::HashMap<String, Pilot>,
+    // Живёт с приложением: Drop останавливает accept-поток и снимает
+    // регистрацию инстанса.
+    _server: Option<crate::remote::Server>,
 }
 
 fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
@@ -38,7 +45,37 @@ fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let (remote_tx, remote_rx) = std::sync::mpsc::channel();
+        // Колбэк исполнения команд: кладёт задачу в очередь GUI и будит
+        // его (иначе ответ ждал бы ближайшего кадра egui), затем ждёт
+        // ответа.
+        let ctx = cc.egui_ctx.clone();
+        let execute: std::sync::Arc<dyn Fn(Vec<String>) -> crate::remote::Response + Send + Sync> =
+            std::sync::Arc::new(move |command| {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                if remote_tx.send((command, reply_tx)).is_err() {
+                    return crate::remote::Response {
+                        message: "gui unavailable".to_owned(),
+                        code: 1,
+                    };
+                }
+                ctx.request_repaint();
+                match reply_rx.recv_timeout(crate::remote::RESPONSE_TIMEOUT) {
+                    Ok(response) => response,
+                    Err(_) => crate::remote::Response {
+                        message: "no response".to_owned(),
+                        code: 1,
+                    },
+                }
+            });
+        let server = match crate::remote::Server::start(execute) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                log::warn!("remote control unavailable: {e}");
+                None
+            }
+        };
         // Ошибка сетапа фатальна: без него экраны не построить. Пишем
         // ERROR в лог и выходим с ненулевым кодом (fatal по смыслу — у
         // log-крейта уровня fatal нет, error! + exit(1) принятое замещение).
@@ -57,7 +94,38 @@ impl App {
             ))),
             setup,
             assignments,
+            remote_rx,
+            _server: server,
         }
+    }
+
+    /// Обработка команды удалённого управления: сначала команду получает
+    /// текущий экран; отклонённое (None дошло до верха) ловит App — echo
+    /// отвечает здесь же, остальное превращается в «unknown command».
+    fn handle_remote(
+        &mut self,
+        ctx: &egui::Context,
+        command: &[String],
+    ) -> crate::remote::Response {
+        let response = match &mut self.state {
+            State::Live(live) => live.handle_remote(ctx, command),
+            State::Menu(_) => None,
+        };
+        response.unwrap_or_else(|| {
+            // Экраны отклонили: echo — команда уровня приложения,
+            // остальное неизвестно.
+            if command.first().map(String::as_str) == Some("echo") {
+                return crate::remote::Response {
+                    message: command[1..].join(" "),
+                    code: 0,
+                };
+            }
+            let message = match command.first() {
+                Some(head) => format!("unknown command {head:?}"),
+                None => "empty command".to_owned(),
+            };
+            crate::remote::Response { message, code: 1 }
+        })
     }
 }
 
@@ -68,6 +136,9 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        while let Ok((tokens, reply)) = self.remote_rx.try_recv() {
+            let _ = reply.send(self.handle_remote(&ctx, &tokens));
+        }
         if fullscreen_pressed(&ctx) {
             let fullscreen = ctx.input(|i| i.viewport().fullscreen).unwrap_or(false);
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
@@ -163,7 +234,7 @@ pub fn run() {
                 o.sync_window_theme = false; // don't touch native window decorations
             });
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            Ok(Box::new(App::new(cc)))
         }),
     )
     .unwrap();

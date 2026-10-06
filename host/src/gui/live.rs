@@ -475,6 +475,36 @@ impl Live {
         self.shown_fps = 0.0;
     }
 
+    /// Команда удалённого управления. Some — обработана, ответ готов;
+    /// None — не моя, экран отдаёт её уровнем выше.
+    pub fn handle_remote(
+        &mut self,
+        ctx: &egui::Context,
+        command: &[String],
+    ) -> Option<crate::remote::Response> {
+        let head = command.first()?.as_str();
+        match head {
+            "toggle-live" | "toggle-rec" => {
+                if command.len() > 1 {
+                    return Some(crate::remote::Response {
+                        message: format!("{head} takes no arguments"),
+                        code: 2,
+                    });
+                }
+                if head == "toggle-live" {
+                    self.toggle_live(ctx);
+                } else {
+                    self.toggle_rec(ctx);
+                }
+                Some(crate::remote::Response {
+                    message: String::new(),
+                    code: 0,
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn toggle_live(&mut self, ctx: &egui::Context) {
         match self.feed {
             FeedState::Off => {

@@ -14,6 +14,7 @@ jpeg-encoder = ["dep:jpeg-encoder"]
 [dependencies]
 bytemuck = { version = "1.25", features = ["extern_crate_alloc"] }
 clap = { version = "4.6", features = ["derive"] }
+dirs = "6"
 resvg = "0.48"
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"

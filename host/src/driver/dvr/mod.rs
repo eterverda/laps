@@ -40,7 +40,7 @@ pub type SharedRecordState = Arc<AtomicCell<RecordState>>;
 /// пишется как реальный таймкод (равномерный таймлайн по fps никто не
 /// строит). Конструктор `create` — inherent у каждого писателя, трейт
 /// покрывает жизненный цикл записи. `Send`: writer живёт в своём потоке.
-pub(crate) trait VideoWriter: Send {
+pub trait VideoWriter: Send {
     fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> io::Result<()>;
     fn sync_data(&mut self) -> io::Result<()>;
     /// Потребляет писателя: таблицы/индекс, патчи заголовков, fsync.
@@ -249,7 +249,7 @@ impl Drop for Recorder {
 }
 
 /// Миллисекунды с Unix-эпохи (для меток файла DVR).
-pub(crate) fn epoch_millis() -> u64 {
+pub fn epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -257,7 +257,7 @@ pub(crate) fn epoch_millis() -> u64 {
 }
 
 /// Префикс имён файлов записи: `YYYY-mm-dd-HH-MM-SS.SSS` (локальное время).
-pub(crate) fn timestamp_prefix() -> String {
+pub fn timestamp_prefix() -> String {
     use time::macros::format_description;
     const FMT: &[time::format_description::FormatItem<'static>] =
         format_description!("[year]-[month]-[day]-[hour]-[minute]-[second].[subsecond digits:3]");

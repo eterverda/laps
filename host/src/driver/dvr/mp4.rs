@@ -25,7 +25,7 @@ const BRAND_QT: [u8; 4] = *b"qt  ";
 
 /// Вариант контейнера семейства ISOBMFF: отличаются только брендами ftyp.
 #[derive(Clone, Copy)]
-pub(crate) enum Flavor {
+pub enum Flavor {
     Mov,
     Mp4,
 }
@@ -91,7 +91,7 @@ const LANGUAGE_UND: u16 = 0x55C4;
 
 /// Общий движок ISOBMFF. Публичные обёртки (Mp4Writer/MovWriter) держат его
 /// и транслируют вызовы; здесь — вся логика.
-pub(crate) struct IsobmffCore {
+pub struct IsobmffCore {
     writer: BufWriter<File>,
     /// Позиция 8-байтного largesize mdat (патч в finalize).
     mdat_size_pos: u64,
@@ -110,7 +110,7 @@ pub(crate) struct IsobmffCore {
 }
 
 impl IsobmffCore {
-    pub(crate) fn create(path: &Path, width: u32, height: u32, flavor: Flavor) -> io::Result<Self> {
+    pub fn create(path: &Path, width: u32, height: u32, flavor: Flavor) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = BufWriter::new(file);
 
@@ -148,7 +148,7 @@ impl IsobmffCore {
 
     /// Пишет кадр в mdat; ts_ms — момент кадра, мс с Unix-эпохи
     /// (внутри — относительно первого кадра).
-    pub(crate) fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
+    pub fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
         let first = *self.first_ts.get_or_insert(ts_ms);
         let rel = ts_ms.saturating_sub(first);
         let offset = self.writer.stream_position()?;
@@ -160,14 +160,14 @@ impl IsobmffCore {
     }
 
     /// Периодический flush + sync для живучести к крашу.
-    pub(crate) fn sync_data(&mut self) -> io::Result<()> {
+    pub fn sync_data(&mut self) -> io::Result<()> {
         self.writer.flush()?;
         self.writer.get_ref().sync_data()
     }
 
     /// Патчит largesize mdat, пишет moov (весь индекс — в памяти), flush +
     /// sync_all.
-    pub(crate) fn finalize(mut self) -> io::Result<()> {
+    pub fn finalize(mut self) -> io::Result<()> {
         self.writer.flush()?;
         let file = self.writer.get_ref();
         let file_size = file.metadata()?.len();
@@ -423,17 +423,17 @@ impl VideoWriter for Mp4Writer {
 
 /// Мини-парсер боксов для тестов семейства (mp4.rs, mov.rs).
 #[cfg(test)]
-pub(crate) mod boxparse {
+pub mod boxparse {
     #[derive(Clone)]
-    pub(crate) struct Bx {
-        pub(crate) typ: [u8; 4],
-        pub(crate) start: usize, // начало payload
-        pub(crate) len: usize,
+    pub struct Bx {
+        pub typ: [u8; 4],
+        pub start: usize, // начало payload
+        pub len: usize,
     }
 
     /// Разобрать боксы уровня; largesize (size==1) поддержан — им пишется
     /// mdat.
-    pub(crate) fn parse(buf: &[u8], from: usize, to: usize) -> Vec<Bx> {
+    pub fn parse(buf: &[u8], from: usize, to: usize) -> Vec<Bx> {
         let mut out = Vec::new();
         let mut p = from;
         while p < to {
@@ -457,7 +457,7 @@ pub(crate) mod boxparse {
         out
     }
 
-    pub(crate) fn find<'a>(bx: &'a [Bx], typ: &[u8; 4]) -> &'a Bx {
+    pub fn find<'a>(bx: &'a [Bx], typ: &[u8; 4]) -> &'a Bx {
         bx.iter()
             .find(|b| &b.typ == typ)
             .unwrap_or_else(|| panic!("box {:?} not found", String::from_utf8_lossy(typ)))
@@ -465,20 +465,20 @@ pub(crate) mod boxparse {
 
     /// Первый дочерний бокс заданного типа, по значению — удобно в цепочках
     /// без промежуточных привязок.
-    pub(crate) fn child(buf: &[u8], parent: &Bx, typ: &[u8; 4]) -> Bx {
+    pub fn child(buf: &[u8], parent: &Bx, typ: &[u8; 4]) -> Bx {
         find(&parse(buf, parent.start, parent.start + parent.len), typ).clone()
     }
 
     /// u32 из payload бокса по смещению (payload начинается с start).
-    pub(crate) fn u32v(buf: &[u8], b: &Bx, at: usize) -> u32 {
+    pub fn u32v(buf: &[u8], b: &Bx, at: usize) -> u32 {
         u32::from_be_bytes(buf[b.start + at..b.start + at + 4].try_into().unwrap())
     }
 
-    pub(crate) fn u64v(buf: &[u8], b: &Bx, at: usize) -> u64 {
+    pub fn u64v(buf: &[u8], b: &Bx, at: usize) -> u64 {
         u64::from_be_bytes(buf[b.start + at..b.start + at + 8].try_into().unwrap())
     }
 
-    pub(crate) fn u16v(buf: &[u8], b: &Bx, at: usize) -> u16 {
+    pub fn u16v(buf: &[u8], b: &Bx, at: usize) -> u16 {
         u16::from_be_bytes(buf[b.start + at..b.start + at + 2].try_into().unwrap())
     }
 }

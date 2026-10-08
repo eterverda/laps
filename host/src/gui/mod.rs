@@ -76,9 +76,8 @@ impl App {
                 None
             }
         };
-        // Ошибка сетапа фатальна: без него экраны не построить. Пишем
-        // ERROR в лог и выходим с ненулевым кодом (fatal по смыслу — у
-        // log-крейта уровня fatal нет, error! + exit(1) принятое замещение).
+        // Ошибка сетапа фатальна: без него экраны не построить —
+        // лог и exit(1).
         let setup: Setup = match serde_yaml::from_str(crate::assets::SETUP_YAML) {
             Ok(setup) => setup,
             Err(e) => {

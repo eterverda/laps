@@ -178,18 +178,14 @@ impl Live {
         let primary_id = self.active_cameras.keys().next().cloned();
         for (id, webcam) in self.webcams.iter_mut() {
             let capture_state = webcam.capture_state();
-            let (texture, new_frame) = webcam.update(ctx);
-            if new_frame && Some(id) == primary_id.as_ref() {
+            if webcam.update_frame() && Some(id) == primary_id.as_ref() {
                 self.shown.on_frame();
             }
             // Поток мёртв (камера не найдена, отвалилась) — testcard вместо
-            // замершей последней текстуры: состояние не отличить по ней.
-            // Starting тоже testcard: кадров ещё нет.
+            // замершей последней текстуры. Starting тоже testcard: кадров
+            // ещё нет (Live ставится по первому кадру).
             let state = if capture_state == CaptureState::Live {
-                match texture {
-                    Some(tex) => viewfinder::ViewfinderContents::Texture(tex.id()),
-                    None => viewfinder::ViewfinderContents::Pending,
-                }
+                viewfinder::ViewfinderContents::Texture(webcam.texture())
             } else {
                 viewfinder::ViewfinderContents::Pending
             };
@@ -442,14 +438,7 @@ impl Live {
 
     fn start_captures(&mut self, ctx: &egui::Context) {
         for (id, camera) in &self.active_cameras {
-            let ctx = ctx.clone();
-            // A 1ms delay instead of an immediate repaint: egui renders twice
-            // per `request_repaint` (outstanding = 1), and the second pass
-            // always finds an empty slot. A tiny delay gives a single pass
-            // per camera frame.
-            let webcam = crate::driver::camera::Camera::start(camera.clone(), move || {
-                ctx.request_repaint_after(std::time::Duration::from_millis(1));
-            });
+            let webcam = crate::driver::camera::Camera::open(camera.clone(), ctx.clone());
             self.webcams.insert(id.clone(), webcam);
         }
         log::info!("webcams starting: {}", self.webcams.len());

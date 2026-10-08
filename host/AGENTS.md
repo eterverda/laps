@@ -157,29 +157,35 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 ## CLI
 
 - **clap** derive. Subcommand `list-cameras` prints available cameras;
-  `list-instances` — локальный список живых инстансов из реестра (без
-  сервера); no args → GUI mode
-- **Remote control** (`src/remote/mod.rs`): один бинарь управляет
-  запущенным инстансом. Вызов: `laps [+pid] +команда [хвост]` — `+pid`
-  (не больше одного) адресует конкретный инстанс; без него команда идёт
-  единственному запущенному, а при нескольких — ошибка со списком pid.
-  Посмотреть живые инстансы: субкоманда `list-instances` (локально, без
-  сервера). Реестр инстансов — per-user каталог (через `dirs`), файл на
-  инстанс, живость проверяется коннектом, мёртвые подчищаются.
-- **Команды**: слово-голова плюс хвост аргументов; при склейке argv в
-  строку квотинг сохраняет группировку (`"a b"`, `\` для `"` и `\`), так
-  что аргументы с пробелами доезжают целыми. Валидация аргументов —
-  на принимающей стороне: ошибка приходит ответом с ненулевым кодом, а
-  не обрывом вызова. Исполняют команды обработчики трейта
-  `remote::Handler` (`handle(&[String]) -> Option<Response>`): сначала
-  текущий экран (`Live` реализует), отклонённое поднимается, `App` —
-  верхний уровень и превращает отклонённое в "unknown command".
-  Stateless-команды (сейчас `echo`) отвечает сам серверный поток, не
-  трогая GUI. Ответ = текст + код выхода: текст на stdout при коде 0,
-  на stderr иначе; exit-код процесса = код ответа. Прецеденты команд:
-  `toggle-live` / `toggle-rec` (идут в GUI, дергают те же `Live::toggle_*`,
-  что и кнопки). Новая stateful-команда = ветка в `handle` нужного
-  экрана, сервер менять не нужно.
+  `list-instances` — local list of live instances from the registry
+  (no server involved); no args → GUI mode
+- **Remote control** (`src/remote/mod.rs`): the same binary controls a
+  running instance. Invocation: `laps [+pid] +command [tail]` — `+pid`
+  (at most one) addresses a specific instance; without it the command
+  goes to the single running instance, and with several — an error
+  listing the pids. List live instances: the `list-instances`
+  subcommand (local, no server). Instance registry — per-user dir
+  (via `dirs`), one file per instance, liveness by connect, dead ones
+  cleaned up.
+- **Commands**: a head word plus a tail of args; joining argv into a
+  string re-quotes so grouping survives (`"a b"`, `\` for `"` and `\`),
+  args with spaces arrive whole. Argument validation — on the receiving
+  side: errors come back as a reply with a non-zero code, not as a
+  broken call. The server executes commands via a callback
+  `Arc<dyn Fn(Vec<String>) -> Response + Send + Sync>` (blocks up to
+  `RESPONSE_TIMEOUT`): the closure in `App::new` enqueues the command
+  for the GUI, wakes egui via `ctx.request_repaint()` (otherwise the
+  answer would wait for the next frame) and waits on a oneshot channel.
+  The accept thread serves clients one at a time. Commands are handled
+  by inherent `handle_remote` methods: the current screen gets the
+  command first (`Live`), declined commands bubble up, `App` is the top
+  level (echo is answered there, everything else becomes "unknown
+  command"). Response = text + exit code: text to stdout on code 0, to
+  stderr otherwise; the process exit code = the response code.
+  Precedent commands: `toggle-live` / `toggle-rec` (go to the GUI, call
+  the same `Live::toggle_*` as the buttons). A new stateful command =
+  a branch in `handle_remote` of the right screen; the server needs no
+  changes.
 
 ## Concurrency
 
@@ -219,6 +225,9 @@ cargo run
 
 ## Notes
 
+- Docs and comments: Russian and English are both fine, but a single
+  document/comment (and docs of one structure or kind) must stick to
+  one language — no mixing. AGENTS.md is English.
 - No external/system dependencies — everything via Cargo; ffmpeg is NOT
   required (containers are our own code)
 - Performance target: FullHD 60fps (achieved: 60.0 sustained on a

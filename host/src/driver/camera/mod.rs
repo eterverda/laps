@@ -134,25 +134,90 @@ pub fn list_cameras() -> std::result::Result<Vec<CameraConfig>, Error> {
 }
 
 pub struct Camera {
+    /// Кадр из capture-потока → UI-поток (latest-wins).
     slot: ImageSlot,
-    texture: Option<egui::TextureHandle>,
+    /// Текстура 1×1 пустышка из open(); первый кадр расширит set'ом.
+    /// TextureId стабилен всю жизнь Camera.
+    texture: egui::TextureHandle,
+    /// Состояние наружу: UI читает атомарно.
+    capture_state: SharedCaptureState,
+    record_state: SharedRecordState,
+    /// Команды записи в capture-поток.
+    commands: crossbeam_channel::Sender<RecordCommand>,
+    /// Латентность live на выходе: пишет UI-поток, логает capture-поток
+    /// в конце сеанса.
+    ui_latency: Arc<Mutex<fps::FrameStats>>,
+    /// Останов и join capture-потока (Drop).
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
-    camera: SharedCaptureState,
-    record: SharedRecordState,
-    commands: crossbeam_channel::Sender<RecordCommand>,
-    ui_latency: Arc<Mutex<fps::FrameStats>>,
 }
 
 impl Camera {
+    pub fn open(desc: CameraConfig, ctx: egui::Context) -> Self {
+        // Пробуждение UI на каждый кадр. 1 мс вместо немедленного repaint: egui
+        // рендерит дважды на request_repaint, второй проход находит пустой
+        // слот; маленькая задержка даёт один проход на кадр.
+        let on_frame = {
+            let ctx = ctx.clone();
+            move || ctx.request_repaint_after(std::time::Duration::from_millis(1))
+        };
+        let slot: ImageSlot = Arc::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let capture_state: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
+        let record_state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
+            ok: false,
+            fps: 0.0,
+        }));
+        let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
+        let ui_latency = Arc::new(Mutex::new(fps::FrameStats::default()));
+        // 1×1-пустышка: id валиден с рождения, размер возьмёт первый кадр
+        // (set перезаписывает мету). Контент не отрисовывается: до первого
+        // кадра capture_state == Starting и экран показывает testcard.
+        let texture = ctx.load_texture(
+            "camera",
+            egui::ColorImage::new([1, 1], vec![egui::Color32::TRANSPARENT]),
+            egui::TextureOptions::NEAREST,
+        );
+
+        let slot_clone = Arc::clone(&slot);
+        let capture_state_clone = Arc::clone(&capture_state);
+        let record_state_clone = Arc::clone(&record_state);
+        let running_clone = Arc::clone(&running);
+        let ui_latency_thread = Arc::clone(&ui_latency);
+
+        let thread = thread::spawn(move || {
+            capture_loop(
+                desc,
+                slot_clone,
+                capture_state_clone,
+                record_state_clone,
+                running_clone,
+                commands_rx,
+                ui_latency_thread,
+                on_frame,
+            );
+        });
+
+        Self {
+            slot,
+            texture,
+            capture_state,
+            record_state,
+            commands: commands_tx,
+            ui_latency,
+            running,
+            thread: Some(thread),
+        }
+    }
+
     /// Стрим открыт, поток камеры жив.
     pub fn capture_state(&self) -> CaptureState {
-        self.camera.load()
+        self.capture_state.load()
     }
 
     /// Writer жив и пишет на диск.
     pub fn record_state(&self) -> RecordState {
-        self.record.load()
+        self.record_state.load()
     }
 
     /// Запустить запись. Команда применится перед следующим кадром;
@@ -179,251 +244,241 @@ impl Camera {
         }
     }
 
-    pub fn start(desc: CameraConfig, on_frame: impl Fn() + Send + Sync + 'static) -> Self {
-        let slot: ImageSlot = Arc::default();
-        let slot_clone = Arc::clone(&slot);
-        let running = Arc::new(AtomicBool::new(true));
-        let running_clone = Arc::clone(&running);
-        let state: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
-        let state_clone = Arc::clone(&state);
-        let record: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
-            ok: false,
-            fps: 0.0,
-        }));
-        let record_clone = Arc::clone(&record);
-        let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
-        // Латентность live считается на ВЫХОДЕ — в Camera::update (момент
-        // отдачи кадра в egui-текстуру), а не при складывании в slot:
-        // замер включает ожидание repaint. UI-поток пишет, capture-поток
-        // логает один раз в конце сеанса.
-        let ui_latency = Arc::new(Mutex::new(fps::FrameStats::default()));
-        let ui_latency_thread = Arc::clone(&ui_latency);
-
-        let thread = thread::spawn(move || {
-            // Перебор устройств и форматов — io, не должно висеть на UI-потоке.
-            let devices = match Backend::list_devices() {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("failed to list devices: {}", e);
-                    state_clone.store(CaptureState::Dead);
-                    return;
-                }
-            };
-
-            let (name, matched) = match devices.into_iter().find_map(|dev| {
-                dev.formats
-                    .into_iter()
-                    .find(|f| {
-                        desc.matches(
-                            &dev.name,
-                            f.resolution.width,
-                            f.resolution.height,
-                            f.frame_rate.0,
-                            f.format.as_str(),
-                        )
-                    })
-                    .map(|f| (dev.name, f))
-            }) {
-                Some(found) => found,
-                None => {
-                    log::error!("no matching camera format for {}", desc);
-                    state_clone.store(CaptureState::Dead);
-                    return;
-                }
-            };
-
-            log::info!("starting capture from {} at {:?}", name, matched);
-
-            // open резолвит устройство по имени заново (P5): между
-            // перечислением и открытием камеру могли переткнуть.
-            let mut session = match Backend::open(&desc) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("failed to open camera: {}", e);
-                    state_clone.store(CaptureState::Dead);
-                    return;
-                }
-            };
-            state_clone.store(CaptureState::Live);
-
-            let fmt = session.negotiated();
-            log::info!("capture stream opened, format: {:?}", fmt);
-
-            let width = fmt.resolution.width;
-            let height = fmt.resolution.height;
-            // The camera may open at a higher frame rate than requested
-            // (e.g. 60 fps when 30 was asked for). Keep the negotiated
-            // stream as-is and drop excess frames in the DVR sink so
-            // recording runs at the requested rate; live view is not
-            // throttled.
-            let mut ui_sink = LatestSink {
-                slot: slot_clone,
-                on_frame: Arc::new(on_frame),
-            };
-            let mut dvr_sink = DvrSink::new(matched.frame_rate, fmt, record_clone);
-
-            // Для определения ошибки захвата используем не счётчик,
-            // потому что frame() может виснуть на несколько секунд,
-            // поэтому критерий — время без единого кадра.
-            let mut errors_since: Option<Instant> = None;
-            // Capture-Backendside rate: tells a slow camera from a slow UI
-            // (ui_latency is measured on the egui side; a latest-wins
-            // slot masks slow consumption as slow capture).
-            let capture_t0 = Instant::now();
-            let mut capture_frames = 0u32;
-            // Интервалы между кадрами по их timestamp (драйверные, если
-            // бэкенд их отдаёт) — точный замер кадровой частоты источника
-            // без джиттера dequeue/планировщика.
-            let mut frame_interval = fps::FrameStats::default();
-            let mut last_timestamp: Option<Instant> = None;
-            // Длительности фаз декода (не латентность от начала кадра):
-            // по одному декоду на кадр, формат известен до вызова.
-            let mut decode_jpeg = fps::FrameStats::default();
-            let mut decode_yuyv = fps::FrameStats::default();
-
-            loop {
-                if !running_clone.load(Ordering::Relaxed) {
-                    log::info!("capture thread stopping");
-                    break;
-                }
-
-                // Команды записи применяем между кадрами: dequeue
-                // блокирует до ~периода кадра, задержка незаметна.
-                for cmd in commands_rx.try_iter() {
-                    match cmd {
-                        RecordCommand::StartRecording(params) => dvr_sink.start(&params),
-                        RecordCommand::StopRecording => dvr_sink.stop(),
-                    }
-                }
-
-                let frame = match session.frame() {
-                    Ok(frame) => {
-                        errors_since = None;
-                        capture_frames += 1;
-                        if let Some(prev) = last_timestamp {
-                            frame_interval.on_process(frame.timestamp - prev);
-                        }
-                        last_timestamp = Some(frame.timestamp);
-                        frame
-                    }
-                    Err(FrameError::Recoverable(e)) => {
-                        let since = errors_since.get_or_insert_with(Instant::now);
-                        if since.elapsed() >= Duration::from_secs(1) {
-                            log::error!("camera lost: no frames for 1s ({}), stopping", e);
-                            break;
-                        }
-                        log::warn!("frame capture error: {}", e);
-                        // backoff: ошибка возвращается немедленно, без sleep
-                        // был бы busy-loop по ioctl.
-                        thread::sleep(Duration::from_millis(16));
-                        continue;
-                    }
-                    Err(FrameError::Unrecoverable(e)) => {
-                        log::error!("camera lost: {}, stopping", e);
-                        break;
-                    }
-                };
-
-                if !dispatch_frame(
-                    frame,
-                    width,
-                    height,
-                    &mut dvr_sink,
-                    &mut ui_sink,
-                    &mut decode_jpeg,
-                    &mut decode_yuyv,
-                ) {
-                    break;
-                }
-            }
-
-            // Поток умирает (штатный стоп или потеря камеры) — гасим CAM,
-            // иначе индикатор висит белым на мёртвой картинке. REC гаснет
-            // сам: writer-поток — единственный владелец RecordState.
-            state_clone.store(CaptureState::Dead);
-
-            // Recorder дропается здесь (через on_stop sink'а): файл
-            // финализируется в фоновом writer-потоке. Session дропается
-            // здесь: Drop бэкенда делает stop_stream.
-            dvr_sink.on_stop();
-            ui_sink.on_stop();
-            drop(dvr_sink);
-            drop(ui_sink);
-
-            // Capture-side session rate: if this is ~60 fps, whatever the
-            // UI-side stats say, the camera is not the bottleneck.
-            let capture_elapsed = capture_t0.elapsed();
-            log::info!(
-                "live: camera frames received: {} in {:?} -> {:.1} fps",
-                capture_frames,
-                capture_elapsed,
-                capture_frames as f32 / capture_elapsed.as_secs_f32().max(0.001)
-            );
-            // Интервалы между кадрами по timestamp'ам источника — точный
-            // замер кадровой частоты без джиттера dequeue/планировщика.
-            if let Some(stats) = frame_interval.snapshot() {
-                log::info!("live: camera frame interval: {stats}");
-            }
-            // Один лог на сеанс: мин/среднее/макс/p90 латентности
-            // «захват → кадр отрисован» (замер на выходе, в рисовалке).
-            if let Some(stats) = ui_latency_thread.lock().unwrap().snapshot() {
-                log::info!("live: frame-to-display latency: {stats}");
-            }
-            for (phase, stats) in [
-                ("jpeg→rgba decode", &mut decode_jpeg),
-                ("yuyv→rgba decode", &mut decode_yuyv),
-            ] {
-                if let Some(s) = stats.snapshot() {
-                    log::info!("live: {phase} duration: {s}");
-                }
-            }
-        });
-
-        Self {
-            slot,
-            texture: None,
-            running,
-            thread: Some(thread),
-            camera: state,
-            record,
-            commands: commands_tx,
-            ui_latency,
-        }
-    }
-
     /// Забрать новый кадр из слота, если есть, и обновить текстуру.
-    /// Второй элемент tuple — true, если кадр реально забран (один за
-    /// коллбэк): UI по нему считает показываемый fps.
-    pub fn update(&mut self, ctx: &egui::Context) -> (Option<&egui::TextureHandle>, bool) {
+    /// true — из слота забран новый кадр.
+    pub fn update_frame(&mut self) -> bool {
         let image = {
             let mut guard = self.slot.lock().unwrap();
             guard.take()
         };
-        let new_frame = image.is_some();
+        let fresh = image.is_some();
 
         if let Some(frame) = image {
             let FrameData::Rgba { rgba } = &frame.data else {
                 unreachable!("ui slot holds only RGBA frames");
             };
-            match &mut self.texture {
-                Some(texture) => {
-                    texture.set((*rgba).clone(), egui::TextureOptions::NEAREST);
-                }
-                None => {
-                    self.texture = Some(ctx.load_texture(
-                        "camera",
-                        (*rgba).clone(),
-                        egui::TextureOptions::NEAREST,
-                    ));
-                }
-            }
+            self.texture
+                .set((*rgba).clone(), egui::TextureOptions::NEAREST);
             // Замер латентности на выходе: кадр реально отдан в текстуру.
             self.ui_latency.lock().unwrap().on_frame(&frame);
         }
 
-        (self.texture.as_ref(), new_frame)
+        fresh
+    }
+
+    /// Текстура последнего кадра. Id стабилен с open(): 1×1-пустышка,
+    /// первый кадр расширяет. Валидна, пока жива Camera.
+    pub fn texture(&self) -> egui::TextureId {
+        self.texture.id()
     }
 }
+
+/// Тело capture-потока: перебор устройств, открытие сессии, цикл
+/// захвата. Живёт в отдельном потоке (io + ожидание кадров),
+/// потому без self: хендлы получает по значению.
+fn capture_loop(
+    desc: CameraConfig,
+    slot: ImageSlot,
+    capture_state: SharedCaptureState,
+    record_state: SharedRecordState,
+    running: Arc<AtomicBool>,
+    commands_rx: crossbeam_channel::Receiver<RecordCommand>,
+    ui_latency: Arc<Mutex<fps::FrameStats>>,
+    on_frame: impl Fn() + Send + Sync + 'static,
+) {
+    let (mut session, matched) = match open_session(&desc) {
+        Ok(opened) => opened,
+        Err(_already_logged) => {
+            capture_state.store(CaptureState::Dead);
+            return;
+        }
+    };
+    let fmt = session.negotiated();
+    log::info!("capture stream opened, format: {:?}", fmt);
+
+    let width = fmt.resolution.width;
+    let height = fmt.resolution.height;
+    // The camera may open at a higher frame rate than requested
+    // (e.g. 60 fps when 30 was asked for). Keep the negotiated
+    // stream as-is and drop excess frames in the DVR sink so
+    // recording runs at the requested rate; live view is not
+    // throttled.
+    let mut ui_sink = LatestSink {
+        slot,
+        on_frame: Arc::new(on_frame),
+    };
+    let mut dvr_sink = DvrSink::new(matched.frame_rate, fmt, record_state);
+
+    let mut errors_since: Option<Instant> = None;
+    let mut first_frame = true;
+    let capture_t0 = Instant::now();
+    let mut capture_frames = 0u32;
+    let mut frame_interval = fps::FrameStats::default();
+    let mut last_timestamp: Option<Instant> = None;
+    let mut decode_jpeg = fps::FrameStats::default();
+    let mut decode_yuyv = fps::FrameStats::default();
+
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            log::info!("capture thread stopping");
+            break;
+        }
+
+        // Команды записи применяем между кадрами: dequeue
+        // блокирует до ~периода кадра, задержка незаметна.
+        for cmd in commands_rx.try_iter() {
+            match cmd {
+                RecordCommand::StartRecording(params) => dvr_sink.start(&params),
+                RecordCommand::StopRecording => dvr_sink.stop(),
+            }
+        }
+
+        let frame = match session.frame() {
+            Ok(frame) => {
+                errors_since = None;
+                capture_frames += 1;
+                if let Some(prev) = last_timestamp {
+                    frame_interval.on_process(frame.timestamp - prev);
+                }
+                last_timestamp = Some(frame.timestamp);
+                frame
+            }
+            Err(FrameError::Recoverable(e)) => {
+                let since = errors_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(1) {
+                    log::error!("camera lost: no frames for 1s ({}), stopping", e);
+                    break;
+                }
+                log::warn!("frame capture error: {}", e);
+                // backoff: ошибка возвращается немедленно, без sleep
+                // был бы busy-loop по ioctl.
+                thread::sleep(Duration::from_millis(16));
+                continue;
+            }
+            Err(FrameError::Unrecoverable(e)) => {
+                log::error!("camera lost: {}, stopping", e);
+                break;
+            }
+        };
+
+        if !dispatch_frame(
+            frame,
+            width,
+            height,
+            &mut dvr_sink,
+            &mut ui_sink,
+            &mut decode_jpeg,
+            &mut decode_yuyv,
+        ) {
+            break;
+        }
+        // Live — когда первый кадр реально пошёл, а не когда
+        // открылось устройство: до первого кадра UI показывает
+        // testcard (Starting), чёрного кадра нет по построению.
+        if first_frame {
+            first_frame = false;
+            capture_state.store(CaptureState::Live);
+        }
+    }
+
+    // Поток умирает (штатный стоп или потеря камеры) — гасим CAM,
+    // иначе индикатор висит белым на мёртвой картинке. REC гаснет
+    // сам: writer-поток — единственный владелец RecordState.
+    capture_state.store(CaptureState::Dead);
+
+    // Recorder дропается здесь (через on_stop sink'а): файл
+    // финализируется в фоновом writer-потоке. Session дропается
+    // здесь: Drop бэкенда делает stop_stream.
+    dvr_sink.on_stop();
+    ui_sink.on_stop();
+    drop(dvr_sink);
+    drop(ui_sink);
+
+    log_session_stats(
+        &ui_latency,
+        capture_t0,
+        capture_frames,
+        &mut frame_interval,
+        &mut decode_jpeg,
+        &mut decode_yuyv,
+    );
+}
+
+/// Открыть сессию или объяснить почему не вышло (перечисление
+/// устройств, поиск формата, открытие потока). Контекст ошибки логает
+/// здесь, на месте; решение «что делать» — за вызывающим.
+fn open_session(desc: &CameraConfig) -> Result<(impl CaptureSession, CaptureFormat), Error> {
+    // Перебор устройств и форматов — io, не должно висеть на UI-потоке.
+    let devices = Backend::list_devices().map_err(|e| {
+        log::error!("failed to list devices: {e}");
+        e
+    })?;
+
+    let (name, matched) = devices
+        .into_iter()
+        .find_map(|dev| {
+            dev.formats
+                .into_iter()
+                .find(|f| {
+                    desc.matches(
+                        &dev.name,
+                        f.resolution.width,
+                        f.resolution.height,
+                        f.frame_rate.0,
+                        f.format.as_str(),
+                    )
+                })
+                .map(|f| (dev.name, f))
+        })
+        .ok_or_else(|| {
+            let e = Error::Config(format!("no matching camera format for {desc}"));
+            log::error!("{e}");
+            e
+        })?;
+
+    log::info!("starting capture from {} at {:?}", name, matched);
+
+    // open резолвит устройство по имени заново (P5): между
+    // перечислением и открытием камеру могли переткнуть.
+    let session = Backend::open(desc).map_err(|e| {
+        log::error!("failed to open camera: {e}");
+        e
+    })?;
+    Ok((session, matched))
+}
+
+/// Отчёт об остановленном сеансе: частота захвата, интервалы между
+/// кадрами, латентность «захват → экран», длительности декода.
+#[allow(clippy::too_many_arguments)]
+fn log_session_stats(
+    ui_latency: &Arc<Mutex<fps::FrameStats>>,
+    capture_t0: Instant,
+    capture_frames: u32,
+    frame_interval: &mut fps::FrameStats,
+    decode_jpeg: &mut fps::FrameStats,
+    decode_yuyv: &mut fps::FrameStats,
+) {
+    let elapsed = capture_t0.elapsed();
+    log::info!(
+        "live: camera frames received: {} in {:?} -> {:.1} fps",
+        capture_frames,
+        elapsed,
+        capture_frames as f32 / elapsed.as_secs_f32().max(0.001)
+    );
+    if let Some(s) = frame_interval.snapshot() {
+        log::info!("live: camera frame interval: {s}");
+    }
+    if let Some(s) = ui_latency.lock().unwrap().snapshot() {
+        log::info!("live: frame-to-display latency: {s}");
+    }
+    if let Some(s) = decode_jpeg.snapshot() {
+        log::info!("live: jpeg→rgba decode duration: {s}");
+    }
+    if let Some(s) = decode_yuyv.snapshot() {
+        log::info!("live: yuyv→rgba decode duration: {s}");
+    }
+}
+
 
 /// Конверсия + fan-out по подпискам sink'ов (P3/P4). Единственный декод
 /// на кадр: Jpeg → RGBA для UI, Yuyv → RGBA для обоих sink'ов. Вынесено

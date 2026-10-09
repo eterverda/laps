@@ -49,6 +49,8 @@ pub struct Scrub {
     players: HashMap<String, Player>,
     shown: FpsCounter,
     shown_fps: f32,
+    /// Кнопка мыши на таймлайне зажата (на прошлом кадре).
+    timeline_down: bool,
     header: header::Header,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
@@ -80,6 +82,7 @@ impl Scrub {
             players,
             shown: FpsCounter::default(),
             shown_fps: 0.0,
+            timeline_down: false,
             header: header::Header::new(),
             setup,
             assignments,
@@ -225,26 +228,7 @@ impl Scrub {
                 {
                     action = Action::TogglePlay;
                 }
-                // Позиция первичного плеера, крупно: мм:сс.ммм.
-                if let Some(pos) = self.primary().map(Player::position_ms) {
-                    let pos_text = format!(
-                        "{:02}:{:02}.{:03}",
-                        pos / 60_000,
-                        (pos / 1_000) % 60,
-                        pos % 1_000
-                    );
-                    ui.painter().text(
-                        play_rect
-                            .right_center()
-                            .into_cell()
-                            .translate(2, 0)
-                            .to_pos2(),
-                        egui::Align2::LEFT_CENTER,
-                        pos_text,
-                        style::FONT_REGULAR_X2,
-                        egui::Color32::WHITE,
-                    );
-                }
+                self.show_timeline(ui, play_rect, bottom_right);
 
                 guidelines::dashed_line(
                     ui,
@@ -269,11 +253,110 @@ impl Scrub {
         }
     }
 
+    /// Нижняя строка scrub: позиция первичного плеера крупно (мм:сс.ммм),
+    /// таймлайн до правого края с кружком позиции. Захват мышью — hold
+    /// (не пауза: playing сохраняется), клик и таскание перематывают
+    /// все плееры по временной шкале.
+    fn show_timeline(
+        &mut self,
+        ui: &mut egui::Ui,
+        play_rect: egui::Rect,
+        bottom_right: grid::Cell,
+    ) {
+        let Some((pos, dur)) = self
+            .primary()
+            .map(|player| (player.position_ms(), player.duration_ms()))
+        else {
+            return;
+        };
+        let pos_text = format!(
+            "{:02}:{:02}.{:03}",
+            pos / 60_000,
+            (pos / 1_000) % 60,
+            pos % 1_000
+        );
+        let text_pos = play_rect
+            .right_center()
+            .into_cell()
+            .translate(2, 0)
+            .to_pos2();
+        ui.painter().text(
+            text_pos,
+            egui::Align2::LEFT_CENTER,
+            &pos_text,
+            style::FONT_REGULAR_X2,
+            egui::Color32::WHITE,
+        );
+        let x0 = text_pos.x + view::content_width(ui.ctx(), &pos_text, "") + grid::cell_x(3);
+        let x1 = grid::cell_x(bottom_right.col - 3);
+        let y = play_rect.center().y;
+        ui.painter().line_segment(
+            [egui::pos2(x0, y), egui::pos2(x1, y)],
+            egui::Stroke::new(2.0, egui::Color32::from_gray(96)),
+        );
+        let frac = if dur > 0 {
+            pos as f32 / dur as f32
+        } else {
+            0.0
+        };
+        ui.painter().circle(
+            egui::pos2(x0 + (x1 - x0) * frac, y),
+            grid::CELL_SIZE.y * 0.24,
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        );
+        let timeline_rect = egui::Rect::from_center_size(
+            egui::pos2((x0 + x1) / 2.0, y),
+            egui::vec2(x1 - x0, grid::CELL_SIZE.y),
+        );
+        let response = ui.interact(
+            timeline_rect,
+            ui.make_persistent_id("scrub_timeline"),
+            egui::Sense::click_and_drag(),
+        );
+        if response.hovered() || response.is_pointer_button_down_on() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // Факт нажатия отслеживаем вручную: у egui на драг есть порог
+        // движения, а тап может уложиться в один фрейм — тогда виден
+        // только clicked().
+        let down = response.is_pointer_button_down_on();
+        if down && !self.timeline_down {
+            for player in self.players.values_mut() {
+                player.set_held(true);
+            }
+        }
+        // Позиция указателя: пока зажато — interact_pointer_pos, клик —
+        // hover_pos.
+        let pointer = response.interact_pointer_pos().or_else(|| {
+            if response.clicked() {
+                response.hover_pos()
+            } else {
+                None
+            }
+        });
+        if let Some(pointer) = pointer {
+            let t = (((pointer.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * dur as f32) as u64;
+            for player in self.players.values_mut() {
+                if let Err(e) = player.seek_ms(t) {
+                    log::error!("player: {e}");
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+        if !down && self.timeline_down {
+            for player in self.players.values_mut() {
+                player.set_held(false);
+            }
+        }
+        self.timeline_down = down;
+    }
+
     /// Команда удалённого управления. Some — обработана; None — не моя,
     /// App ответит unknown.
     pub fn handle_remote(&mut self, command: &[String]) -> Option<crate::remote::Response> {
         match command.first()?.as_str() {
-            "play" => {
+            "toggle-play" => {
                 if command.len() > 1 {
                     return Some(crate::remote::Response {
                         message: "play takes no arguments".to_owned(),

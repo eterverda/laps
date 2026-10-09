@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::driver::camera::decode::decode_pixels_mjpeg_into;
 use crate::driver::camera::fps::FrameStats;
-use crate::driver::dvr::{open_reader, VideoReader};
+use crate::driver::dvr::{VideoReader, open_reader};
 
 /// Отставание от графика больше этого — не догоняем серией кадров,
 /// а перепривязываем часы (резко, честно).
@@ -37,6 +37,8 @@ pub struct Player {
     cursor: usize,
     shown_idx: usize,
     playing: bool,
+    /// Захват шкалы мышью: само по себе не играет, playing сохраняется.
+    held: bool,
     /// (момент старта, pts на экране на тот момент) — часы воспроизведения.
     anchor: Option<(Instant, u64)>,
     /// Показано кадров за сеанс воспроизведения (лог на паузе).
@@ -55,7 +57,9 @@ impl Player {
     pub fn open(path: &Path, ctx: egui::Context) -> io::Result<Self> {
         let reader = open_reader(path)?;
         let dims = reader.resolution();
-        let pts: Vec<u64> = (0..reader.frame_count()).map(|i| reader.timestamp(i)).collect();
+        let pts: Vec<u64> = (0..reader.frame_count())
+            .map(|i| reader.timestamp(i))
+            .collect();
         let jpeg = vec![0u8; reader.max_frame_len()];
         let image = Arc::new(egui::ColorImage::new(
             [dims.width as usize, dims.height as usize],
@@ -79,6 +83,7 @@ impl Player {
             cursor: 0,
             shown_idx: 0,
             playing: false,
+            held: false,
             anchor: None,
             presented: 0,
             presented_t0: Instant::now(),
@@ -101,8 +106,7 @@ impl Player {
             self.playing = true;
             self.presented = 0;
             self.presented_t0 = Instant::now();
-            self.anchor = Some((Instant::now(), self.pts[self.shown_idx]));
-            self.ctx.request_repaint();
+            self.reanchor();
         }
     }
 
@@ -141,9 +145,47 @@ impl Player {
         self.playing
     }
 
+    /// Захват шкалы: пока держат — сам не играет (это не пауза: playing
+    /// сохраняется), отпускание продолжает с показанного кадра.
+    pub fn set_held(&mut self, held: bool) {
+        if self.held == held {
+            return;
+        }
+        self.held = held;
+        if !held && self.playing {
+            self.reanchor();
+        }
+    }
+
+    /// Перемотка на время t (мс от начала): показывается последний кадр
+    /// с pts <= t. При игре часы перепривязываются к показанному (пока
+    /// стоит hold — не нужно: перепривяжем по отпусканию).
+    pub fn seek_ms(&mut self, t: u64) -> io::Result<()> {
+        let mut next = self.pts.partition_point(|&p| p <= t);
+        if next == 0 {
+            next = 1;
+        }
+        let i = (next - 1).min(self.pts.len().saturating_sub(1));
+        if i == self.shown_idx {
+            return Ok(());
+        }
+        self.read_and_present(i)?;
+        self.shown_idx = i;
+        self.cursor = (i + 1).min(self.pts.len());
+        if self.playing && !self.held {
+            self.reanchor();
+        }
+        Ok(())
+    }
+
     /// Позиция в файле: pts кадра на экране, мс от начала.
     pub fn position_ms(&self) -> u64 {
         self.pts[self.shown_idx]
+    }
+
+    /// Общая длительность: pts последнего кадра, мс.
+    pub fn duration_ms(&self) -> u64 {
+        self.pts.last().copied().unwrap_or(0)
     }
 
     /// Текстура последнего кадра. Id стабилен с open().
@@ -154,10 +196,14 @@ impl Player {
     /// Один проход: показывает не больше одного кадра — следующий, если
     /// его дедлайн наступил. true — на экране новый кадр (fps-замер).
     pub fn update_frame(&mut self) -> io::Result<bool> {
+        if self.held {
+            return Ok(false);
+        }
         let Some((wall, base_pts)) = self.anchor else {
             return Ok(false);
         };
         if self.cursor >= self.pts.len() {
+            self.pause(); // конец файла — стоп-кадр
             return Ok(false);
         }
         let now_pts = base_pts + wall.elapsed().as_millis() as u64;
@@ -191,6 +237,12 @@ impl Player {
             self.ctx.request_repaint_after(Duration::from_millis(wait));
         }
         Ok(true)
+    }
+
+    /// Часы воспроизведения заново от показанного кадра.
+    fn reanchor(&mut self) {
+        self.anchor = Some((Instant::now(), self.pts[self.shown_idx]));
+        self.ctx.request_repaint();
     }
 
     /// Кадр i: read в постоянный JPEG-буфер, декод in-place в image.

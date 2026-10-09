@@ -146,8 +146,14 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 - `read_frame_into` per frame (no streaming pipeline), **zune-jpeg** decode
   of a single frame; scrubbing = index lookup + one JPEG decode (~5 ms);
   every MJPEG frame is a keyframe, no GOP rewinds
-- Player (`driver/player/`): container timestamps are the clock, no
-  resampling; frame-accurate `seek_ms`; playback-tested at 30 fps FullHD
+- Player (`driver/player/`): facade mirrors `Camera` — io and the playback
+  clock live in a worker thread (free function, like `capture_loop`), the
+  facade holds texture, frame slot, state atomics and a command channel.
+  Opening is async: `open()` returns immediately, index + first frame are
+  built in the thread (`OpenState::Opening(phase)/Ready/Failed`); commands
+  sent before readiness wait in the channel queue. Container timestamps
+  are the clock, no resampling; frame-accurate `seek`; playback-tested at
+  30 fps FullHD
 
 ## Configuration
 

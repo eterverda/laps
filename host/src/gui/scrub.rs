@@ -19,7 +19,7 @@ use super::view;
 use super::viewfinder;
 use crate::config::setup::Setup;
 use crate::driver::camera::fps::FpsCounter;
-use crate::driver::player::Player;
+use crate::driver::player::{OpenState, Player};
 use crate::model::pilot::Pilot;
 
 const GRID_WIDTH: isize = 160;
@@ -75,12 +75,9 @@ impl Scrub {
             let Some(path) = latest_capture(&captures, camera_id) else {
                 continue;
             };
-            match Player::open(&path, ctx.clone()) {
-                Ok(player) => {
-                    players.insert(camera_id.clone(), player);
-                }
-                Err(e) => log::error!("player: {}: {e}", path.display()),
-            }
+            // open асинхронный: фасад всегда возвращается, ошибки файла
+            // придут в OpenState::Failed (viewport останется пустым).
+            players.insert(camera_id.clone(), Player::open(&path, ctx.clone()));
         }
         Self {
             players,
@@ -123,21 +120,15 @@ impl Scrub {
             .find(|id| self.players.contains_key(*id))
             .cloned();
         for (id, player) in self.players.iter_mut() {
-            let fresh = match player.update_frame() {
-                Ok(fresh) => fresh,
-                Err(e) => {
-                    log::error!("player: {e}");
-                    player.pause();
-                    false
-                }
-            };
-            if fresh && Some(id) == primary_id.as_ref() {
+            if player.update_frame() && Some(id) == primary_id.as_ref() {
                 self.shown.on_frame();
             }
-            contents.insert(
-                id.clone(),
-                viewfinder::ViewfinderContents::Texture(player.texture()),
-            );
+            // До готовности — testcard, как у камеры в Starting.
+            let kind = match player.open_state() {
+                OpenState::Ready => viewfinder::ViewfinderContents::Texture(player.texture()),
+                _ => viewfinder::ViewfinderContents::Pending,
+            };
+            contents.insert(id.clone(), kind);
         }
         if let Some(fps) = self.shown.fps() {
             self.shown_fps = fps as f32;
@@ -267,23 +258,35 @@ impl Scrub {
         play_rect: egui::Rect,
         bottom_right: grid::Cell,
     ) {
-        let Some((pos, dur)) = self
-            .primary()
-            .map(|player| (player.position_ms(), player.duration_ms()))
-        else {
+        let Some(primary) = self.primary() else {
             return;
         };
+        let text_pos = play_rect
+            .right_center()
+            .into_cell()
+            .translate(2, 0)
+            .to_pos2();
+        // Провал открытия — единственный особый случай; иначе рисуем
+        // время как есть (при загрузке это 00:00.000), таймлайн —
+        // только у готового плеера.
+        if let OpenState::Failed(msg) = primary.open_state() {
+            ui.painter().text(
+                text_pos,
+                egui::Align2::LEFT_CENTER,
+                format!("OPEN FAILED: {:.40}", msg),
+                style::FONT_REGULAR_X2,
+                egui::Color32::LIGHT_RED,
+            );
+            return;
+        }
+        let ready = primary.open_state() == OpenState::Ready;
+        let (pos, dur) = (primary.position_ms(), primary.duration_ms());
         let pos_text = format!(
             "{:02}:{:02}.{:03}",
             pos / 60_000,
             (pos / 1_000) % 60,
             pos % 1_000
         );
-        let text_pos = play_rect
-            .right_center()
-            .into_cell()
-            .translate(2, 0)
-            .to_pos2();
         ui.painter().text(
             text_pos,
             egui::Align2::LEFT_CENTER,
@@ -291,6 +294,9 @@ impl Scrub {
             style::FONT_REGULAR_X2,
             egui::Color32::WHITE,
         );
+        if !ready {
+            return;
+        }
         let x0 = text_pos.x + view::content_width(ui.ctx(), &pos_text, "") + grid::cell_x(3);
         let x1 = grid::cell_x(bottom_right.col - 3);
         let y = play_rect.center().y;
@@ -326,7 +332,7 @@ impl Scrub {
         // только clicked().
         let down = response.is_pointer_button_down_on();
         if down && !self.timeline_down {
-            for player in self.players.values_mut() {
+            for player in self.players.values() {
                 player.set_held(true);
             }
         }
@@ -341,15 +347,14 @@ impl Scrub {
         });
         if let Some(pointer) = pointer {
             let t = (((pointer.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * dur as f32) as u64;
-            for player in self.players.values_mut() {
-                if let Err(e) = player.seek_ms(t) {
-                    log::error!("player: {e}");
-                }
+            // Команды ждут готовности в очереди worker'а — прозрачно.
+            for player in self.players.values() {
+                player.seek(t);
             }
             ui.ctx().request_repaint();
         }
         if !down && self.timeline_down {
-            for player in self.players.values_mut() {
+            for player in self.players.values() {
                 player.set_held(false);
             }
         }

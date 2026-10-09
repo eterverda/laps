@@ -1,21 +1,25 @@
-//! MKV-муксер (Matroska/EBML) для одного видеопотока.
+//! MKV (Matroska/EBML) для одного видеопотока: писатель и ридер.
 //! Кадры — MJPEG в SimpleBlock (все ключевые), таймкоды — реальные,
-//! миллисекундные (TimecodeScale = 1 мс), поэтому fps на входе не нужен:
-//! переменный frame rate отражается честно. Лимита размера файла, вроде
-//! 4 ГиБ у RIFF, нет. Файл живой до finalize() (патчим размеры
-//! Segment/Cluster, SeekHead и Duration), живучесть к крашу —
-//! через sync_data().
-
+//! TimecodeScale = 1 мс. Ридер — зеркало писателя: индексирует файл при
+//! open и читает кадры seek+read в буфер вызывающего.
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Seek, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use super::VideoWriter;
+use super::{Resolution, VideoWriter};
 
 /// Кластеры режем по таймкодам: внутри кластера SimpleBlock хранит
 /// относительный i16-таймкод, ширина винта ограничивает относительное
 /// смещение ~32767 мс — запас 5 с ни к чему не обязывает.
+/// EBML element ids, которыми оперируют и писатель, и ридер.
+pub const EBML_HEADER_ID: u32 = 0x1A45DFA3;
+pub const SEGMENT_ID: u32 = 0x18538067;
+pub const TRACKS_ID: u32 = 0x1654AE6B;
+pub const CLUSTER_ID: u32 = 0x1F43B675;
+pub const TIMECODE_ID: u32 = 0xE7;
+pub const SIMPLE_BLOCK_ID: u32 = 0xA3;
+
 const CLUSTER_SPAN_MS: u64 = 5_000;
 
 /// Резерв под SeekHead в начале Segment: заполняем Void'ом, в finalize()
@@ -104,7 +108,7 @@ pub struct MkvWriter {
 }
 
 impl MkvWriter {
-    pub fn create(path: &Path, width: u32, height: u32) -> io::Result<Self> {
+    pub fn create(path: &Path, resolution: Resolution) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = BufWriter::new(file);
 
@@ -117,10 +121,10 @@ impl MkvWriter {
         push_text(&mut hdr, 0x4282, 2, "matroska"); // DocType
         push_u(&mut hdr, 0x4287, 2, 4); // DocTypeVersion
         push_u(&mut hdr, 0x4285, 2, 2); // DocTypeReadVersion
-        write_elem(&mut writer, 0x1A45DFA3, 4, &hdr)?; // EBML
+        write_elem(&mut writer, EBML_HEADER_ID, 4, &hdr)?; // EBML
 
         // Segment: размер — 8-байтный резерв, патч в finalize.
-        writer.write_all(&0x18538067u32.to_be_bytes())?;
+        writer.write_all(&{ SEGMENT_ID as u32 }.to_be_bytes())?;
         let segment_size_pos = writer.stream_position()?;
         writer.write_all(&vint(0, 8))?;
         let segment_data_start = writer.stream_position()?;
@@ -147,8 +151,8 @@ impl MkvWriter {
 
         // Tracks: один видеотрек, CodecID V_MJPEG, размеры кадра.
         let mut video = Vec::new();
-        push_u(&mut video, 0xB0, 1, width as u64); // PixelWidth
-        push_u(&mut video, 0xBA, 1, height as u64); // PixelHeight
+        push_u(&mut video, 0xB0, 1, resolution.width as u64); // PixelWidth
+        push_u(&mut video, 0xBA, 1, resolution.height as u64); // PixelHeight
         let mut entry = Vec::new();
         push_u(&mut entry, 0xD7, 1, 1); // TrackNumber
         push_u(&mut entry, 0x73C5, 2, 1); // TrackUID
@@ -167,7 +171,7 @@ impl MkvWriter {
         let mut tracks = Vec::new();
         push_elem(&mut tracks, 0xAE, 1, &entry); // TrackEntry
         let tracks_pos = writer.stream_position()?;
-        write_elem(&mut writer, 0x1654AE6B, 4, &tracks)?; // Tracks
+        write_elem(&mut writer, TRACKS_ID, 4, &tracks)?; // Tracks
 
         Ok(Self {
             writer,
@@ -267,7 +271,7 @@ impl VideoWriter for MkvWriter {
         let mut payload = Vec::new();
         for (seek_id, pos) in [
             (0x1549A966u32, info_rel),
-            (0x1654AE6Bu32, tracks_rel),
+            ({ TRACKS_ID as u32 }, tracks_rel),
             (0x1C53BB6Bu32, cues_pos - self.segment_data_start),
         ] {
             let mut entry = Vec::new();
@@ -299,7 +303,8 @@ impl MkvWriter {
     /// Открывает кластер с абсолютным (от первого кадра) таймкодом rel.
     fn open_cluster(&mut self, rel: u64) -> io::Result<()> {
         let cluster_pos = self.writer.stream_position()?;
-        self.writer.write_all(&0x1F43B675u32.to_be_bytes())?;
+        self.writer
+            .write_all(&{ CLUSTER_ID as u32 }.to_be_bytes())?;
         let size_pos = self.writer.stream_position()?;
         // 5-байтный size-винт: до 32 ГиБ на кластер — спан 5 с при любом
         // битрейте MJPEG укладывается с огромным запасом.
@@ -325,6 +330,242 @@ impl MkvWriter {
         }
         Ok(())
     }
+}
+
+// --- Ридер (зеркало писателя) -----------------------------------------------
+
+use std::io::{BufReader, Read, SeekFrom};
+
+/// Запись индекса: кадр в файле.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRec {
+    pub pts: u64,
+    /// Абсолютная позиция payload SimpleBlock (JPEG).
+    pub offset: u64,
+    pub len: u32,
+}
+
+/// Индексированный поток: `frame(i, buf)` читает кадр i в буфер.
+pub struct MkvReader {
+    file: File,
+    frames: Vec<FrameRec>,
+    max_frame: usize,
+    resolution: super::Resolution,
+}
+
+impl MkvReader {
+    /// Открыть файл и построить индекс: один проход по заголовкам,
+    /// payload'ы пропускаются seek'ом.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let mut r = BufReader::new(File::open(path)?);
+        let (id, size) = element_head(&mut r)?;
+        if id != EBML_HEADER_ID {
+            return Err(invalid("not an EBML file"));
+        }
+        skip(&mut r, size)?;
+        let (id, size) = element_head(&mut r)?;
+        if id != SEGMENT_ID {
+            return Err(invalid("no Segment"));
+        }
+        let segment_end = r.stream_position()?.saturating_add(size);
+
+        let mut resolution = None;
+        let mut frames = Vec::new();
+        let mut max_frame = 0usize;
+        let mut cluster_end = 0u64;
+        let mut cluster_tc = 0u64;
+        loop {
+            let head_pos = r.stream_position()?;
+            if head_pos >= segment_end {
+                break;
+            }
+            if cluster_end > 0 && head_pos >= cluster_end {
+                cluster_end = 0;
+                continue;
+            }
+            let (id, size) = element_head(&mut r)?;
+            let payload_pos = r.stream_position()?;
+            match id {
+                TRACKS_ID => {
+                    let (w, h) = parse_tracks(&mut r, size)?;
+                    resolution = Some(super::Resolution {
+                        width: w,
+                        height: h,
+                    });
+                }
+                CLUSTER_ID => cluster_end = payload_pos.saturating_add(size),
+                TIMECODE_ID if cluster_end > 0 => cluster_tc = read_uint(&mut r, size)?,
+                SIMPLE_BLOCK_ID if cluster_end > 0 => {
+                    // Головка блока: track vint, i16 от кластера, флаги —
+                    // без неё нет pts кадра.
+                    let mut head4 = [0u8; 4];
+                    r.read_exact(&mut head4)?;
+                    let rel = i16::from_be_bytes([head4[1], head4[2]]);
+                    let pts = (cluster_tc as i64 + rel as i64).max(0) as u64;
+                    let len = size.saturating_sub(4) as u32; // track vint + i16 + flags
+                    frames.push(FrameRec {
+                        pts,
+                        offset: payload_pos + 4,
+                        len,
+                    });
+                    max_frame = max_frame.max(len as usize);
+                    skip(&mut r, (size - 4).min(u64::MAX))?;
+                }
+                _ => skip(&mut r, size)?,
+            }
+        }
+        if frames.is_empty() {
+            return Err(invalid("no frames"));
+        }
+        Ok(Self {
+            file: r.into_inner(),
+            frames,
+            max_frame,
+            resolution: resolution.ok_or_else(|| invalid("no Tracks"))?,
+        })
+    }
+}
+
+impl crate::driver::dvr::VideoReader for MkvReader {
+    fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn timestamp(&self, i: usize) -> u64 {
+        self.frames[i].pts
+    }
+
+    fn max_frame_len(&self) -> usize {
+        self.max_frame
+    }
+
+    fn resolution(&self) -> super::Resolution {
+        self.resolution
+    }
+
+    fn read_frame_into(&mut self, i: usize, buf: &mut [u8]) -> io::Result<(u64, usize)> {
+        let rec = self.frames[i];
+        if buf.len() < rec.len as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mkv: frame buffer too small",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(rec.offset))?;
+        self.file.read_exact(&mut buf[..rec.len as usize])?;
+        Ok((rec.pts, rec.len as usize))
+    }
+}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("mkv: {msg}"))
+}
+
+/// Длина ID в байтах по первому установленному биту первого байта.
+fn id_len(first: u8) -> usize {
+    first.leading_zeros() as usize + 1
+}
+
+/// Прочитать EBML element head: (id, payload_size). Размер-винт
+/// «все биты единицы» (unknown) отдаём как u64::MAX.
+fn element_head(r: &mut impl Read) -> io::Result<(u32, u64)> {
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first)?;
+    let len = id_len(first[0]);
+    if len > 4 {
+        return Err(invalid("element id longer than 4 bytes"));
+    }
+    let mut id_buf = [0u8; 4];
+    id_buf[0] = first[0];
+    r.read_exact(&mut id_buf[1..len])?;
+    let id = u32::from_be_bytes(id_buf) >> (8 * (4 - len));
+    let size = read_vint(r)?;
+    Ok((id, size))
+}
+
+/// Винт: первый установленный бит — маркер, остальные биты — значение.
+fn read_vint(r: &mut impl Read) -> io::Result<u64> {
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first)?;
+    let len = id_len(first[0]);
+    let mut v = (first[0] & !(1 << (8 - len))) as u64;
+    for _ in 1..len {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b)?;
+        v = (v << 8) | b[0] as u64;
+    }
+    if v == (1u64 << (7 * len)) - 1 {
+        return Ok(u64::MAX); // unknown size
+    }
+    Ok(v)
+}
+
+/// Tracks → TrackEntry → Video → PixelWidth/PixelHeight. Границы — по
+/// позициям в потоке, не по арифметике винтов.
+fn parse_tracks(r: &mut (impl Read + Seek), size: u64) -> io::Result<(u32, u32)> {
+    let end = r.stream_position()?.saturating_add(size);
+    while r.stream_position()? < end {
+        let (id, sz) = element_head(r)?;
+        match id {
+            0xAE => {
+                if let Some(dims) = parse_track_entry(r, sz)? {
+                    return Ok(dims);
+                }
+            }
+            _ => skip(r, sz)?,
+        }
+    }
+    Err(invalid("no video track dimensions"))
+}
+
+fn parse_track_entry(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<(u32, u32)>> {
+    let end = r.stream_position()?.saturating_add(size);
+    while r.stream_position()? < end {
+        let (id, sz) = element_head(r)?;
+        if id == 0xE0 {
+            return parse_video(r, sz);
+        }
+        skip(r, sz)?;
+    }
+    Ok(None)
+}
+
+fn parse_video(r: &mut (impl Read + Seek), size: u64) -> io::Result<Option<(u32, u32)>> {
+    let end = r.stream_position()?.saturating_add(size);
+    let (mut w, mut h) = (None, None);
+    while r.stream_position()? < end {
+        let (id, sz) = element_head(r)?;
+        match id {
+            0xB0 => w = Some(read_uint(r, sz)? as u32),
+            0xBA => h = Some(read_uint(r, sz)? as u32),
+            _ => skip(r, sz)?,
+        }
+    }
+    Ok(match (w, h) {
+        (Some(w), Some(h)) => Some((w, h)),
+        _ => None,
+    })
+}
+
+fn read_uint(r: &mut impl Read, size: u64) -> io::Result<u64> {
+    let mut v = 0u64;
+    for _ in 0..size.min(8) {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b)?;
+        v = (v << 8) | b[0] as u64;
+    }
+    skip(r, size.saturating_sub(8))?;
+    Ok(v)
+}
+
+fn skip(r: &mut impl Read, mut n: u64) -> io::Result<()> {
+    while n > 0 {
+        let step = n.min(64 * 1024) as usize;
+        let mut buf = vec![0u8; step];
+        r.read_exact(&mut buf)?;
+        n -= step as u64;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -422,7 +663,7 @@ mod tests {
     fn simple_blocks(buf: &[u8], segment: &El) -> Vec<(i64, Vec<u8>)> {
         let children = parse(buf, segment.start, segment.start + segment.len);
         let mut out = Vec::new();
-        for cluster in children.iter().filter(|e| e.id == 0x1F43B675) {
+        for cluster in children.iter().filter(|e| e.id == CLUSTER_ID) {
             let tc = u_value(
                 buf,
                 find(
@@ -451,7 +692,7 @@ mod tests {
         let path = test_path("header");
         let frames = fake_frames(3);
         {
-            let mut writer = Box::new(MkvWriter::create(&path, 1920, 1080).unwrap());
+            let mut writer = Box::new(MkvWriter::create(&path, Resolution { width: 1920, height: 1080 }).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 1_000_000 + i as u64 * 33)
@@ -462,8 +703,8 @@ mod tests {
 
         let buf = std::fs::read(&path).unwrap();
         let top = parse(&buf, 0, buf.len());
-        let ebml = find(&top, 0x1A45DFA3);
-        let segment = find(&top, 0x18538067);
+        let ebml = find(&top, EBML_HEADER_ID);
+        let segment = find(&top, SEGMENT_ID);
 
         // DocType/версии из EBML-заголовка.
         let hdr_children = parse(&buf, ebml.start, ebml.start + ebml.len);
@@ -481,7 +722,7 @@ mod tests {
 
         // Tracks: CodecID и размеры.
         let seg_children = parse(&buf, segment.start, segment.start + segment.len);
-        let tracks = find(&seg_children, 0x1654AE6B);
+        let tracks = find(&seg_children, TRACKS_ID);
         let tracks_children = parse(&buf, tracks.start, tracks.start + tracks.len);
         let entry = find(&tracks_children, 0xAE);
         let entry_children = parse(&buf, entry.start, entry.start + entry.len);
@@ -523,7 +764,7 @@ mod tests {
         let path = test_path("clusters");
         let frames = fake_frames(400); // 400 * 33 мс ≈ 13 с — два переключения
         {
-            let mut writer = Box::new(MkvWriter::create(&path, 640, 480).unwrap());
+            let mut writer = Box::new(MkvWriter::create(&path, Resolution { width: 640, height: 480 }).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 5_000_000 + i as u64 * 33)
@@ -534,11 +775,11 @@ mod tests {
 
         let buf = std::fs::read(&path).unwrap();
         let top = parse(&buf, 0, buf.len());
-        let segment = find(&top, 0x18538067);
+        let segment = find(&top, SEGMENT_ID);
         let seg_children = parse(&buf, segment.start, segment.start + segment.len);
 
         // Кластеры: ≥ 3 (спан 5 с, запись ~13 с).
-        let cluster_els: Vec<&El> = seg_children.iter().filter(|e| e.id == 0x1F43B675).collect();
+        let cluster_els: Vec<&El> = seg_children.iter().filter(|e| e.id == CLUSTER_ID).collect();
         assert!(cluster_els.len() >= 3, "expected >=3 clusters");
 
         // Cues: по CuePoint на кластер, позиции указывают на реальные
@@ -553,7 +794,7 @@ mod tests {
             let rel = u_value(&buf, find(&tp_children, 0xF1)) as usize;
             let abs = segment.start + rel;
             let (id, _) = read_id(&buf, abs);
-            assert_eq!(id, 0x1F43B675, "CueClusterPosition must point at Cluster");
+            assert_eq!(id, CLUSTER_ID, "CueClusterPosition must point at Cluster");
             // Таймкод CuePoint == таймкоду кластера.
             let cluster_tc = u_value(
                 &buf,
@@ -593,17 +834,17 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let path = test_path("empty");
-        Box::new(MkvWriter::create(&path, 640, 480).unwrap())
+        Box::new(MkvWriter::create(&path, Resolution { width: 640, height: 480 }).unwrap())
             .finalize()
             .unwrap();
 
         let buf = std::fs::read(&path).unwrap();
         let top = parse(&buf, 0, buf.len());
-        let segment = find(&top, 0x18538067);
+        let segment = find(&top, SEGMENT_ID);
         let seg_children = parse(&buf, segment.start, segment.start + segment.len);
 
         // Ни кластеров, ни CuePoint'ов; Duration = 0.
-        assert!(seg_children.iter().all(|e| e.id != 0x1F43B675));
+        assert!(seg_children.iter().all(|e| e.id != CLUSTER_ID));
         let cues = find(&seg_children, 0x1C53BB6B);
         assert_eq!(cues.len, 0);
         let info = find(&seg_children, 0x1549A966);
@@ -611,5 +852,39 @@ mod tests {
         assert_eq!(f64_value(&buf, find(&info_children, 0x4489)), 0.0);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    use crate::driver::dvr::{VideoReader, VideoWriter};
+
+    /// Round-trip: наш писатель → этот ридер. Кадры — произвольные байты
+    /// (декод JPEG тут не задействован).
+    #[test]
+    fn roundtrip_with_our_writer() {
+        let dir = std::env::temp_dir().join(format!("laps-player-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.mkv");
+        let frames: Vec<(u64, Vec<u8>)> = (0..5)
+            .map(|i| (i * 40, vec![i as u8; 100 + i as usize]))
+            .collect();
+        {
+            let mut w: Box<dyn VideoWriter> = Box::new(MkvWriter::create(&path, Resolution { width: 64, height: 48 }).unwrap());
+            for (ts, data) in &frames {
+                w.write_frame(data, *ts).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let mut s = MkvReader::open(&path).unwrap();
+        assert_eq!(s.resolution().width, 64);
+        assert_eq!(s.resolution().height, 48);
+        assert_eq!(s.frame_count(), frames.len());
+        let mut buf = vec![0u8; s.max_frame_len()];
+        let got: Vec<(u64, Vec<u8>)> = (0..frames.len())
+            .map(|i| {
+                let (pts, len) = s.read_frame_into(i, &mut buf).unwrap();
+                (pts, buf[..len].to_vec())
+            })
+            .collect();
+        assert_eq!(got, frames);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

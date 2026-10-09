@@ -29,7 +29,7 @@ pub fn decode_frame(
 ) -> Result<egui::ColorImage> {
     let pixels = match frame_format {
         crate::config::camera::PixelConfig::Mjpeg => decode_pixels_mjpeg(raw, width, height)?,
-        crate::config::camera::PixelConfig::Yuyv => decode_pixeld_yuyv(raw, width, height)?,
+        crate::config::camera::PixelConfig::Yuyv => decode_pixels_yuyv(raw, width, height)?,
     };
     Ok(egui::ColorImage {
         size: [width as usize, height as usize],
@@ -38,7 +38,7 @@ pub fn decode_frame(
     })
 }
 
-fn decode_pixeld_yuyv(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::Color32>> {
+fn decode_pixels_yuyv(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::Color32>> {
     let mut pixels = bytemuck::allocation::zeroed_vec((width * height) as usize);
     let packed = yuv::YuvPackedImage {
         yuy: raw,
@@ -60,23 +60,40 @@ fn decode_pixeld_yuyv(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::C
     Ok(pixels)
 }
 
-fn decode_pixels_mjpeg(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::Color32>> {
+/// Декод MJPEG в готовый буфер (ровно width*height пикселей): без
+/// аллокации и memset — для проигрывателя с постоянной памятью.
+pub fn decode_pixels_mjpeg_into(
+    raw: &[u8],
+    width: u32,
+    height: u32,
+    pixels: &mut [egui::Color32],
+) -> Result<()> {
+    if pixels.len() != (width * height) as usize {
+        return Err(Error::Recoverable(format!(
+            "mjpeg decode buffer {} pixels, expected {}",
+            pixels.len(),
+            width * height
+        )));
+    }
     if !(raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8) {
         return Err(Error::Recoverable(
-            "MJPEG frame without JPEG SOI (FF D8) marker; \
-                     the negotiated format may not be real MJPEG"
-                .to_string(),
+            "MJPEG frame without JPEG SOI (FF D8) marker".to_string(),
         ));
     }
-    let mut pixels = bytemuck::allocation::zeroed_vec((width * height) as usize);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
         zune_jpeg::zune_core::bytestream::ZCursor::new(raw),
         zune_jpeg::zune_core::options::DecoderOptions::default()
             .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGBA),
     );
     decoder
-        .decode_into(bytemuck::cast_slice_mut(&mut pixels))
+        .decode_into(bytemuck::cast_slice_mut(pixels))
         .map_err(|e| Error::Recoverable(format!("MJPEG decode error: {e}")))?;
+    Ok(())
+}
+
+fn decode_pixels_mjpeg(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::Color32>> {
+    let mut pixels = bytemuck::allocation::zeroed_vec((width * height) as usize);
+    decode_pixels_mjpeg_into(raw, width, height, &mut pixels)?;
     Ok(pixels)
 }
 

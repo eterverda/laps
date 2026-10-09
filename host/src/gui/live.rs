@@ -14,7 +14,7 @@ const RIGHT_MARGIN: isize = 4;
 const TOP_BAR_ROWS: isize = 2;
 const BOTTOM_BAR_ROWS: isize = 2;
 
-fn viewfinder_rows(count: usize) -> isize {
+pub fn viewfinder_rows(count: usize) -> isize {
     match count {
         1 | 2 => 21,
         3 => 15,
@@ -22,7 +22,7 @@ fn viewfinder_rows(count: usize) -> isize {
     }
 }
 
-fn viewfinder_cols(count: usize) -> isize {
+pub fn viewfinder_cols(count: usize) -> isize {
     viewfinder_rows(count) * 8 / 3
 }
 

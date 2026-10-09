@@ -13,7 +13,7 @@ use std::io::{self, BufWriter, Seek, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use super::VideoWriter;
+use super::{Resolution, VideoWriter};
 
 /// Таймлайн в миллисекундах: дельты таймкодов пишем без округления.
 const TIMESCALE: u32 = 1000;
@@ -110,7 +110,7 @@ pub struct IsobmffCore {
 }
 
 impl IsobmffCore {
-    pub fn create(path: &Path, width: u32, height: u32, flavor: Flavor) -> io::Result<Self> {
+    pub fn create(path: &Path, resolution: Resolution, flavor: Flavor) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = BufWriter::new(file);
 
@@ -137,8 +137,8 @@ impl IsobmffCore {
             writer,
             mdat_size_pos,
             mdat_data_start,
-            width,
-            height,
+            width: resolution.width,
+            height: resolution.height,
             first_ts: None,
             rel_ts: Vec::new(),
             sizes: Vec::new(),
@@ -398,9 +398,9 @@ pub struct Mp4Writer {
 }
 
 impl Mp4Writer {
-    pub fn create(path: &Path, width: u32, height: u32) -> io::Result<Self> {
+    pub fn create(path: &Path, resolution: Resolution) -> io::Result<Self> {
         Ok(Self {
-            core: IsobmffCore::create(path, width, height, Flavor::Mp4)?,
+            core: IsobmffCore::create(path, resolution, Flavor::Mp4)?,
         })
     }
 }
@@ -557,7 +557,7 @@ mod tests {
         let path = test_path("roundtrip");
         let frames = fake_frames(3);
         {
-            let mut writer = Box::new(Mp4Writer::create(&path, 1920, 1080).unwrap());
+            let mut writer = Box::new(Mp4Writer::create(&path, Resolution { width: 1920, height: 1080 }).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 1_000_000 + i as u64 * 33)
@@ -632,7 +632,7 @@ mod tests {
         let rel = [0u64, 33, 67, 100, 150];
         let frames = fake_frames(rel.len());
         {
-            let mut writer = Box::new(Mp4Writer::create(&path, 640, 480).unwrap());
+            let mut writer = Box::new(Mp4Writer::create(&path, Resolution { width: 640, height: 480 }).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer.write_frame(frame, 5_000_000 + rel[i]).unwrap();
             }
@@ -659,7 +659,7 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let path = test_path("empty");
-        Box::new(Mp4Writer::create(&path, 640, 480).unwrap())
+        Box::new(Mp4Writer::create(&path, Resolution { width: 640, height: 480 }).unwrap())
             .finalize()
             .unwrap();
 

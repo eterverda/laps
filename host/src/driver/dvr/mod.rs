@@ -47,6 +47,38 @@ pub trait VideoWriter: Send {
     fn finalize(self: Box<Self>) -> io::Result<()>;
 }
 
+/// Размеры кадра записи (реэкспорт, в dvr без суффикса Config).
+pub use crate::config::camera::ResolutionConfig as Resolution;
+
+/// Видео-читалка: индексированный доступ к кадрам записи. Зеркало
+/// `VideoWriter`: `open` — у конкретных форматов, выбор формата —
+/// фабрика по расширению (`open_reader`), как у писателей match на
+/// `ContainerConfig`. Кадр читается в буфер вызывающего — постоянная
+/// память на кадр не тратится.
+pub trait VideoReader: Send {
+    /// Число кадров.
+    fn frame_count(&self) -> usize;
+    /// pts кадра i, мс от начала файла.
+    fn timestamp(&self, i: usize) -> u64;
+    /// Максимальный размер кадра — минимальная длина буфера под read_frame_into.
+    fn max_frame_len(&self) -> usize;
+    /// Размеры кадра.
+    fn resolution(&self) -> Resolution;
+    /// Кадр i в буфер (длиной ≥ max_frame_len). Возвращает (pts, байт).
+    fn read_frame_into(&mut self, i: usize, buf: &mut [u8]) -> io::Result<(u64, usize)>;
+}
+
+/// Открыть читалку по расширению файла.
+pub fn open_reader(path: &std::path::Path) -> io::Result<Box<dyn VideoReader>> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mkv") => Ok(Box::new(mkv::MkvReader::open(path)?)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported recording format: {other:?}"),
+        )),
+    }
+}
+
 /// Каталог записей по умолчанию, относительно рабочей директории.
 pub const CAPTURES_DIR: &str = "captures";
 
@@ -90,8 +122,7 @@ impl Recorder {
         let stem = format!("{}-{}-mjpeg", timestamp_prefix(), params.camera_id);
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
-        let width = negotiated.resolution.width;
-        let height = negotiated.resolution.height;
+        let resolution = negotiated.resolution;
         let extension = match params.camera.dvr.container {
             ContainerConfig::Mkv => "mkv",
             ContainerConfig::Mov => "mov",
@@ -99,9 +130,9 @@ impl Recorder {
         };
         let path = params.dir.join(format!("{stem}.{extension}"));
         let mut writer: Box<dyn VideoWriter> = match params.camera.dvr.container {
-            ContainerConfig::Mkv => Box::new(MkvWriter::create(&path, width, height)?),
-            ContainerConfig::Mov => Box::new(MovWriter::create(&path, width, height)?),
-            ContainerConfig::Mp4 => Box::new(Mp4Writer::create(&path, width, height)?),
+            ContainerConfig::Mkv => Box::new(MkvWriter::create(&path, resolution)?),
+            ContainerConfig::Mov => Box::new(MovWriter::create(&path, resolution)?),
+            ContainerConfig::Mp4 => Box::new(Mp4Writer::create(&path, resolution)?),
         };
         state.store(RecordState { ok: true, fps: 0.0 });
         let writer_path = path.clone();
@@ -140,8 +171,8 @@ impl Recorder {
                         // Кадр общий (Arc), пиксели только заимствуем.
                         let jpeg = match encode::encode_rgba_to_jpeg(
                             bytemuck::cast_slice(&rgba.pixels),
-                            width,
-                            height,
+                            resolution.width,
+                            resolution.height,
                         ) {
                             Ok(jpeg) => jpeg,
                             Err(e) => {

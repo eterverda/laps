@@ -16,7 +16,10 @@ struct Cli {
 enum Commands {
     ListCameras,
     ListInstances,
+    /// Воспроизведение последней записи из captures/.
+    Scrub,
 }
+
 
 fn setup_logging() {
     env_logger::Builder::new()
@@ -66,6 +69,17 @@ fn main() {
                 println!("Error: {}", e);
             }
         },
+        Some(Commands::Scrub) => {
+            let captures = std::path::PathBuf::from("captures");
+            let has_any = std::fs::read_dir(&captures)
+                .map(|mut d| d.any(|e| e.map(|e| e.path().extension().is_some_and(|x| x == "mkv")).unwrap_or(false)))
+                .unwrap_or(false);
+            if !has_any {
+                eprintln!("no recordings in captures/");
+                std::process::exit(1);
+            }
+            gui::run(Some(captures));
+        }
         Some(Commands::ListInstances) => {
             remote::cleanup();
             let instances = remote::discover();
@@ -77,7 +91,7 @@ fn main() {
             }
         }
         None => {
-            gui::run();
+            gui::run(None);
         }
     }
 }

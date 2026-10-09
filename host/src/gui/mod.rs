@@ -4,6 +4,7 @@ use crate::model::pilot::Pilot;
 mod grid;
 mod guidelines;
 mod header;
+mod scrub;
 mod live;
 mod menu;
 mod style;
@@ -13,6 +14,7 @@ mod viewfinder;
 enum State {
     Menu(menu::Menu),
     Live(Box<live::Live>),
+    Scrub(Box<scrub::Scrub>),
 }
 
 #[derive(Default)]
@@ -23,8 +25,15 @@ impl Navigator {
         self.0 = Some(state.into());
     }
 }
+impl From<Box<scrub::Scrub>> for State {
+    fn from(scrub: Box<scrub::Scrub>) -> Self {
+        State::Scrub(scrub)
+    }
+}
 
 struct App {
+    /// Каталог записей для scrub-режима: экран строится с плеерами.
+    scrub: Option<std::path::PathBuf>,
     remote_rx: std::sync::mpsc::Receiver<(
         Vec<String>,
         std::sync::mpsc::Sender<crate::remote::Response>,
@@ -45,7 +54,7 @@ fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, scrub: Option<std::path::PathBuf>) -> Self {
         let (remote_tx, remote_rx) = std::sync::mpsc::channel();
         // Колбэк исполнения команд: кладёт задачу в очередь GUI и будит
         // его (иначе ответ ждал бы ближайшего кадра egui), затем ждёт
@@ -87,14 +96,23 @@ impl App {
         };
         let assignments = hardcoded_assignments();
         Self {
-            state: State::Live(Box::new(live::Live::new(
-                setup.clone(),
-                assignments.clone(),
-            ))),
+            state: match &scrub {
+                Some(captures) => State::Scrub(Box::new(scrub::Scrub::new(
+                    &cc.egui_ctx,
+                    setup.clone(),
+                    assignments.clone(),
+                    captures.clone(),
+                ))),
+                None => State::Live(Box::new(live::Live::new(
+                    setup.clone(),
+                    assignments.clone(),
+                ))),
+            },
             setup,
             assignments,
             remote_rx,
             _server: server,
+            scrub,
         }
     }
 
@@ -108,6 +126,7 @@ impl App {
     ) -> crate::remote::Response {
         let response = match &mut self.state {
             State::Live(live) => live.handle_remote(ctx, command),
+            State::Scrub(scrub) => scrub.handle_remote(command),
             State::Menu(_) => None,
         };
         response.unwrap_or_else(|| {
@@ -149,13 +168,22 @@ impl eframe::App for App {
 
                 match self.state {
                     State::Menu(ref mut menu) => match menu.update(ui) {
-                        menu::Action::Start => navigator.goto(Box::new(live::Live::new(
-                            self.setup.clone(),
-                            self.assignments.clone(),
-                        ))),
+                        menu::Action::Start => match &self.scrub {
+                            Some(captures) => navigator.goto(Box::new(scrub::Scrub::new(
+                                &ctx,
+                                self.setup.clone(),
+                                self.assignments.clone(),
+                                captures.clone(),
+                            ))),
+                            None => navigator.goto(Box::new(live::Live::new(
+                                self.setup.clone(),
+                                self.assignments.clone(),
+                            ))),
+                        },
                         menu::Action::None => {}
                     },
                     State::Live(ref mut live) => live.update(ui, &mut navigator),
+                    State::Scrub(ref mut scrub) => scrub.update(ui, &mut navigator),
                 }
 
                 if let Some(state) = navigator.0 {
@@ -206,7 +234,7 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-pub fn run() {
+pub fn run(scrub: Option<std::path::PathBuf>) {
     let options = eframe::NativeOptions {
         persist_window: false,
         viewport: egui::ViewportBuilder::default()
@@ -233,7 +261,7 @@ pub fn run() {
                 o.sync_window_theme = false; // don't touch native window decorations
             });
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc)))
+            Ok(Box::new(App::new(cc, scrub)))
         }),
     )
     .unwrap();

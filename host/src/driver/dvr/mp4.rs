@@ -7,9 +7,13 @@
 //! fps на входе не нужен. Индекс для seek'а — co64+stsz+stts в moov
 //! (moov после mdat, ридер читает индекс за один проход). Файл живой до
 //! finalize() (патч largesize mdat), живучесть к крашу — через sync_data().
+//!
+//! Ридер семейства — `IsobmffReader` (MP4 и MOV читаются одним кодом,
+//! бренды ftyp для чтения не важны): зеркало писателя, читает только наши
+//! файлы — один видеотрек 'jpeg', stsc «1 сэмпл на чанк», stco или co64.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Seek, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -421,6 +425,314 @@ impl VideoWriter for Mp4Writer {
     }
 }
 
+/// Ридер ISOBMFF (MP4/MOV): индекс из moov при open, кадры — seek+read
+/// в буфер вызывающего (как `MkvReader`). Поддерживает только наши файлы:
+/// один видеотрек ('jpeg'), stsc «1 сэмпл на чанк» (sample i = chunk i),
+/// stco или co64.
+pub struct IsobmffReader {
+    file: File,
+    pts: Vec<u64>,
+    offsets: Vec<u64>,
+    sizes: Vec<u32>,
+    max_frame: usize,
+    resolution: Resolution,
+}
+
+impl IsobmffReader {
+    /// Открыть файл: moov в память (таблицы — килобайты), индекс из
+    /// stts/stsz/stco|co64.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let mut file = File::open(path)?;
+        // Топ-уровень: ftyp, mdat, moov. Пейлоады не-моov пропускаем
+        // seek'ом, moov забираем целиком.
+        let mut moov: Option<Vec<u8>> = None;
+        loop {
+            let mut hdr = [0u8; 8];
+            match file.read_exact(&mut hdr) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            let size32 = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
+            let typ: [u8; 4] = hdr[4..8].try_into().unwrap();
+            let pos = file.stream_position()?;
+            let (payload_start, payload_len, to_eof) = if size32 == 1 {
+                let mut ext = [0u8; 8];
+                file.read_exact(&mut ext)?;
+                let total = u64::from_be_bytes(ext);
+                (file.stream_position()?, total.saturating_sub(16), false)
+            } else if size32 == 0 {
+                // Бокс до конца файла.
+                (pos, file.metadata()?.len().saturating_sub(pos), true)
+            } else {
+                (pos, size32 as u64 - 8, false)
+            };
+            if &typ == b"moov" {
+                let len = usize::try_from(payload_len)
+                    .map_err(|_| invalid("moov larger than addressable memory"))?;
+                let mut buf = vec![0u8; len];
+                file.seek(SeekFrom::Start(payload_start))?;
+                file.read_exact(&mut buf)?;
+                moov = Some(buf);
+            } else {
+                file.seek(SeekFrom::Start(payload_start + payload_len))?;
+            }
+            if to_eof {
+                break;
+            }
+        }
+        let moov = moov.ok_or_else(|| invalid("no moov"))?;
+        let index = Self::parse_moov(&moov)?;
+        if index.pts.is_empty() {
+            return Err(invalid("no frames"));
+        }
+        let max_frame = index.sizes.iter().max().copied().unwrap_or(0) as usize;
+        Ok(Self {
+            file,
+            pts: index.pts,
+            offsets: index.offsets,
+            sizes: index.sizes,
+            max_frame,
+            resolution: index.resolution,
+        })
+    }
+
+    /// moov → таймлайн и таблицы. Только version-0 боксы (так пишем мы);
+    /// чужую разметку честно отвергаем, а не гадаем.
+    fn parse_moov(moov: &[u8]) -> io::Result<TrackIndex> {
+        let top = child_boxes(moov)?;
+        let (_, trak_start, trak_len) = find_box(&top, b"trak")?;
+        let trak = &moov[trak_start..trak_start + trak_len];
+
+        let mdia = child_boxes(trak).and_then(|b| {
+            let (_, s, l) = find_box(&b, b"mdia")?;
+            Ok(trak[s..s + l].to_vec())
+        })?;
+        // hdlr: это видеотрек? (handler_type == 'vide').
+        let mdia_boxes = child_boxes(&mdia)?;
+        let (_, hdlr_s, hdlr_l) = find_box(&mdia_boxes, b"hdlr")?;
+        if hdlr_l < 12 || &mdia[hdlr_s + 8..hdlr_s + 12] != b"vide" {
+            return Err(invalid("first track is not video"));
+        }
+        // mdhd: timescale для перевода таймлайна в миллисекунды.
+        let (_, mdhd_s, mdhd_l) = find_box(&mdia_boxes, b"mdhd")?;
+        let mdhd = &mdia[mdhd_s..mdhd_s + mdhd_l];
+        if mdhd.first().copied().unwrap_or(1) != 0 {
+            return Err(invalid("mdhd version != 0"));
+        }
+        let timescale = ru32(mdhd, 12)? as u64;
+        if timescale == 0 {
+            return Err(invalid("mdhd timescale is 0"));
+        }
+
+        let (_, minf_s, minf_l) = find_box(&mdia_boxes, b"minf")?;
+        let minf_boxes = child_boxes(&mdia[minf_s..minf_s + minf_l])?;
+        let (_, stbl_s, stbl_l) = find_box(&minf_boxes, b"stbl")?;
+        let stbl = &mdia[minf_s + stbl_s..minf_s + stbl_s + stbl_l];
+        let stbl_boxes = child_boxes(stbl)?;
+
+        // stsd: формат кадра и размеры. Берём только 'jpeg' (Photo-JPEG).
+        let (_, stsd_s, stsd_l) = find_box(&stbl_boxes, b"stsd")?;
+        let stsd = &stbl[stsd_s..stsd_s + stsd_l];
+        if ru32(stsd, 4)? != 1 {
+            return Err(invalid("stsd entry_count != 1"));
+        }
+        // Sample entry: box (size+format) + поля; width/height — u16
+        // на смещениях 24/26 от начала payload entry.
+        let entry_size = ru32(stsd, 8)? as usize;
+        if entry_size < 8 + 28 || 8 + entry_size > stsd.len() {
+            return Err(invalid("bad stsd sample entry"));
+        }
+        if &stsd[12..16] != b"jpeg" {
+            return Err(invalid("unsupported codec (not 'jpeg')"));
+        }
+        let resolution = Resolution {
+            width: ru16(stsd, 8 + 8 + 24)? as u32,
+            height: ru16(stsd, 8 + 8 + 26)? as u32,
+        };
+
+        // stsz: размеры кадров.
+        let (_, stsz_s, stsz_l) = find_box(&stbl_boxes, b"stsz")?;
+        let stsz = &stbl[stsz_s..stsz_s + stsz_l];
+        let sample_size = ru32(stsz, 4)?;
+        let n = ru32(stsz, 8)? as usize;
+        let sizes: Vec<u32> = if sample_size != 0 {
+            vec![sample_size; n]
+        } else {
+            if stsz_l < 12 + 4 * n {
+                return Err(invalid("truncated stsz"));
+            }
+            (0..n)
+                .map(|i| ru32(stsz, 12 + 4 * i))
+                .collect::<io::Result<_>>()?
+        };
+
+        // stts: (count, delta) → кумулятивные таймкоды, переводим в мс.
+        let (_, stts_s, stts_l) = find_box(&stbl_boxes, b"stts")?;
+        let stts = &stbl[stts_s..stts_s + stts_l];
+        let entries = ru32(stts, 4)? as usize;
+        if stts_l < 8 + 8 * entries {
+            return Err(invalid("truncated stts"));
+        }
+        let mut pts = Vec::with_capacity(n);
+        let mut t = 0u64;
+        for e in 0..entries {
+            let count = ru32(stts, 8 + 8 * e)? as u64;
+            let delta = ru32(stts, 12 + 8 * e)? as u64;
+            for _ in 0..count {
+                if pts.len() >= n {
+                    return Err(invalid("stts covers more samples than stsz"));
+                }
+                pts.push((t * 1000 + timescale / 2) / timescale);
+                t += delta;
+            }
+        }
+        if pts.len() != n {
+            return Err(invalid("stts covers fewer samples than stsz"));
+        }
+
+        // stsc: принимаем только «1 сэмпл на чанк» — sample i = chunk i.
+        let (_, stsc_s, stsc_l) = find_box(&stbl_boxes, b"stsc")?;
+        let stsc = &stbl[stsc_s..stsc_s + stsc_l];
+        if ru32(stsc, 4)? != 1 || ru32(stsc, 12)? != 1 {
+            return Err(invalid("unsupported stsc layout (need 1 sample per chunk)"));
+        }
+
+        // stco или co64: оффсеты чанков == оффсеты кадров.
+        let offsets: Vec<u64> = if let Ok((_, s, l)) = find_box(&stbl_boxes, b"co64") {
+            let co64 = &stbl[s..s + l];
+            if ru32(co64, 4)? as usize != n || l < 8 + 8 * n {
+                return Err(invalid("co64 count mismatch"));
+            }
+            (0..n)
+                .map(|i| ru64(co64, 8 + 8 * i))
+                .collect::<io::Result<_>>()?
+        } else {
+            let (_, s, l) = find_box(&stbl_boxes, b"stco")?;
+            let stco = &stbl[s..s + l];
+            if ru32(stco, 4)? as usize != n || l < 8 + 4 * n {
+                return Err(invalid("stco count mismatch"));
+            }
+            (0..n)
+                .map(|i| Ok(ru32(stco, 8 + 4 * i)? as u64))
+                .collect::<io::Result<_>>()?
+        };
+
+        Ok(TrackIndex {
+            pts,
+            offsets,
+            sizes,
+            resolution,
+        })
+    }
+}
+
+/// Индекс одного трека: результат разбора moov.
+struct TrackIndex {
+    pts: Vec<u64>,
+    offsets: Vec<u64>,
+    sizes: Vec<u32>,
+    resolution: Resolution,
+}
+
+impl crate::driver::dvr::VideoReader for IsobmffReader {
+    fn frame_count(&self) -> usize {
+        self.pts.len()
+    }
+
+    fn timestamp(&self, i: usize) -> u64 {
+        self.pts[i]
+    }
+
+    fn max_frame_len(&self) -> usize {
+        self.max_frame
+    }
+
+    fn resolution(&self) -> Resolution {
+        self.resolution
+    }
+
+    fn read_frame_into(&mut self, i: usize, buf: &mut [u8]) -> io::Result<(u64, usize)> {
+        let (pts, offset, len) = (self.pts[i], self.offsets[i], self.sizes[i] as usize);
+        if buf.len() < len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mp4: frame buffer too small",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(&mut buf[..len])?;
+        Ok((pts, len))
+    }
+}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("mp4: {msg}"))
+}
+
+/// Дочерние боксы payload'а: (тип, начало payload, длина payload).
+/// Границы проверяются: битый файл — ошибка, не паника.
+fn child_boxes(buf: &[u8]) -> io::Result<Vec<([u8; 4], usize, usize)>> {
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while p < buf.len() {
+        if buf.len() - p < 8 {
+            return Err(invalid("truncated box header"));
+        }
+        let size32 = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap());
+        let typ: [u8; 4] = buf[p + 4..p + 8].try_into().unwrap();
+        let (total, hdr) = if size32 == 1 {
+            if buf.len() - p < 16 {
+                return Err(invalid("truncated largesize header"));
+            }
+            (
+                u64::from_be_bytes(buf[p + 8..p + 16].try_into().unwrap()),
+                16usize,
+            )
+        } else if size32 == 0 {
+            ((buf.len() - p) as u64, 8usize)
+        } else {
+            (size32 as u64, 8usize)
+        };
+        let total = usize::try_from(total).map_err(|_| invalid("box too large"))?;
+        if total < hdr || total > buf.len() - p {
+            return Err(invalid("bad box size"));
+        }
+        out.push((typ, p + hdr, total - hdr));
+        p += total;
+    }
+    Ok(out)
+}
+
+fn find_box(
+    boxes: &[([u8; 4], usize, usize)],
+    typ: &[u8; 4],
+) -> io::Result<([u8; 4], usize, usize)> {
+    boxes
+        .iter()
+        .find(|b| &b.0 == typ)
+        .copied()
+        .ok_or_else(|| invalid(&format!("no {} box", String::from_utf8_lossy(typ))))
+}
+
+/// BE-числа из payload с проверкой границ.
+fn slice(buf: &[u8], at: usize, len: usize) -> io::Result<&[u8]> {
+    buf.get(at..at + len)
+        .ok_or_else(|| invalid("truncated box payload"))
+}
+
+fn ru32(buf: &[u8], at: usize) -> io::Result<u32> {
+    Ok(u32::from_be_bytes(slice(buf, at, 4)?.try_into().unwrap()))
+}
+
+fn ru64(buf: &[u8], at: usize) -> io::Result<u64> {
+    Ok(u64::from_be_bytes(slice(buf, at, 8)?.try_into().unwrap()))
+}
+
+fn ru16(buf: &[u8], at: usize) -> io::Result<u16> {
+    Ok(u16::from_be_bytes(slice(buf, at, 2)?.try_into().unwrap()))
+}
+
 /// Мини-парсер боксов для тестов семейства (mp4.rs, mov.rs).
 #[cfg(test)]
 pub mod boxparse {
@@ -557,7 +869,16 @@ mod tests {
         let path = test_path("roundtrip");
         let frames = fake_frames(3);
         {
-            let mut writer = Box::new(Mp4Writer::create(&path, Resolution { width: 1920, height: 1080 }).unwrap());
+            let mut writer = Box::new(
+                Mp4Writer::create(
+                    &path,
+                    Resolution {
+                        width: 1920,
+                        height: 1080,
+                    },
+                )
+                .unwrap(),
+            );
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 1_000_000 + i as u64 * 33)
@@ -608,7 +929,10 @@ mod tests {
         let p = colr_at + 8;
         assert_eq!(&buf[p..p + 4], b"nclx");
         assert_eq!(u16::from_be_bytes(buf[p + 4..p + 6].try_into().unwrap()), 6); // primaries
-        assert_eq!(u16::from_be_bytes(buf[p + 8..p + 10].try_into().unwrap()), 6); // matrix
+        assert_eq!(
+            u16::from_be_bytes(buf[p + 8..p + 10].try_into().unwrap()),
+            6
+        ); // matrix
         assert_eq!(buf[p + 10] & 0x80, 0x80); // full range
 
         // stss: все кадры ключевые, явно перечислены.
@@ -632,7 +956,16 @@ mod tests {
         let rel = [0u64, 33, 67, 100, 150];
         let frames = fake_frames(rel.len());
         {
-            let mut writer = Box::new(Mp4Writer::create(&path, Resolution { width: 640, height: 480 }).unwrap());
+            let mut writer = Box::new(
+                Mp4Writer::create(
+                    &path,
+                    Resolution {
+                        width: 640,
+                        height: 480,
+                    },
+                )
+                .unwrap(),
+            );
             for (i, frame) in frames.iter().enumerate() {
                 writer.write_frame(frame, 5_000_000 + rel[i]).unwrap();
             }
@@ -659,9 +992,18 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let path = test_path("empty");
-        Box::new(Mp4Writer::create(&path, Resolution { width: 640, height: 480 }).unwrap())
-            .finalize()
-            .unwrap();
+        Box::new(
+            Mp4Writer::create(
+                &path,
+                Resolution {
+                    width: 640,
+                    height: 480,
+                },
+            )
+            .unwrap(),
+        )
+        .finalize()
+        .unwrap();
 
         let buf = std::fs::read(&path).unwrap();
         let top = bp::parse(&buf, 0, buf.len());
@@ -682,6 +1024,103 @@ mod tests {
         let mvhd = bp::child(&buf, moov, b"mvhd");
         assert_eq!(bp::u32v(&buf, &mvhd, 16), 0);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Ридер ISOBMFF: round-trip писатель→ридер — индекс, кадры побайтово,
+    /// таймкоды, random access. Общая проверка для MP4 и MOV.
+    fn reader_roundtrip(
+        path: &std::path::Path,
+        writer: Box<dyn super::VideoWriter>,
+        frames: &[Vec<u8>],
+        rel: &[u64],
+        w: u32,
+        h: u32,
+    ) {
+        use crate::driver::dvr::VideoReader as _;
+        {
+            let mut writer = writer;
+            for (i, frame) in frames.iter().enumerate() {
+                writer.write_frame(frame, 9_000_000 + rel[i]).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+        let mut reader = super::IsobmffReader::open(path).unwrap();
+        assert_eq!(reader.frame_count(), frames.len());
+        assert_eq!(reader.resolution().width, w);
+        assert_eq!(reader.resolution().height, h);
+        assert_eq!(
+            reader.max_frame_len(),
+            frames.iter().map(|f| f.len()).max().unwrap()
+        );
+
+        // Таймкоды: единицы timescale 1000 == миллисекундам.
+        for (i, &t) in rel.iter().enumerate() {
+            assert_eq!(reader.timestamp(i), t, "pts кадра {i}");
+        }
+
+        // Кадры побайтово, вперёд и вразнобую (random access).
+        let mut buf = vec![0u8; reader.max_frame_len()];
+        let mut order: Vec<usize> = (0..frames.len()).collect();
+        order.reverse();
+        for i in order {
+            let (pts, len) = reader.read_frame_into(i, &mut buf).unwrap();
+            assert_eq!(pts, rel[i]);
+            assert_eq!(&buf[..len], frames[i].as_slice(), "кадр {i}");
+        }
+
+        // Маленький буфер — честная ошибка, не паника.
+        let mut tiny = [0u8; 4];
+        let err = reader.read_frame_into(0, &mut tiny).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_reader_roundtrip_mp4() {
+        let path = test_path("reader-mp4");
+        let rel = [0u64, 33, 67, 100, 150];
+        let frames = fake_frames(rel.len());
+        let writer = Box::new(
+            Mp4Writer::create(
+                &path,
+                Resolution {
+                    width: 640,
+                    height: 480,
+                },
+            )
+            .unwrap(),
+        );
+        reader_roundtrip(&path, writer, &frames, &rel, 640, 480);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reader_roundtrip_mov() {
+        let path =
+            std::env::temp_dir().join(format!("laps-mov-test-{}-reader.mov", std::process::id()));
+        let rel = [0u64, 40, 80];
+        let frames = fake_frames(rel.len());
+        let writer = Box::new(
+            crate::driver::dvr::mov::MovWriter::create(
+                &path,
+                Resolution {
+                    width: 1280,
+                    height: 720,
+                },
+            )
+            .unwrap(),
+        );
+        reader_roundtrip(&path, writer, &frames, &rel, 1280, 720);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_reader_rejects_foreign_file() {
+        // Не-ISOBMFF файл — ошибка, не паника.
+        let path = test_path("reader-foreign");
+        std::fs::write(&path, b"not a movie at all").unwrap();
+        let err = super::IsobmffReader::open(&path).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_file(&path).ok();
     }
 }

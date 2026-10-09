@@ -29,17 +29,21 @@ const TOP_BAR_ROWS: isize = 2;
 const BOTTOM_BAR_ROWS: isize = 2;
 const MAX_PADS: usize = 4;
 
-/// Последний по имени .mkv для камеры: `{anything}-{camera_id}-mjpeg.mkv`.
-/// Таймстамп-префикс сортируется лексикографически.
+/// Последний по имени файл записи камеры: `{anything}-{camera_id}-mjpeg`
+/// + любой из поддержанных контейнеров. Таймстамп-префикс сортируется
+/// лексикографически.
 fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
-    let suffix = format!("-{camera_id}-mjpeg.mkv");
+    let stem = format!("-{camera_id}-mjpeg.");
+    let exts = ["mkv", "mp4", "mov"];
     std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .is_some_and(|n| n.to_string_lossy().ends_with(&suffix))
+            p.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                exts.iter().any(|ext| n.ends_with(&format!("{stem}{ext}")))
+            })
         })
         .max()
 }

@@ -131,13 +131,21 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   `format_description!` — components must be bracketed (`[year]`), bare
   names emit literals
 
-## Video Playback (planned)
+## Video Playback
 
-- Own reader (mirrors writers): MKV Cues / MOV-MP4 moov tables
-  (stts/stsz/co64) parsed once into memory, `read_at` per frame (no seek),
-  **zune-jpeg** decode of a single frame
-- Scrubbing = index lookup + one JPEG decode (~5 ms); every MJPEG frame is
-  a keyframe, no GOP rewinds. Target: faster than VLC, no pipeline flush
+- **Scrub mode** (`laps scrub`): playback of the latest per-camera recording
+  from `captures/`; same header/viewfinder layout as live, PLAY button +
+  timeline with hold-to-scrub (hold ≠ pause)
+- Own readers (mirror writers): **MKV** (Cues / cluster scan, `mkv.rs`) and
+  **MOV/MP4** (ISOBMFF: stts/stsz/stco|co64 parsed once into memory,
+  `mp4.rs` `IsobmffReader` — one reader for both flavors). Readers cover
+  our own files only: single 'jpeg' video track, 1 sample per chunk,
+  version-0 boxes; foreign layout is rejected with an error, not guessed
+- `read_frame_into` per frame (no streaming pipeline), **zune-jpeg** decode
+  of a single frame; scrubbing = index lookup + one JPEG decode (~5 ms);
+  every MJPEG frame is a keyframe, no GOP rewinds
+- Player (`driver/player/`): container timestamps are the clock, no
+  resampling; frame-accurate `seek_ms`; playback-tested at 30 fps FullHD
 
 ## Configuration
 

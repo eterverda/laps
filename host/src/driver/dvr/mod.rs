@@ -72,6 +72,9 @@ pub trait VideoReader: Send {
 pub fn open_reader(path: &std::path::Path) -> io::Result<Box<dyn VideoReader>> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("mkv") => Ok(Box::new(mkv::MkvReader::open(path)?)),
+        // MP4 и MOV читаются одним ридером ISOBMFF (бренды ftyp для
+        // чтения не важны).
+        Some("mp4") | Some("mov") => Ok(Box::new(mp4::IsobmffReader::open(path)?)),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unsupported recording format: {other:?}"),
@@ -384,5 +387,99 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Recorder → mp4/mov → open_reader: контейнеры семейства ISOBMFF
+    /// читаются обратно (индекс, кадры побайтово, таймкоды). Кадры —
+    /// настоящие JPEG (как из MJPEG-потока), чтобы путь был полным.
+    #[test]
+    fn records_isobmff_and_reads_back() {
+        use super::{RecordState, SharedRecordState, open_reader};
+        use crate::config::camera::{CameraConfig, ContainerConfig, PixelConfig};
+        use crossbeam_utils::atomic::AtomicCell;
+        use std::sync::Arc;
+
+        for container in [ContainerConfig::Mp4, ContainerConfig::Mov] {
+            let dir = std::env::temp_dir().join(format!(
+                "laps-dvr-test-{}-{container:?}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
+                ok: false,
+                fps: 0.0,
+            }));
+            let mut camera = CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg);
+            camera.dvr.container = container;
+            let params = super::RecordParams {
+                dir: dir.clone(),
+                camera_id: "camera-1".to_owned(),
+                camera,
+            };
+            let negotiated = crate::driver::camera::capture::CaptureFormat {
+                resolution: crate::config::camera::ResolutionConfig {
+                    width: 64,
+                    height: 48,
+                },
+                frame_rate: crate::config::camera::FrameRateConfig(30),
+                format: PixelConfig::Mjpeg,
+            };
+            // Два разных по содержимому JPEG-кадра: читаемость проверяем
+            // побайтово.
+            let mut jpegs = Vec::new();
+            for color in [egui::Color32::BLACK, egui::Color32::WHITE] {
+                let rgba: Vec<u8> = egui::ColorImage::new([64, 48], vec![color; 64 * 48])
+                    .pixels
+                    .iter()
+                    .flat_map(|c| c.to_array())
+                    .collect();
+                jpegs.push(super::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap());
+            }
+            let base = 8_000_000u64;
+            {
+                let recorder = super::Recorder::start(&params, &negotiated, &state).unwrap();
+                for i in 0..6u64 {
+                    let jpeg = &jpegs[i as usize % 2];
+                    recorder.push(
+                        std::sync::Arc::new(crate::driver::camera::capture::Frame {
+                            timestamp: std::time::Instant::now(),
+                            data: crate::driver::camera::capture::FrameData::Jpeg {
+                                buf: jpeg.clone(),
+                                len: Some(jpeg.len()),
+                            },
+                        }),
+                        base + i * 33,
+                    );
+                }
+            } // drop: writer финализирует в фоне
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.load().ok && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            let ext = match container {
+                ContainerConfig::Mkv => "mkv",
+                ContainerConfig::Mov => "mov",
+                ContainerConfig::Mp4 => "mp4",
+            };
+            let path = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.extension().is_some_and(|e| e == ext))
+                .unwrap_or_else(|| panic!("no {ext} recording in {dir:?}"));
+            let mut reader = open_reader(&path).unwrap();
+            assert_eq!(reader.frame_count(), 6);
+            assert_eq!(reader.resolution().width, 64);
+            let mut buf = vec![0u8; reader.max_frame_len()];
+            for i in 0..6u64 {
+                let (pts, len) = reader.read_frame_into(i as usize, &mut buf).unwrap();
+                assert_eq!(pts, i * 33, "pts кадра {i}");
+                assert_eq!(&buf[..len], jpegs[i as usize % 2].as_slice(), "кадр {i}");
+            }
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

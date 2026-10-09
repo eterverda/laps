@@ -20,7 +20,6 @@ enum Commands {
     Scrub,
 }
 
-
 fn setup_logging() {
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
@@ -72,7 +71,17 @@ fn main() {
         Some(Commands::Scrub) => {
             let captures = std::path::PathBuf::from("captures");
             let has_any = std::fs::read_dir(&captures)
-                .map(|mut d| d.any(|e| e.map(|e| e.path().extension().is_some_and(|x| x == "mkv")).unwrap_or(false)))
+                .map(|mut d| {
+                    d.any(|e| {
+                        e.map(|e| {
+                            e.path()
+                                .extension()
+                                .and_then(|x| x.to_str())
+                                .is_some_and(|x| matches!(x, "mkv" | "mp4" | "mov"))
+                        })
+                        .unwrap_or(false)
+                    })
+                })
                 .unwrap_or(false);
             if !has_any {
                 eprintln!("no recordings in captures/");

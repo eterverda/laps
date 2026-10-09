@@ -7,7 +7,6 @@
 
 mod encode;
 mod mkv;
-mod mov;
 mod mp4;
 mod sink;
 
@@ -20,8 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mkv::MkvWriter;
-use mov::MovWriter;
-use mp4::Mp4Writer;
+use mp4::IsobmffWriter;
 
 use crate::config::camera::ContainerConfig;
 
@@ -134,8 +132,8 @@ impl Recorder {
         let path = params.dir.join(format!("{stem}.{extension}"));
         let mut writer: Box<dyn VideoWriter> = match params.camera.dvr.container {
             ContainerConfig::Mkv => Box::new(MkvWriter::create(&path, resolution)?),
-            ContainerConfig::Mov => Box::new(MovWriter::create(&path, resolution)?),
-            ContainerConfig::Mp4 => Box::new(Mp4Writer::create(&path, resolution)?),
+            ContainerConfig::Mov => Box::new(IsobmffWriter::create_mov(&path, resolution)?),
+            ContainerConfig::Mp4 => Box::new(IsobmffWriter::create_mp4(&path, resolution)?),
         };
         state.store(RecordState { ok: true, fps: 0.0 });
         let writer_path = path.clone();

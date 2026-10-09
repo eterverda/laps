@@ -1,16 +1,14 @@
-//! MP4-муксер (ISOBMFF) для одного MJPEG-видеопотока. Общий движок
-//! семейства: MP4/MOV — одни и те же боксы, различаются брендами ftyp
-//! (см. `Flavor`); MOV-обёртка — в `mov.rs`. Кадры — self-contained JPEG,
-//! все ключевые, stss пишем явно. Реальные миллисекундные таймкоды
-//! (timescale 1000): длительность sample k — это rel[k+1]-rel[k], последний
-//! повторяет предыдущую дельту, переменный frame rate отражается честно,
-//! fps на входе не нужен. Индекс для seek'а — co64+stsz+stts в moov
-//! (moov после mdat, ридер читает индекс за один проход). Файл живой до
-//! finalize() (патч largesize mdat), живучесть к крашу — через sync_data().
-//!
-//! Ридер семейства — `IsobmffReader` (MP4 и MOV читаются одним кодом,
-//! бренды ftyp для чтения не важны): зеркало писателя, читает только наши
-//! файлы — один видеотрек 'jpeg', stsc «1 сэмпл на чанк», stco или co64.
+//! Муксер и демуксер ISOBMFF (MP4/MOV) для одного MJPEG-видеопотока.
+//! Общий движок семейства: MP4/MOV — одни и те же боксы, различаются
+//! брендами ftyp (выбор — `IsobmffWriter::create_mp4/create_mov`); читает
+//! `IsobmffReader::open` (для чтения бренды не важны).
+//! Кадры — self-contained JPEG, все ключевые, stss пишем явно. Реальные
+//! миллисекундные таймкоды (timescale 1000): длительность sample k —
+//! это rel[k+1]-rel[k], последний повторяет предыдущую дельту, переменный
+//! frame rate отражается честно, fps на входе не нужен. Индекс для seek'а —
+//! co64+stsz+stts в moov (moov после mdat, ридер читает индекс за один
+//! проход). Файл живой до finalize() (патч largesize mdat), живучесть к
+//! крашу — через sync_data().
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -26,30 +24,6 @@ const BRAND_ISOM: [u8; 4] = *b"isom";
 const BRAND_ISO2: [u8; 4] = *b"iso2";
 const BRAND_MP41: [u8; 4] = *b"mp41";
 const BRAND_QT: [u8; 4] = *b"qt  ";
-
-/// Вариант контейнера семейства ISOBMFF: отличаются только брендами ftyp.
-#[derive(Clone, Copy)]
-pub enum Flavor {
-    Mov,
-    Mp4,
-}
-
-impl Flavor {
-    fn major_brand(self) -> [u8; 4] {
-        match self {
-            Flavor::Mov => BRAND_QT,
-            Flavor::Mp4 => BRAND_ISOM,
-        }
-    }
-
-    fn compat_brands(self) -> &'static [[u8; 4]] {
-        match self {
-            Flavor::Mov => &[BRAND_QT],
-            // major brand дублируется в compat — так принято у MP4.
-            Flavor::Mp4 => &[BRAND_ISOM, BRAND_ISO2, BRAND_MP41],
-        }
-    }
-}
 
 // --- Бинарные примитивы ------------------------------------------------------
 
@@ -93,9 +67,10 @@ const MATRIX: [u32; 9] = [
 /// 'und' — undefined language (ISO 639-2/T packed).
 const LANGUAGE_UND: u16 = 0x55C4;
 
-/// Общий движок ISOBMFF. Публичные обёртки (Mp4Writer/MovWriter) держат его
-/// и транслируют вызовы; здесь — вся логика.
-pub struct IsobmffCore {
+/// Писатель ISOBMFF (MP4/MOV): единый тип семейства, различие — только
+/// бренды ftyp. `ts_ms` — момент кадра, мс с Unix-эпохи; внутри файла —
+/// относительно первого кадра.
+pub struct IsobmffWriter {
     writer: BufWriter<File>,
     /// Позиция 8-байтного largesize mdat (патч в finalize).
     mdat_size_pos: u64,
@@ -113,19 +88,38 @@ pub struct IsobmffCore {
     offsets: Vec<u64>,
 }
 
-impl IsobmffCore {
-    pub fn create(path: &Path, resolution: Resolution, flavor: Flavor) -> io::Result<Self> {
+impl IsobmffWriter {
+    pub fn create_mp4(path: &Path, resolution: Resolution) -> io::Result<Self> {
+        // major brand дублируется в compat — так принято у MP4.
+        Self::create(
+            path,
+            resolution,
+            BRAND_ISOM,
+            &[BRAND_ISOM, BRAND_ISO2, BRAND_MP41],
+        )
+    }
+
+    pub fn create_mov(path: &Path, resolution: Resolution) -> io::Result<Self> {
+        Self::create(path, resolution, BRAND_QT, &[BRAND_QT])
+    }
+
+    /// MP4 и MOV различаются только брендами ftyp — они и есть «flavor».
+    fn create(
+        path: &Path,
+        resolution: Resolution,
+        major_brand: [u8; 4],
+        compat_brands: &[[u8; 4]],
+    ) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
         let mut writer = BufWriter::new(file);
 
         // ftyp.
-        let brands = flavor.compat_brands();
-        let payload_len = 8 + 4 * brands.len();
+        let payload_len = 8 + 4 * compat_brands.len();
         writer.write_all(&be32(payload_len as u32 + 8))?;
         writer.write_all(b"ftyp")?;
-        writer.write_all(&flavor.major_brand())?;
+        writer.write_all(&major_brand)?;
         writer.write_all(&be32(0x200))?; // minor version
-        for brand in brands {
+        for brand in compat_brands {
             writer.write_all(brand)?;
         }
 
@@ -148,42 +142,6 @@ impl IsobmffCore {
             sizes: Vec::new(),
             offsets: Vec::new(),
         })
-    }
-
-    /// Пишет кадр в mdat; ts_ms — момент кадра, мс с Unix-эпохи
-    /// (внутри — относительно первого кадра).
-    pub fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
-        let first = *self.first_ts.get_or_insert(ts_ms);
-        let rel = ts_ms.saturating_sub(first);
-        let offset = self.writer.stream_position()?;
-        self.writer.write_all(data)?;
-        self.rel_ts.push(rel);
-        self.sizes.push(data.len() as u32);
-        self.offsets.push(offset);
-        Ok(())
-    }
-
-    /// Периодический flush + sync для живучести к крашу.
-    pub fn sync_data(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_data()
-    }
-
-    /// Патчит largesize mdat, пишет moov (весь индекс — в памяти), flush +
-    /// sync_all.
-    pub fn finalize(mut self) -> io::Result<()> {
-        self.writer.flush()?;
-        let file = self.writer.get_ref();
-        let file_size = file.metadata()?.len();
-        // largesize mdat — размер всего бокса: 16-байтный заголовок + payload.
-        let mdat_start = self.mdat_data_start - 16;
-        file.write_all_at(&(file_size - mdat_start).to_be_bytes(), self.mdat_size_pos)?;
-
-        let moov = self.build_moov();
-        self.writer.write_all(&moov)?;
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
-        Ok(())
     }
 
     /// Длительность таймлайна: до последнего кадра + его дельта.
@@ -396,32 +354,41 @@ impl IsobmffCore {
     }
 }
 
-/// Писатель MP4: ftyp(isom) + mdat + moov.
-pub struct Mp4Writer {
-    core: IsobmffCore,
-}
-
-impl Mp4Writer {
-    pub fn create(path: &Path, resolution: Resolution) -> io::Result<Self> {
-        Ok(Self {
-            core: IsobmffCore::create(path, resolution, Flavor::Mp4)?,
-        })
-    }
-}
-
-impl VideoWriter for Mp4Writer {
-    /// `ts_ms` — момент кадра, мс с Unix-эпохи; внутри файла — относительно
-    /// первого кадра.
+impl VideoWriter for IsobmffWriter {
+    /// Пишет кадр в mdat; ts_ms — момент кадра, мс с Unix-эпохи
+    /// (внутри — относительно первого кадра).
     fn write_frame(&mut self, data: &[u8], ts_ms: u64) -> io::Result<()> {
-        self.core.write_frame(data, ts_ms)
+        let first = *self.first_ts.get_or_insert(ts_ms);
+        let rel = ts_ms.saturating_sub(first);
+        let offset = self.writer.stream_position()?;
+        self.writer.write_all(data)?;
+        self.rel_ts.push(rel);
+        self.sizes.push(data.len() as u32);
+        self.offsets.push(offset);
+        Ok(())
     }
 
+    /// Периодический flush + sync для живучести к крашу.
     fn sync_data(&mut self) -> io::Result<()> {
-        self.core.sync_data()
+        self.writer.flush()?;
+        self.writer.get_ref().sync_data()
     }
 
-    fn finalize(self: Box<Self>) -> io::Result<()> {
-        self.core.finalize()
+    /// Патчит largesize mdat, пишет moov (весь индекс — в памяти), flush +
+    /// sync_all.
+    fn finalize(mut self: Box<Self>) -> io::Result<()> {
+        self.writer.flush()?;
+        let file = self.writer.get_ref();
+        let file_size = file.metadata()?.len();
+        // largesize mdat — размер всего бокса: 16-байтный заголовок + payload.
+        let mdat_start = self.mdat_data_start - 16;
+        file.write_all_at(&(file_size - mdat_start).to_be_bytes(), self.mdat_size_pos)?;
+
+        let moov = self.build_moov();
+        self.writer.write_all(&moov)?;
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+        Ok(())
     }
 }
 
@@ -870,7 +837,7 @@ mod tests {
         let frames = fake_frames(3);
         {
             let mut writer = Box::new(
-                Mp4Writer::create(
+                IsobmffWriter::create_mp4(
                     &path,
                     Resolution {
                         width: 1920,
@@ -957,7 +924,7 @@ mod tests {
         let frames = fake_frames(rel.len());
         {
             let mut writer = Box::new(
-                Mp4Writer::create(
+                IsobmffWriter::create_mp4(
                     &path,
                     Resolution {
                         width: 640,
@@ -993,7 +960,7 @@ mod tests {
     fn test_empty_file() {
         let path = test_path("empty");
         Box::new(
-            Mp4Writer::create(
+            IsobmffWriter::create_mp4(
                 &path,
                 Resolution {
                     width: 640,
@@ -1081,7 +1048,7 @@ mod tests {
         let rel = [0u64, 33, 67, 100, 150];
         let frames = fake_frames(rel.len());
         let writer = Box::new(
-            Mp4Writer::create(
+            IsobmffWriter::create_mp4(
                 &path,
                 Resolution {
                     width: 640,
@@ -1101,7 +1068,7 @@ mod tests {
         let rel = [0u64, 40, 80];
         let frames = fake_frames(rel.len());
         let writer = Box::new(
-            crate::driver::dvr::mov::MovWriter::create(
+            IsobmffWriter::create_mov(
                 &path,
                 Resolution {
                     width: 1280,
@@ -1111,6 +1078,11 @@ mod tests {
             .unwrap(),
         );
         reader_roundtrip(&path, writer, &frames, &rel, 1280, 720);
+        // Отличие MP4 — только бренды ftyp: у MOV major brand 'qt  '.
+        let buf = std::fs::read(&path).unwrap();
+        let top = bp::parse(&buf, 0, buf.len());
+        let ftyp = bp::find(&top, b"ftyp");
+        assert_eq!(&buf[ftyp.start..ftyp.start + 4], b"qt  ");
         std::fs::remove_file(&path).ok();
     }
 

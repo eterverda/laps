@@ -112,13 +112,15 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   default `mkv`):
   - `mkv` — Matroska/EBML, real per-frame millisecond timestamps
     (TimecodeScale = 1 ms, no fps input), Cues per 5 s cluster, no size limit
-  - `mov`/`mp4` — ISOBMFF; common engine in `dvr/mp4.rs` (MovWriter is a
-    thin `Flavor::Mov` wrapper), stss lists all frames as sync, co64
-    offsets unconditionally, mdat largesize patched at finalize
+  - `mov`/`mp4` — ISOBMFF; one `IsobmffWriter` in `dvr/mp4.rs` for both
+    (`create_mov`/`create_mp4` differ in ftyp brands only), stss lists all
+    frames as sync, co64 offsets unconditionally, mdat largesize patched at
+    finalize
   - `VideoWriter` trait in `dvr/mod.rs` (`write_frame` / `sync_data` /
-    `finalize(self: Box<Self>)`) — implemented by all three writers;
-    `create` stays inherent per writer, selection is a `match` on
-    `ContainerConfig` in `Recorder::start`
+    `finalize(self: Box<Self>)`) — implemented by both writers; `create`
+    stays inherent per writer, selection is a `match` on
+    `ContainerConfig` in `Recorder::start` (mkv → MkvWriter, mov/mp4 →
+    IsobmffWriter::create_mov/create_mp4)
 - One file per recording start; **no segment rotation** (documented gap)
 - Writer thread + bounded channel (64): overflow = dropped frame + warn
   (capture outranks recording); periodic sync every 5 s; `Drop` detaches
@@ -138,7 +140,7 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   timeline with hold-to-scrub (hold ≠ pause)
 - Own readers (mirror writers): **MKV** (Cues / cluster scan, `mkv.rs`) and
   **MOV/MP4** (ISOBMFF: stts/stsz/stco|co64 parsed once into memory,
-  `mp4.rs` `IsobmffReader` — one reader for both flavors). Readers cover
+  `mp4.rs` `IsobmffReader` — one reader for both). Readers cover
   our own files only: single 'jpeg' video track, 1 sample per chunk,
   version-0 boxes; foreign layout is rejected with an error, not guessed
 - `read_frame_into` per frame (no streaming pipeline), **zune-jpeg** decode

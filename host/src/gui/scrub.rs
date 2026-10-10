@@ -19,7 +19,7 @@ use super::view;
 use super::viewfinder;
 use crate::config::setup::Setup;
 use crate::driver::camera::fps::FpsCounter;
-use crate::driver::player::{OpenState, Player};
+use crate::driver::player::{Player, PlayerState};
 use crate::model::pilot::Pilot;
 
 const GRID_WIDTH: isize = 160;
@@ -48,13 +48,113 @@ fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
         .max()
 }
 
+/// События таймлайна: команды хозяину (scrub) на все плееры разом.
+enum TimelineEvent {
+    /// Захват/отпускание шкалы — hold (не пауза).
+    SetHeld(bool),
+    /// Перемотать на t мс от начала.
+    Seek(u64),
+}
+
+/// Таймлайн scrub: линия с кружком позиции, интерактив. Держит своё
+/// состояние ввода (нажатие, точку последнего seek'а), наружу отдаёт
+/// только события. Клик и таскание перематывают по временной шкале;
+/// seek — только при реальном сдвиге указателя. Время рисует хозяин.
+struct Timeline {
+    /// Кнопка мыши на шкале зажата (на прошлом кадре).
+    down: bool,
+    /// Точка последнего seek'а: пока кнопка зажата, seek идёт только
+    /// при реальном сдвиге — иначе каждый кадр UI слал бы команду
+    /// впустую и крутил busy-loop.
+    last_seek: Option<egui::Pos2>,
+}
+
+impl Timeline {
+    fn new() -> Self {
+        Self {
+            down: false,
+            last_seek: None,
+        }
+    }
+
+    /// Рисует линию и кружок позиции в rect, возвращает события кадра.
+    /// frac — доля позиции (0..1), dur_ms — для перевода доли в мс.
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        frac: f32,
+        dur_ms: u64,
+    ) -> Vec<TimelineEvent> {
+        let mut events = Vec::new();
+        let y = rect.center().y;
+        ui.painter().line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(2.0, egui::Color32::from_gray(96)),
+        );
+        ui.painter().circle(
+            egui::pos2(rect.left() + rect.width() * frac, y),
+            grid::CELL_SIZE.y * 0.24,
+            egui::Color32::WHITE,
+            egui::Stroke::NONE,
+        );
+        let response = ui.interact(
+            rect,
+            ui.make_persistent_id("scrub_timeline"),
+            egui::Sense::click_and_drag(),
+        );
+        if response.hovered() || response.is_pointer_button_down_on() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // Факт нажатия отслеживаем вручную: у egui на драг есть порог
+        // движения, а тап может уложиться в один фрейм — тогда виден
+        // только clicked().
+        let down = response.is_pointer_button_down_on();
+        if down && !self.down {
+            events.push(TimelineEvent::SetHeld(true));
+        }
+        // Позиция указателя: пока зажато — interact_pointer_pos, клик —
+        // hover_pos.
+        let pointer = response.interact_pointer_pos().or_else(|| {
+            if response.clicked() {
+                response.hover_pos()
+            } else {
+                None
+            }
+        });
+        if let Some(pointer) = pointer {
+            // Seek — только при реальном сдвиге: порог — физический
+            // пиксель (points пересчитываем по pixels_per_point, наш
+            // виртуальный зум letterbox'а так отсекается). Иначе
+            // микродрожание сенсора гоняло бы декод каждый кадр.
+            let moved = self
+                .last_seek
+                .is_none_or(|last| (pointer - last).length() > 1.0 / ui.ctx().pixels_per_point());
+            if moved || !down {
+                let t = (((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * dur_ms as f32)
+                    as u64;
+                events.push(TimelineEvent::Seek(t));
+                ui.ctx().request_repaint();
+                self.last_seek = Some(pointer);
+            }
+        }
+        if !down && self.down {
+            events.push(TimelineEvent::SetHeld(false));
+        }
+        if !down {
+            self.last_seek = None;
+        }
+        self.down = down;
+        events
+    }
+}
+
 pub struct Scrub {
     /// camera_id → плеер записи этой камеры.
     players: HashMap<String, Player>,
     shown: FpsCounter,
     shown_fps: f32,
-    /// Кнопка мыши на таймлайне зажата (на прошлом кадре).
-    timeline_down: bool,
+    timeline: Timeline,
     header: header::Header,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
@@ -76,14 +176,14 @@ impl Scrub {
                 continue;
             };
             // open асинхронный: фасад всегда возвращается, ошибки файла
-            // придут в OpenState::Failed (viewport останется пустым).
+            // придут в PlayerState::Failed (viewport останется пустым).
             players.insert(camera_id.clone(), Player::open(&path, ctx.clone()));
         }
         Self {
             players,
             shown: FpsCounter::default(),
             shown_fps: 0.0,
-            timeline_down: false,
+            timeline: Timeline::new(),
             header: header::Header::new(),
             setup,
             assignments,
@@ -125,7 +225,7 @@ impl Scrub {
             }
             // До готовности — testcard, как у камеры в Starting.
             let kind = match player.open_state() {
-                OpenState::Ready => viewfinder::ViewfinderContents::Texture(player.texture()),
+                PlayerState::Ready => viewfinder::ViewfinderContents::Texture(player.texture()),
                 _ => viewfinder::ViewfinderContents::Pending,
             };
             contents.insert(id.clone(), kind);
@@ -223,7 +323,80 @@ impl Scrub {
                 {
                     action = Action::TogglePlay;
                 }
-                self.show_timeline(ui, play_rect, bottom_right);
+                // Время первичного плеера крупно (мм:сс.ммм) — отдельно
+                // от таймлайна; таймлайну достаётся rect под линию.
+                if let Some(primary) = self.primary() {
+                    let (pos, dur, state) = (
+                        primary.position_ms(),
+                        primary.duration_ms(),
+                        primary.open_state(),
+                    );
+                    let text_pos = play_rect
+                        .right_center()
+                        .into_cell()
+                        .translate(2, 0)
+                        .to_pos2();
+                    match &state {
+                        PlayerState::Failed(msg) => {
+                            ui.painter().text(
+                                text_pos,
+                                egui::Align2::LEFT_CENTER,
+                                format!("OPEN FAILED: {:.40}", msg),
+                                style::FONT_REGULAR_X2,
+                                egui::Color32::LIGHT_RED,
+                            );
+                        }
+                        _ => {
+                            let pos_text = format!(
+                                "{:02}:{:02}.{:03}",
+                                pos / 60_000,
+                                (pos / 1_000) % 60,
+                                pos % 1_000
+                            );
+                            ui.painter().text(
+                                text_pos,
+                                egui::Align2::LEFT_CENTER,
+                                &pos_text,
+                                style::FONT_REGULAR_X2,
+                                egui::Color32::WHITE,
+                            );
+                            // Шкала — только у готового плеера.
+                            if state == PlayerState::Ready {
+                                let x0 = text_pos.x
+                                    + view::content_width(ui.ctx(), &pos_text, "")
+                                    + grid::cell_x(3);
+                                let rect = egui::Rect::from_min_max(
+                                    egui::pos2(x0, play_rect.top()),
+                                    egui::pos2(
+                                        grid::cell_x(bottom_right.col - 3),
+                                        play_rect.bottom(),
+                                    ),
+                                );
+                                let frac = if dur > 0 {
+                                    pos as f32 / dur as f32
+                                } else {
+                                    0.0
+                                };
+                                // Команды ждут готовности в очереди
+                                // worker'а — прозрачно.
+                                for event in self.timeline.show(ui, rect, frac, dur) {
+                                    match event {
+                                        TimelineEvent::SetHeld(held) => {
+                                            for player in self.players.values() {
+                                                player.set_held(held);
+                                            }
+                                        }
+                                        TimelineEvent::Seek(t) => {
+                                            for player in self.players.values() {
+                                                player.seek(t);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 guidelines::dashed_line(
                     ui,
@@ -246,119 +419,6 @@ impl Scrub {
             }
             Action::None => {}
         }
-    }
-
-    /// Нижняя строка scrub: позиция первичного плеера крупно (мм:сс.ммм),
-    /// таймлайн до правого края с кружком позиции. Захват мышью — hold
-    /// (не пауза: playing сохраняется), клик и таскание перематывают
-    /// все плееры по временной шкале.
-    fn show_timeline(
-        &mut self,
-        ui: &mut egui::Ui,
-        play_rect: egui::Rect,
-        bottom_right: grid::Cell,
-    ) {
-        let Some(primary) = self.primary() else {
-            return;
-        };
-        let text_pos = play_rect
-            .right_center()
-            .into_cell()
-            .translate(2, 0)
-            .to_pos2();
-        // Провал открытия — единственный особый случай; иначе рисуем
-        // время как есть (при загрузке это 00:00.000), таймлайн —
-        // только у готового плеера.
-        if let OpenState::Failed(msg) = primary.open_state() {
-            ui.painter().text(
-                text_pos,
-                egui::Align2::LEFT_CENTER,
-                format!("OPEN FAILED: {:.40}", msg),
-                style::FONT_REGULAR_X2,
-                egui::Color32::LIGHT_RED,
-            );
-            return;
-        }
-        let ready = primary.open_state() == OpenState::Ready;
-        let (pos, dur) = (primary.position_ms(), primary.duration_ms());
-        let pos_text = format!(
-            "{:02}:{:02}.{:03}",
-            pos / 60_000,
-            (pos / 1_000) % 60,
-            pos % 1_000
-        );
-        ui.painter().text(
-            text_pos,
-            egui::Align2::LEFT_CENTER,
-            &pos_text,
-            style::FONT_REGULAR_X2,
-            egui::Color32::WHITE,
-        );
-        if !ready {
-            return;
-        }
-        let x0 = text_pos.x + view::content_width(ui.ctx(), &pos_text, "") + grid::cell_x(3);
-        let x1 = grid::cell_x(bottom_right.col - 3);
-        let y = play_rect.center().y;
-        ui.painter().line_segment(
-            [egui::pos2(x0, y), egui::pos2(x1, y)],
-            egui::Stroke::new(2.0, egui::Color32::from_gray(96)),
-        );
-        let frac = if dur > 0 {
-            pos as f32 / dur as f32
-        } else {
-            0.0
-        };
-        ui.painter().circle(
-            egui::pos2(x0 + (x1 - x0) * frac, y),
-            grid::CELL_SIZE.y * 0.24,
-            egui::Color32::WHITE,
-            egui::Stroke::NONE,
-        );
-        let timeline_rect = egui::Rect::from_center_size(
-            egui::pos2((x0 + x1) / 2.0, y),
-            egui::vec2(x1 - x0, grid::CELL_SIZE.y),
-        );
-        let response = ui.interact(
-            timeline_rect,
-            ui.make_persistent_id("scrub_timeline"),
-            egui::Sense::click_and_drag(),
-        );
-        if response.hovered() || response.is_pointer_button_down_on() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        // Факт нажатия отслеживаем вручную: у egui на драг есть порог
-        // движения, а тап может уложиться в один фрейм — тогда виден
-        // только clicked().
-        let down = response.is_pointer_button_down_on();
-        if down && !self.timeline_down {
-            for player in self.players.values() {
-                player.set_held(true);
-            }
-        }
-        // Позиция указателя: пока зажато — interact_pointer_pos, клик —
-        // hover_pos.
-        let pointer = response.interact_pointer_pos().or_else(|| {
-            if response.clicked() {
-                response.hover_pos()
-            } else {
-                None
-            }
-        });
-        if let Some(pointer) = pointer {
-            let t = (((pointer.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * dur as f32) as u64;
-            // Команды ждут готовности в очереди worker'а — прозрачно.
-            for player in self.players.values() {
-                player.seek(t);
-            }
-            ui.ctx().request_repaint();
-        }
-        if !down && self.timeline_down {
-            for player in self.players.values() {
-                player.set_held(false);
-            }
-        }
-        self.timeline_down = down;
     }
 
     /// Команда удалённого управления. Some — обработана; None — не моя,

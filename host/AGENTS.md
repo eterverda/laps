@@ -150,7 +150,7 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   clock live in a worker thread (free function, like `capture_loop`), the
   facade holds texture, frame slot, state atomics and a command channel.
   Opening is async: `open()` returns immediately, index + first frame are
-  built in the thread (`OpenState::Opening(phase)/Ready/Failed`); commands
+  built in the thread (`PlayerState::Opening/Ready/Failed`); commands
   sent before readiness wait in the channel queue. Container timestamps
   are the clock, no resampling; frame-accurate `seek`; playback-tested at
   30 fps FullHD

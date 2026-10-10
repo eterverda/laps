@@ -6,7 +6,7 @@
 //! своих таймингов не играем, отставание — честная ресинхронизация.
 //!
 //! Открытие асинхронное: `open()` возвращает фасад сразу, индекс и
-//! первый кадр строятся в потоке (`OpenState::Opening` → Ready/Failed).
+//! первый кадр строятся в потоке (`PlayerState::Opening` → Ready/Failed).
 //! Команды, пришедшие до готовности, ждут в очереди канала — готовность
 //! ждут сами, прозрачно для вызывающего.
 //!
@@ -43,7 +43,7 @@ type FrameSlot = Arc<Mutex<Option<(Arc<egui::ColorImage>, bool)>>>;
 
 /// Состояние открытия файла: наружу, для индикатора в scrub.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum OpenState {
+pub enum PlayerState {
     /// Индекс и первый кадр строятся в worker-потоке.
     Opening,
     Ready,
@@ -64,7 +64,7 @@ pub struct Player {
     /// Текстура 1×1 пустышка из open(); первый кадр расширит set'ом.
     /// TextureId стабилен всю жизнь Player.
     texture: egui::TextureHandle,
-    state: Arc<Mutex<OpenState>>,
+    state: Arc<Mutex<PlayerState>>,
     /// Авторитет у worker'а: конец файла гасит кнопку сам.
     playing: Arc<AtomicCell<bool>>,
     position_ms: Arc<AtomicCell<u64>>,
@@ -81,7 +81,7 @@ impl Player {
     /// и само воспроизведение — в worker-потоке.
     pub fn open(path: &Path, ctx: egui::Context) -> Self {
         let slot: FrameSlot = Arc::new(Mutex::new(None));
-        let state = Arc::new(Mutex::new(OpenState::Opening));
+        let state = Arc::new(Mutex::new(PlayerState::Opening));
         let playing = Arc::new(AtomicCell::new(false));
         let position_ms = Arc::new(AtomicCell::new(0u64));
         let duration_ms = Arc::new(AtomicCell::new(0u64));
@@ -131,7 +131,7 @@ impl Player {
     }
 
     /// Открытие файла: scrub рисует индикатор, пока Opening.
-    pub fn open_state(&self) -> OpenState {
+    pub fn open_state(&self) -> PlayerState {
         self.state.lock().unwrap().clone()
     }
 
@@ -221,7 +221,7 @@ fn playback_loop(
     path: std::path::PathBuf,
     ctx: egui::Context,
     slot: FrameSlot,
-    state: Arc<Mutex<OpenState>>,
+    state: Arc<Mutex<PlayerState>>,
     playing: Arc<AtomicCell<bool>>,
     position_ms: Arc<AtomicCell<u64>>,
     duration_ms: Arc<AtomicCell<u64>>,
@@ -453,13 +453,13 @@ fn playback_loop(
         }
     }
 
-    // --- Open: индекс, первый кадр. Ошибки — в OpenState::Failed. ---
+    // --- Open: индекс, первый кадр. Ошибки — в PlayerState::Failed. ---
 
     let reader = match open_reader(&path) {
         Ok(reader) => reader,
         Err(e) => {
             log::error!("player: {}: {e}", path.display());
-            *state.lock().unwrap() = OpenState::Failed(e.to_string());
+            *state.lock().unwrap() = PlayerState::Failed(e.to_string());
             ctx.request_repaint();
             return;
         }
@@ -496,20 +496,20 @@ fn playback_loop(
     if pb.pts.is_empty() {
         let e = io::Error::new(io::ErrorKind::InvalidData, "no frames");
         log::error!("player: {}: {e}", path.display());
-        *state.lock().unwrap() = OpenState::Failed(e.to_string());
+        *state.lock().unwrap() = PlayerState::Failed(e.to_string());
         pb.ctx.request_repaint();
         return;
     }
     // «Готов» = «первый кадр на экране», как у Camera.
     if let Err(e) = pb.read_and_present(0, false) {
         log::error!("player: {}: {e}", path.display());
-        *state.lock().unwrap() = OpenState::Failed(e.to_string());
+        *state.lock().unwrap() = PlayerState::Failed(e.to_string());
         pb.ctx.request_repaint();
         return;
     }
     pb.position_ms.store(pb.pts[0]);
     duration_ms.store(pb.pts.last().copied().unwrap_or(0));
-    *state.lock().unwrap() = OpenState::Ready;
+    *state.lock().unwrap() = PlayerState::Ready;
     log::info!(
         "player: {} frames, {} ms span, max frame {} bytes",
         pb.pts.len(),

@@ -4,9 +4,9 @@ use crate::model::pilot::Pilot;
 mod grid;
 mod guidelines;
 mod header;
-mod scrub;
 mod live;
 mod menu;
+mod scrub;
 mod style;
 mod view;
 mod viewfinder;
@@ -106,6 +106,7 @@ impl App {
                 None => State::Live(Box::new(live::Live::new(
                     setup.clone(),
                     assignments.clone(),
+                    crate::model::race::RaceRules::default(),
                 ))),
             },
             setup,
@@ -178,6 +179,7 @@ impl eframe::App for App {
                             None => navigator.goto(Box::new(live::Live::new(
                                 self.setup.clone(),
                                 self.assignments.clone(),
+                                crate::model::race::RaceRules::default(),
                             ))),
                         },
                         menu::Action::None => {}

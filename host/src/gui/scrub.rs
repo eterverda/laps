@@ -51,6 +51,10 @@ const SCROLL_REARM: std::time::Duration = std::time::Duration::from_millis(300);
 /// Тишина, по которой скролл-скраб отпускает курсор. Стандарта нет,
 /// 200 мс — общепринятый дебаунс «конца скролла» в скролл-библиотеках.
 const HSCROLL_RELEASE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Транспорт scrub'а: слоновая кость — активная светлая, покой тёмная.
+/// Текст на плашках всегда чёрный.
+const TRANSPORT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF0, 0xDC);
+const TRANSPORT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x6E, 0x62);
 /// Масштаб скролл-скраба: миллисекунды файла на физический пиксель
 /// пальца. Осознанно фиксирован: не зависит от длины записи (бар при
 /// этом перестаёт отображать файл 1:1 — палец и кружок расходятся).
@@ -225,26 +229,101 @@ pub struct Scrub {
     seek_speed: usize,
     play_speed: usize,
     rpt_size: usize,
-    /// Накопитель скролла для шага по шкале.
-    scroll_acc: f32,
-    /// Накопитель горизонтального скролла над таймлайном (мс файла,
-    /// дробный остаток между кадрами).
-    hscroll_acc: f32,
-    /// Скролл-скраб активен: введён реальной дельтой (с порогом), не
-    /// выводится микро-скроллами — только тишиной (как hold).
-    hscroll_active: bool,
-    /// Начало текущего непрерывного промежутка без горизонтального
-    /// скролла.
-    hscroll_quiet_since: std::time::Instant,
-    /// Скролл вооружён (может дать шаг). После выстрела разоружается
-    /// до SCROLL_REARM непрерывной тишины — трэкпад шлёт дельты
-    /// рывками, кадр без дельты посреди жеста не считается концом.
-    scroll_armed: bool,
-    /// Начало текущего непрерывного промежутка без скролла.
-    scroll_quiet_since: std::time::Instant,
+    /// Вертикальный скролл над контролами — шаг по их шкалам.
+    vscroll: ScrollGate,
+    /// Горизонтальный скролл над таймлайном — относительный скраб.
+    hscroll: HScroll,
     header: header::Header,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
+}
+
+/// Гистерезис скролла «один жест — один шаг»: накопитель дельты +
+/// перевооружение после непрерывной тишины. Трэкпад шлёт дельты
+/// рывками, поэтому концом жеста считается не кадр без дельты, а
+/// тишина длиннее rearm. Возвращает направление шага (true — вверх).
+struct ScrollGate {
+    acc: f32,
+    armed: bool,
+    quiet_since: std::time::Instant,
+}
+
+impl ScrollGate {
+    fn new() -> Self {
+        Self {
+            acc: 0.0,
+            armed: true,
+            quiet_since: std::time::Instant::now(),
+        }
+    }
+
+    fn step(&mut self, delta: f32, threshold: f32, rearm: std::time::Duration) -> Option<bool> {
+        if delta == 0.0 {
+            if self.quiet_since.elapsed() >= rearm {
+                self.armed = true;
+                self.acc = 0.0;
+            }
+            return None;
+        }
+        self.quiet_since = std::time::Instant::now();
+        self.acc += delta;
+        if self.armed && self.acc.abs() >= threshold {
+            let up = self.acc > 0.0;
+            self.armed = false;
+            self.acc = 0.0;
+            return Some(up);
+        }
+        None
+    }
+}
+
+/// Горизонтальный скролл над таймлайном — относительный скраб. Всё в
+/// физических пикселях пальца: и пороги, и масштаб — длина записи в
+/// расчёт не входит (бар перестаёт отображать файл 1:1 — осознанно).
+/// Вход жёстче, чтобы микро-дрожание не будило скраб; выход — по тишине.
+struct HScroll {
+    acc: f32,
+    active: bool,
+    quiet_since: std::time::Instant,
+}
+
+impl HScroll {
+    fn new() -> Self {
+        Self {
+            acc: 0.0,
+            active: false,
+            quiet_since: std::time::Instant::now(),
+        }
+    }
+
+    /// Скраб активен (hold): курсор Grabbing, тикает repaint.
+    fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Дельта кадра (0 — скролла нет) → миллисекунды шага, если скраб
+    /// двигается. Выход по тишине проверяется на каждом вызове,
+    /// включая нулевые дельты.
+    fn feed(&mut self, dx: f32, pixels_per_point: f32) -> Option<i64> {
+        if dx == 0.0 {
+            if self.active && self.quiet_since.elapsed() >= HSCROLL_RELEASE {
+                self.active = false;
+                self.acc = 0.0;
+            }
+            return None;
+        }
+        self.quiet_since = std::time::Instant::now();
+        self.acc += dx;
+        let px = self.acc * pixels_per_point;
+        let enter = if self.active { 1.0 } else { 2.0 };
+        if px.abs() < enter {
+            return None;
+        }
+        self.active = true;
+        let ms = (px * HSCROLL_MS_PER_PX).round() as i64;
+        self.acc = 0.0;
+        Some(ms)
+    }
 }
 
 /// Кнопка перемотки: клик — позиционный шаг, удержание — разгон плеера
@@ -311,12 +390,8 @@ impl Scrub {
             seek_speed: SEEK_SPEEDS.iter().position(|&v| v == 10).unwrap(),
             play_speed: PLAY_SPEEDS.iter().position(|&v| v == 100).unwrap(),
             rpt_size: RPT_SIZES.iter().position(|&v| v == 1.0).unwrap(),
-            scroll_acc: 0.0,
-            hscroll_acc: 0.0,
-            hscroll_active: false,
-            hscroll_quiet_since: std::time::Instant::now(),
-            scroll_armed: true,
-            scroll_quiet_since: std::time::Instant::now(),
+            vscroll: ScrollGate::new(),
+            hscroll: HScroll::new(),
             header: header::Header::new(),
             setup,
             assignments,
@@ -357,7 +432,6 @@ impl Scrub {
                 state.down = true;
                 state.down_since = std::time::Instant::now();
                 state.hold_sent = false;
-                log::info!("scrub: {} PRESS", if back { "REW" } else { "FF" });
                 Event::Press
             } else if !state.down && response.clicked() {
                 Event::Tap
@@ -367,16 +441,20 @@ impl Scrub {
         };
         match event {
             Event::Release => {
-                let held_for = if back { self.rew.down_since } else { self.ff.down_since }.elapsed();
-                log::info!(
-                    "scrub: {} RELEASE held={held_for:?} hold_sent={}",
-                    if back { "REW" } else { "FF" },
-                    if back { self.rew.hold_sent } else { self.ff.hold_sent }
-                );
-                let quick = held_for < SEEK_CLICK_MAX;
+                let quick = if back {
+                    self.rew.down_since
+                } else {
+                    self.ff.down_since
+                }
+                .elapsed()
+                    < SEEK_CLICK_MAX;
                 if quick {
                     // Отмена: release только если hold успел уйти.
-                    if if back { self.rew.hold_sent } else { self.ff.hold_sent } {
+                    if if back {
+                        self.rew.hold_sent
+                    } else {
+                        self.ff.hold_sent
+                    } {
                         for player in self.players.values() {
                             player.seek_release(SEEK_RELEASE_RAMP);
                         }
@@ -393,7 +471,6 @@ impl Scrub {
             }
             Event::Press => {}
             Event::Tap => {
-                log::info!("scrub: {} TAP", if back { "REW" } else { "FF" });
                 let state = if back { &mut self.rew } else { &mut self.ff };
                 state.flash = true;
                 let step = SEEK_SPEEDS[self.seek_speed] as i64 * SEEK_TAP as i64;
@@ -412,7 +489,6 @@ impl Scrub {
             }
             if state.down && !state.hold_sent && state.down_since.elapsed() >= SEEK_HOLD_DELAY {
                 state.hold_sent = true;
-                log::info!("scrub: {} ARM (hold sent)", if back { "REW" } else { "FF" });
                 true
             } else {
                 false
@@ -429,12 +505,158 @@ impl Scrub {
     /// Перемотка всех плееров на delta мс от текущей позиции, с
     /// зажатием в границы файла.
     fn seek_by(&self, delta: i64) {
-        // Временный лог для разбора дрожания скролл-скраба.
-        log::info!("scrub: seek_by {delta:+} ms");
         for player in self.players.values() {
             let t = (player.position_ms() as i64 + delta).clamp(0, player.duration_ms() as i64);
             player.seek(t as u64);
         }
+    }
+
+    /// Транспорт: плашки REW/PLAY/FF/RPT 3 клетки высотой (иконка
+    /// по центру верхних двух + подпись шкалы в нижней), клик — вся
+    /// плашка. Возвращает true, если PLAY тоглят. Раскладка — таблица
+    /// (ширина, зазор после): RPT на 2 колонки уже и отстоит на 2.
+    fn draw_transport(&mut self, ui: &mut egui::Ui, bottom_right: grid::Cell) -> bool {
+        let mut toggle_play = false;
+        let btn_rect = |col: isize, cols: isize| {
+            let x = grid::cell_x(col);
+            let y = grid::cell_y(bottom_right.row - 1);
+            egui::Rect::from_min_max(
+                egui::pos2(x, y - grid::cell_y(2)),
+                egui::pos2(x + grid::cell_x(cols), y + grid::CELL_SIZE.y),
+            )
+        };
+        // Кнопка — interact и paint раздельно: seek_tick между
+        // ними, чтобы кадр нажатия рисовался уже нажатым
+        // (иначе белая вспышка терялась между кадрами).
+        let transport_interact = |ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id| {
+            ui.interact(rect, id, egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+        };
+        let transport_paint =
+            |ui: &mut egui::Ui, rect: egui::Rect, icon: &str, pressed: bool, label: &str| {
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    if pressed {
+                        TRANSPORT_ACTIVE
+                    } else {
+                        TRANSPORT_IDLE
+                    },
+                );
+                let icon_w = super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, icon).x;
+                ui.painter().text(
+                    egui::pos2(rect.center().x - icon_w / 2.0, rect.top() + grid::cell_y(1)),
+                    egui::Align2::LEFT_CENTER,
+                    icon,
+                    style::FONT_REGULAR_X2,
+                    egui::Color32::BLACK,
+                );
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.bottom()),
+                    egui::Align2::CENTER_BOTTOM,
+                    label,
+                    style::FONT_REGULAR,
+                    egui::Color32::BLACK,
+                );
+            };
+
+        // Раскладка ряда: (ширина, зазор после кнопки) с колонки 2
+        // (1 колонка от левого края).
+        let layout = [(8, 1), (8, 1), (8, 2), (6, 0)];
+        let mut col = 2isize;
+        let mut rects = layout.iter().map(|&(w, gap)| {
+            let r = btn_rect(col, w);
+            col += w + gap;
+            r
+        });
+        let rew_rect = rects.next().unwrap();
+        let play_rect = rects.next().unwrap();
+        let ff_rect = rects.next().unwrap();
+        let loop_rect = rects.next().unwrap();
+        let rew_id = ui.make_persistent_id("status_rew");
+        let rew_response = transport_interact(ui, rew_rect, rew_id);
+        // Тап может уложиться в один кадр — виден только clicked(),
+        // как на таймлайне.
+        self.seek_tick(ui, &rew_response, true);
+        transport_paint(
+            ui,
+            rew_rect,
+            "\u{25c0}\u{25c0}",
+            self.rew.lit(),
+            &format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
+        );
+
+        let playing = self
+            .primary()
+            .is_some_and(|p| p.is_playing() && !p.is_seeking());
+        let play_id = ui.make_persistent_id("status_play");
+        let play_response = transport_interact(ui, play_rect, play_id);
+        if play_response.clicked() {
+            toggle_play = true;
+        }
+        transport_paint(
+            ui,
+            play_rect,
+            "\u{25b6}",
+            playing,
+            &format!("{}%", PLAY_SPEEDS[self.play_speed]),
+        );
+
+        let ff_id = ui.make_persistent_id("status_ff");
+        let ff_response = transport_interact(ui, ff_rect, ff_id);
+        self.seek_tick(ui, &ff_response, false);
+        transport_paint(
+            ui,
+            ff_rect,
+            "\u{25b6}\u{25b6}",
+            self.ff.lit(),
+            &format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
+        );
+
+        // RPT: пока некликабельна (повтор фрагмента — потом).
+        let loop_id = ui.make_persistent_id("status_loop");
+        let loop_response = transport_interact(ui, loop_rect, loop_id);
+        transport_paint(
+            ui,
+            loop_rect,
+            "\u{F0456}",
+            false,
+            &format!("±{:.1}s", RPT_SIZES[self.rpt_size]),
+        );
+
+        // Скролл над контролом — шаг по его шкале. Вверх всегда
+        // «больше» (натуральный скролл: знак дельты как есть).
+        let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+        if let Some(up) = self.vscroll.step(scroll_delta, SCROLL_STEP, SCROLL_REARM) {
+            let shift = |cur: &mut usize, len: usize, dir: i64| {
+                *cur = (*cur as i64 + dir).clamp(0, len as i64 - 1) as usize;
+            };
+            if rew_response.hovered() || ff_response.hovered() {
+                // SEEK_SPEEDS убывающий (×20…×3): вверх —
+                // к большей скорости, т.е. к концу списка.
+                shift(
+                    &mut self.seek_speed,
+                    SEEK_SPEEDS.len(),
+                    if up { 1 } else { -1 },
+                );
+            } else if play_response.hovered() {
+                let before = self.play_speed;
+                shift(
+                    &mut self.play_speed,
+                    PLAY_SPEEDS.len(),
+                    if up { -1 } else { 1 },
+                );
+                if self.play_speed != before {
+                    let speed = PLAY_SPEEDS[self.play_speed] as f32 / 100.0;
+                    for player in self.players.values() {
+                        player.set_speed(speed);
+                    }
+                }
+            } else if loop_response.hovered() {
+                shift(&mut self.rpt_size, RPT_SIZES.len(), if up { -1 } else { 1 });
+            }
+        }
+        toggle_play
     }
 
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
@@ -469,6 +691,14 @@ impl Scrub {
             .max_virtual_height(grid::cell_y(50))
             .outline(true)
             .show(ui, |ui| {
+                let bottom_right = grid::cell_at(ui.max_rect().max);
+                let header_rect = grid::cell(0, 0).extrude(bottom_right.col, 2);
+                self.header.show(ui, header_rect);
+
+                if self.draw_transport(ui, bottom_right) {
+                    action = Action::TogglePlay;
+                }
+
                 let pads: Vec<_> = self.setup.pads.iter().take(MAX_PADS).collect();
                 let columns = pads.len() as isize;
                 let viewfinder_rows = live::viewfinder_rows(pads.len());
@@ -489,10 +719,6 @@ impl Scrub {
                         );
                     }
                 }
-
-                let bottom_right = grid::cell_at(ui.max_rect().max);
-                let header_rect = grid::cell(0, 0).extrude(bottom_right.col, 2);
-                self.header.show(ui, header_rect);
 
                 if columns > 0 {
                     let alt = ui.input(|i| i.modifiers.alt);
@@ -542,177 +768,10 @@ impl Scrub {
                                         }
                                     });
                                 if let Some(val) = val {
-                                    let row = grid::CELL_SIZE.y;
-                                    let width =
-                                        super::measure_text(ui.ctx(), style::FONT_REGULAR, &val).x;
-                                    let right = rect.right() - grid::cell_x(1);
-                                    let bottom = rect.bottom() - grid::cell_y(1);
-                                    // Пол-высоты клетки вниз — визуальная
-                                    // центровка значка на картинке.
-                                    let text = egui::Rect::from_min_max(
-                                        egui::pos2(right - width, bottom - row),
-                                        egui::pos2(right, bottom),
-                                    )
-                                    .translate(egui::vec2(0.0, row * 0.5));
-                                    view::hint_badge(ui, text, egui::Align2::RIGHT_BOTTOM, &[val]);
+                                    view::hint_badge_corner(ui, rect, &[val]);
                                 }
                             }
                         });
-                    }
-                }
-
-                // Транспорт: плашка 3 клетки высотой (иконка по центру
-                // верхних двух + подпись шкалы в нижней), фон — серый в
-                // покое, белый пока нажата; текст всегда чёрный. Клик —
-                // вся плашка. Ширина: 8 колонок (у RPT 6), зазор 1
-                // колонка (перед RPT — 2), левый край — колонка 1.
-                let btn_rect = |col: isize, cols: isize| {
-                    let x = grid::cell_x(col);
-                    let y = grid::cell_y(bottom_right.row - 1);
-                    egui::Rect::from_min_max(
-                        egui::pos2(x, y - grid::cell_y(2)),
-                        egui::pos2(x + grid::cell_x(cols), y + grid::CELL_SIZE.y),
-                    )
-                };
-                // Кнопка — interact и paint раздельно: seek_tick между
-                // ними, чтобы кадр нажатия рисовался уже нажатым
-                // (иначе белая вспышка терялась между кадрами).
-                let transport_interact = |ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id| {
-                    ui.interact(rect, id, egui::Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                };
-                let transport_paint = |ui: &mut egui::Ui,
-                                       rect: egui::Rect,
-                                       icon: &str,
-                                       pressed: bool,
-                                       label: &str| {
-                    // Слоновая кость: активный — светлая, покой —
-                    // тёмная. Текст всегда чёрный.
-                    ui.painter().rect_filled(
-                        rect,
-                        0.0,
-                        if pressed {
-                            egui::Color32::from_rgb(0xF5, 0xF0, 0xDC)
-                        } else {
-                            egui::Color32::from_rgb(0x6E, 0x6E, 0x62)
-                        },
-                    );
-                    let icon_w = super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, icon).x;
-                    ui.painter().text(
-                        egui::pos2(rect.center().x - icon_w / 2.0, rect.top() + grid::cell_y(1)),
-                        egui::Align2::LEFT_CENTER,
-                        icon,
-                        style::FONT_REGULAR_X2,
-                        egui::Color32::BLACK,
-                    );
-                    ui.painter().text(
-                        egui::pos2(rect.center().x, rect.bottom()),
-                        egui::Align2::CENTER_BOTTOM,
-                        label,
-                        style::FONT_REGULAR,
-                        egui::Color32::BLACK,
-                    );
-                };
-
-                let rew_rect = btn_rect(2, 8);
-                let rew_id = ui.make_persistent_id("status_rew");
-                let rew_response = transport_interact(ui, rew_rect, rew_id);
-                // Тап может уложиться в один кадр — виден только clicked(),
-                // как на таймлайне.
-                self.seek_tick(ui, &rew_response, true);
-                transport_paint(
-                    ui,
-                    rew_rect,
-                    "\u{25c0}\u{25c0}",
-                    self.rew.lit(),
-                    &format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
-                );
-
-                let playing = self
-                    .primary()
-                    .is_some_and(|p| p.is_playing() && !p.is_seeking());
-                let play_rect = btn_rect(11, 8);
-                let play_id = ui.make_persistent_id("status_play");
-                let play_response = transport_interact(ui, play_rect, play_id);
-                if play_response.clicked() {
-                    action = Action::TogglePlay;
-                }
-                transport_paint(
-                    ui,
-                    play_rect,
-                    "\u{25b6}",
-                    playing,
-                    &format!("{}%", PLAY_SPEEDS[self.play_speed]),
-                );
-
-                let ff_rect = btn_rect(20, 8);
-                let ff_id = ui.make_persistent_id("status_ff");
-                let ff_response = transport_interact(ui, ff_rect, ff_id);
-                self.seek_tick(ui, &ff_response, false);
-                transport_paint(
-                    ui,
-                    ff_rect,
-                    "\u{25b6}\u{25b6}",
-                    self.ff.lit(),
-                    &format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
-                );
-
-                // RPT: пока некликабельна (повтор фрагмента — потом).
-                let loop_rect = btn_rect(30, 6);
-                let loop_id = ui.make_persistent_id("status_loop");
-                let loop_response = transport_interact(ui, loop_rect, loop_id);
-                transport_paint(
-                    ui,
-                    loop_rect,
-                    "\u{F0456}",
-                    false,
-                    &format!("±{:.1}s", RPT_SIZES[self.rpt_size]),
-                );
-
-                // Скролл над контролом — шаг по его шкале. Вверх всегда
-                // «больше» (натуральный скролл: знак дельты как есть).
-                // Один жест — один шаг: после выстрела разрешаем
-                // следующий только после SCROLL_REARM непрерывной тишины.
-                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll_delta == 0.0 {
-                    if self.scroll_quiet_since.elapsed() >= SCROLL_REARM {
-                        self.scroll_armed = true;
-                        self.scroll_acc = 0.0;
-                    }
-                } else {
-                    self.scroll_quiet_since = std::time::Instant::now();
-                    self.scroll_acc += scroll_delta;
-                    if self.scroll_armed && self.scroll_acc.abs() >= SCROLL_STEP {
-                        self.scroll_armed = false;
-                        self.scroll_acc = 0.0;
-                        let up = scroll_delta > 0.0;
-                        let shift = |cur: &mut usize, len: usize, dir: i64| {
-                            *cur = (*cur as i64 + dir).clamp(0, len as i64 - 1) as usize;
-                        };
-                        if rew_response.hovered() || ff_response.hovered() {
-                            // SEEK_SPEEDS убывающий (20x…3x): вверх — к
-                            // большей скорости, т.е. к концу списка.
-                            shift(
-                                &mut self.seek_speed,
-                                SEEK_SPEEDS.len(),
-                                if up { 1 } else { -1 },
-                            );
-                        } else if play_response.hovered() {
-                            let before = self.play_speed;
-                            shift(
-                                &mut self.play_speed,
-                                PLAY_SPEEDS.len(),
-                                if up { -1 } else { 1 },
-                            );
-                            if self.play_speed != before {
-                                let speed = PLAY_SPEEDS[self.play_speed] as f32 / 100.0;
-                                for player in self.players.values() {
-                                    player.set_speed(speed);
-                                }
-                            }
-                        } else if loop_response.hovered() {
-                            shift(&mut self.rpt_size, RPT_SIZES.len(), if up { -1 } else { 1 });
-                        }
                     }
                 }
 
@@ -780,7 +839,13 @@ impl Scrub {
                                     // базлайна, доп-таймер — в строке под
                                     // ними. Строка — под базлайном основного
                                     // (play_rect выше кнопки на клетку).
-                                    let row = grid::cell_at(play_rect.left_bottom()).row - 1;
+                                    // Строка под базлайном основного
+                                    // (низ иконочной части транспорта).
+                                    let row = grid::cell_at(egui::pos2(
+                                        0.0,
+                                        grid::cell_y(bottom_right.row - 1) + grid::CELL_SIZE.y,
+                                    ))
+                                    .row - 1;
                                     let x =
                                         text_pos.x + view::content_width(ui.ctx(), &pos_text) / 2.0;
                                     ui.painter().text(
@@ -837,54 +902,26 @@ impl Scrub {
                                 // Горизонтальный скролл над полоской —
                                 // относительный скраб: без прыжка под
                                 // курсор, дельта двигает позицию от
-                                // текущей, как при драге за кружок.
-                                // Гистерезис: вход — по накопленной
-                                // дельте с порогом, выход — только по
-                                // тишине. Микро-скроллы не вводят в
-                                // скраб и не выводят из него.
-                                // Дельта берётся только над полоской, а
-                                // тишина/выход — всегда: иначе увод
-                                // курсора с полоски оставляет скраб
-                                // активным навсегда (и крутит repaint).
+                                // текущей, как при драге за кружок. Дельта
+                                // берётся только над полоской, а тишина и
+                                // выход — всегда: иначе увод курсора с
+                                // полоски залипает навсегда.
                                 let dx = if response.hovered() {
                                     ui.input(|i| i.smooth_scroll_delta.x)
                                 } else {
                                     0.0
                                 };
+                                if let Some(ms) = self.hscroll.feed(dx, ui.ctx().pixels_per_point())
                                 {
-                                    if dx == 0.0 {
-                                        // Выход из скраба — по тишине
-                                        // короче реарма шкал: иначе
-                                        // Grabbing «залипает» на 200 мс.
-                                        if self.hscroll_quiet_since.elapsed() >= HSCROLL_RELEASE {
-                                            self.hscroll_active = false;
-                                            self.hscroll_acc = 0.0;
-                                        }
-                                    } else {
-                                        self.hscroll_quiet_since = std::time::Instant::now();
-                                        self.hscroll_acc += dx;
-                                        // Всё в физических пикселях пальца:
-                                        // и пороги, и масштаб — длина
-                                        // записи в расчёт не входит.
-                                        // Вход жёстче, чтобы микро-дрожание
-                                        // не будило скраб (гистерезис).
-                                        let px = self.hscroll_acc * ui.ctx().pixels_per_point();
-                                        let enter = if self.hscroll_active { 1.0 } else { 2.0 };
-                                        if px.abs() >= enter {
-                                            self.hscroll_active = true;
-                                            self.seek_by((px * HSCROLL_MS_PER_PX).round() as i64);
-                                            self.hscroll_acc = 0.0;
-                                        }
-                                    }
+                                    self.seek_by(ms);
                                 }
-                                // Курсор — на весь жест, а не только на
-                                // кадры со сиком: иначе Grab/Grabbing
-                                // мигали каждый кадр. Пока скраб активен,
-                                // крутим перерисовку: иначе во время паузы
-                                // таймаут отпускания не сработает — кадров
-                                // нет. Крутим вне зависимости от hover:
-                                // иначе увод с полоски залипает навсегда.
-                                if self.hscroll_active {
+                                // Скролл-скраб = тот же hold: курсор —
+                                // зажатая ладонь на весь жест, а не только
+                                // на кадры со сиком (иначе Grab/Grabbing
+                                // мигали каждый кадр). Пока активен, крутим
+                                // перерисовку: таймаут отпускания честный
+                                // даже во время паузы, без hover тоже.
+                                if self.hscroll.active() {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                                     ui.ctx().request_repaint();
                                 }

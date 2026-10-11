@@ -338,6 +338,12 @@ impl Clock {
         self.ramp = None;
     }
 
+    /// Подтянуть базу к позиции без старта часов (показанный кадр
+    /// сменился дискретным seek'ом на стоящих часах).
+    fn sync_base(&mut self, pos: u64) {
+        self.base = pos;
+    }
+
     /// Стоп: позиция остаётся в base для возможного старта от неё.
     fn stop(&mut self) {
         let (_, pos) = self.eval();
@@ -707,7 +713,7 @@ fn playback_loop(
                                     // кадр сменился — базу подтягиваем,
                                     // иначе жест hold стартует от позиции
                                     // до тапов (отскок назад).
-                                    self.clock.base = self.pts[i];
+                                    self.clock.sync_base(self.pts[i]);
                                 }
                             }
                             Err(e) => {

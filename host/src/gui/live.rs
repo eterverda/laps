@@ -217,9 +217,8 @@ impl Live {
                                 webcam_contents,
                                 rect,
                             );
-                            // Alt: эффективное разрешение вьюпорта. Правый
-                            // нижний угол текста — на клетку влево и вверх
-                            // от правого нижнего угла картинки.
+                            // Alt: эффективное разрешение вьюпорта
+                            // (значок — в правом нижнем углу картинки).
                             if let Some(res) = frame_res.get(&pad.fpv.camera_id) {
                                 let val = res
                                     .map(|r| {
@@ -228,19 +227,7 @@ impl Live {
                                         format!("{}p", lines.round() as u32)
                                     })
                                     .unwrap_or_else(|| "error".to_owned());
-                                let row = grid::CELL_SIZE.y;
-                                let width =
-                                    super::measure_text(ui.ctx(), style::FONT_REGULAR, &val).x;
-                                let right = rect.right() - grid::cell_x(1);
-                                let bottom = rect.bottom() - grid::cell_y(1);
-                                // Пол-высоты клетки вниз — визуальная
-                                // центровка значка на картинке.
-                                let text = egui::Rect::from_min_max(
-                                    egui::pos2(right - width, bottom - row),
-                                    egui::pos2(right, bottom),
-                                )
-                                .translate(egui::vec2(0.0, row * 0.5));
-                                view::hint_badge(ui, text, egui::Align2::RIGHT_BOTTOM, &[val]);
+                                view::hint_badge_corner(ui, rect, &[val]);
                             }
                         });
 
@@ -310,9 +297,7 @@ impl Live {
                 let live_rect = grid::cell(1, bottom_right.row)
                     .translate(1, -1)
                     .extrude(grid::whole_cols(live_text_w), -2);
-                let live_plate = live_rect
-                    .with_min_x(live_rect.left() - overlap - air)
-                    .with_max_x(live_rect.right() + air + tip);
+                let live_plate = plate_rect(live_rect, tip, air, overlap);
                 let (live_plate_color, live_text_color) =
                     plate_colors(live_status, PLATE_LIVE_IDLE, PLATE_LIVE);
 
@@ -331,9 +316,7 @@ impl Live {
                     .into_cell()
                     .translate(6, 0)
                     .extrude(grid::whole_cols(rec_text_w), -2);
-                let rec_plate = rec_rect
-                    .with_min_x(rec_rect.left() - overlap - air)
-                    .with_max_x(rec_rect.right() + air + tip);
+                let rec_plate = plate_rect(rec_rect, tip, air, overlap);
                 let (rec_plate_color, rec_text_color) =
                     plate_colors(rec_status, PLATE_REC_IDLE, PLATE_REC);
 
@@ -346,9 +329,7 @@ impl Live {
                     .into_cell()
                     .translate(6, 0)
                     .extrude(grid::whole_cols(race_text_w), -2);
-                let race_plate = race_rect
-                    .with_min_x(race_rect.left() - overlap - air)
-                    .with_max_x(race_rect.right() + air + tip);
+                let race_plate = plate_rect(race_rect, tip, air, overlap);
                 let (race_plate_color, race_text_color) = plate_colors(
                     if race_active {
                         Status::Active
@@ -892,6 +873,13 @@ const PLATE_RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x7C, 0x49)
 /// Активный RACE — кислотно-жёлтый гоночного режима (изначальный
 /// RACE_COLOR, см. git history).
 const PLATE_RACE: egui::Color32 = egui::Color32::from_rgb(0xCC, 0xFF, 0x00);
+
+/// Плашка вокруг текстового rect: воздух по колонке с каждой стороны,
+/// наконечник справа, левый хвост — под наконечник соседа (overlap).
+fn plate_rect(text: egui::Rect, tip: f32, air: f32, overlap: f32) -> egui::Rect {
+    text.with_min_x(text.left() - overlap - air)
+        .with_max_x(text.right() + air + tip)
+}
 
 /// (подложка, текст) кнопки-стрелки: в покое пригашенный оттенок, в
 /// активе насыщенный; текст всегда чёрный.

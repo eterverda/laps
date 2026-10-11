@@ -333,6 +333,28 @@ pub fn arrow_plate(ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32) {
     ));
 }
 
+/// Подсказка-значок в правом нижнем углу anchor: правый нижний угол
+/// текста — на клетку влево и вверх от угла anchor, вся плашка сдвинута
+/// на пол-высоты клетки вниз (визуальная центровка на картинке).
+pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let row = super::grid::CELL_SIZE.y;
+    let width = lines
+        .iter()
+        .map(|line| super::measure_text(ui.ctx(), super::style::FONT_REGULAR, line).x)
+        .fold(0.0f32, f32::max);
+    let right = anchor.right() - super::grid::cell_x(1);
+    let bottom = anchor.bottom() - super::grid::cell_y(1);
+    let text = egui::Rect::from_min_max(
+        egui::pos2(right - width, bottom - row),
+        egui::pos2(right, bottom),
+    )
+    .translate(egui::vec2(0.0, row * 0.5));
+    hint_badge(ui, text, egui::Align2::RIGHT_BOTTOM, lines);
+}
+
 /// Подсказка-значок: текст выравнивается к краям text по align (координаты
 /// — в границах текста: фон и обводка рисуются за его пределами). Фон —
 /// скруглённый rect: поле и радиус — по половине ширины ячейки (и по

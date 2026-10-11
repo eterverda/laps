@@ -394,7 +394,7 @@ impl Live {
                     egui::pos2(
                         race_rect.left()
                             + view::content_width(ui.ctx(), "\u{f140b} RACE", "")
-                            + grid::cell_x(1),
+                            + grid::cell_x(2),
                         race_rect.left_bottom().y,
                     ),
                     egui::Align2::LEFT_BOTTOM,

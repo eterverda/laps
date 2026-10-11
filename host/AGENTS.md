@@ -154,6 +154,17 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   sent before readiness wait in the channel queue. Container timestamps
   are the clock, no resampling; frame-accurate `seek`; playback-tested at
   30 fps FullHD
+- Speed model: discrete commands (`Play`/`Pause`/`Seek`/`SetSpeed`, wheel
+  x0.25–x2) take effect instantly and cancel any gesture; ramps exist
+  only in the REW/FF hold gesture (`SeekHold`/`SeekRelease`, ease-out,
+  landing commits seamlessly — the clock re-anchors at the landing
+  position). Release during play ramps back to the play speed; release
+  from pause is an instant stop on the current frame (no drift — precise
+  scrubbing). Timeline drag = discrete `Seek` per frame, sticks to the
+  cursor, no ramps. The clock itself is a pure `Clock` struct (position =
+  base + ∫speed) covered by unit tests
+- Remote: `toggle-play`, `set-play-speed <pct>`, `seek-hold <x>`,
+  `seek-release` (the latter two mirror the hold gesture for testing)
 
 ## Configuration
 

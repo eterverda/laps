@@ -37,7 +37,7 @@ pub struct RaceRules {
 impl Default for RaceRules {
     fn default() -> Self {
         RaceRules {
-            duration: Duration::from_secs(90),
+            duration: Duration::from_secs(15),
             start_signal_delay: Default::default(),
         }
     }

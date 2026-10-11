@@ -384,6 +384,7 @@ impl Scrub {
                 self.header.show(ui, header_rect);
 
                 if columns > 0 {
+                    let alt = ui.input(|i| i.modifiers.alt);
                     for (i, (pad_id, pad)) in pads.into_iter().enumerate() {
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - viewfinder_cols) / 2;
@@ -410,6 +411,41 @@ impl Scrub {
                                 frame_contents,
                                 rect,
                             );
+                            // Alt: эффективное разрешение вьюпорта в
+                            // линиях (высота файла × высота viewport'а).
+                            // Правый нижний угол текста — на клетку влево
+                            // и вверх от правого нижнего угла картинки.
+                            // Пока файл открывается — без значка.
+                            if alt {
+                                let val =
+                                    self.players.get(&pad.fpv.camera_id).and_then(|p| {
+                                        match p.open_state() {
+                                            PlayerState::Ready => p.resolution().map(|r| {
+                                                let lines = r.height as f32
+                                                    * (pad.fpv.viewport.bottom
+                                                        - pad.fpv.viewport.top);
+                                                format!("{}p", lines.round() as u32)
+                                            }),
+                                            PlayerState::Failed(_) => Some("error".to_owned()),
+                                            PlayerState::Opening => None,
+                                        }
+                                    });
+                                if let Some(val) = val {
+                                    let row = grid::CELL_SIZE.y;
+                                    let width =
+                                        super::measure_text(ui.ctx(), style::FONT_REGULAR, &val).x;
+                                    let right = rect.right() - grid::cell_x(1);
+                                    let bottom = rect.bottom() - grid::cell_y(1);
+                                    // Пол-высоты клетки вниз — визуальная
+                                    // центровка значка на картинке.
+                                    let text = egui::Rect::from_min_max(
+                                        egui::pos2(right - width, bottom - row),
+                                        egui::pos2(right, bottom),
+                                    )
+                                    .translate(egui::vec2(0.0, row * 0.5));
+                                    view::hint_badge(ui, text, egui::Align2::RIGHT_BOTTOM, &[val]);
+                                }
+                            }
                         });
                     }
                 }
@@ -419,7 +455,7 @@ impl Scrub {
                 // hold), PLAY тоглит всех плееров. Цвет перемотки: белый
                 // пока нажата, иначе серый.
                 let rew_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
-                    grid::whole_cols(view::content_width(ui.ctx(), "\u{25c0}\u{25c0} REW", "")),
+                    grid::whole_cols(view::content_width(ui.ctx(), "\u{25c0}\u{25c0} REW")),
                     -2,
                 );
                 let rew_color = if self.rew.down {
@@ -427,8 +463,11 @@ impl Scrub {
                 } else {
                     egui::Color32::DARK_GRAY
                 };
-                let rew_response = view::BigButton::new("\u{25c0}\u{25c0} REW", "", "", rew_color)
-                    .show(ui, rew_rect, ui.make_persistent_id("status_rew"));
+                let rew_response = view::BigButton::new("\u{25c0}\u{25c0} REW", rew_color).show(
+                    ui,
+                    rew_rect,
+                    ui.make_persistent_id("status_rew"),
+                );
                 // Тап может уложиться в один кадр — виден только clicked(),
                 // как на таймлайне.
                 self.seek_tick(ui, &rew_response, true);
@@ -442,10 +481,10 @@ impl Scrub {
                     egui::Color32::DARK_GRAY
                 };
                 let play_rect = rew_rect.right_bottom().into_cell().translate(2, 0).extrude(
-                    grid::whole_cols(view::content_width(ui.ctx(), "\u{25b6} PLAY", "")),
+                    grid::whole_cols(view::content_width(ui.ctx(), "\u{25b6} PLAY")),
                     -2,
                 );
-                let play_response = view::BigButton::new("\u{25b6} PLAY", "", "", play_color).show(
+                let play_response = view::BigButton::new("\u{25b6} PLAY", play_color).show(
                     ui,
                     play_rect,
                     ui.make_persistent_id("status_play"),
@@ -459,7 +498,7 @@ impl Scrub {
                     .into_cell()
                     .translate(2, 0)
                     .extrude(
-                        grid::whole_cols(view::content_width(ui.ctx(), "\u{25b6}\u{25b6} FF", "")),
+                        grid::whole_cols(view::content_width(ui.ctx(), "\u{25b6}\u{25b6} FF")),
                         -2,
                     );
                 let ff_color = if self.ff.down {
@@ -467,21 +506,20 @@ impl Scrub {
                 } else {
                     egui::Color32::DARK_GRAY
                 };
-                let ff_response = view::BigButton::new("\u{25b6}\u{25b6} FF", "", "", ff_color)
-                    .show(ui, ff_rect, ui.make_persistent_id("status_ff"));
+                let ff_response = view::BigButton::new("\u{25b6}\u{25b6} FF", ff_color).show(
+                    ui,
+                    ff_rect,
+                    ui.make_persistent_id("status_ff"),
+                );
                 self.seek_tick(ui, &ff_response, false);
 
                 // LOOP: пока некликабельна (повтор фрагмента — потом).
                 let loop_rect = ff_rect.right_bottom().into_cell().translate(2, 0).extrude(
-                    grid::whole_cols(view::content_width(ui.ctx(), "\u{F0456} RPT", "")),
+                    grid::whole_cols(view::content_width(ui.ctx(), "\u{F0456} RPT")),
                     -2,
                 );
-                let loop_response =
-                    view::BigButton::new("\u{F0456} RPT", "", "", egui::Color32::DARK_GRAY).show(
-                        ui,
-                        loop_rect,
-                        ui.make_persistent_id("status_loop"),
-                    );
+                let loop_response = view::BigButton::new("\u{F0456} RPT", egui::Color32::DARK_GRAY)
+                    .show(ui, loop_rect, ui.make_persistent_id("status_loop"));
 
                 // Скролл над контролом — шаг по его шкале: вверх — к
                 // началу списка (быстрее/больше), вниз — к концу.
@@ -516,9 +554,9 @@ impl Scrub {
                     let icon = words.next().unwrap_or("");
                     let word = words.next().unwrap_or("");
                     let x = rect.left()
-                        + view::content_width(ui.ctx(), icon, "")
+                        + view::content_width(ui.ctx(), icon)
                         + grid::cell_x(1)
-                        + view::content_width(ui.ctx(), word, "") / 2.0;
+                        + view::content_width(ui.ctx(), word) / 2.0;
                     ui.painter().text(
                         egui::pos2(x, label_y),
                         egui::Align2::CENTER_TOP,
@@ -553,9 +591,10 @@ impl Scrub {
                 );
                 // Время первичного плеера крупно (мм:сс.ммм) — отдельно
                 // от таймлайна; таймлайну достаётся rect под линию.
-                // Позиция и цвет — как у таймера RACE в live: тот же ряд
-                // (LIVE, REC, RACE по два отступа), низ кнопки, серый как
-                // в покое.
+                // Позиция свойственна scrub'у: за правым краем ряда
+                // контролов (после RPT). Расчёт намеренно разведён с
+                // таймером RACE в live — сведём обратно, когда
+                // унифицируем ui.
                 if let Some(primary) = self.primary() {
                     let (pos, dur, state) = (
                         primary.position_ms(),
@@ -563,13 +602,7 @@ impl Scrub {
                         primary.open_state(),
                     );
                     let text_pos = egui::pos2(
-                        grid::cell_x(2)
-                            + view::content_width(ui.ctx(), "\u{e602} LIVE", "--fps")
-                            + grid::cell_x(2)
-                            + view::content_width(ui.ctx(), "\u{f044a} REC", "--fps")
-                            + grid::cell_x(2)
-                            + view::content_width(ui.ctx(), "\u{f140b} RACE", "")
-                            + grid::cell_x(2),
+                        loop_rect.right() + grid::cell_x(2),
                         play_rect.left_bottom().y,
                     );
                     match &state {
@@ -620,8 +653,8 @@ impl Scrub {
                                     // базлайна, доп-таймер — в строке под
                                     // ними.
                                     let row = grid::cell_at(play_rect.left_bottom()).row;
-                                    let x = text_pos.x
-                                        + view::content_width(ui.ctx(), &pos_text, "") / 2.0;
+                                    let x =
+                                        text_pos.x + view::content_width(ui.ctx(), &pos_text) / 2.0;
                                     ui.painter().text(
                                         egui::pos2(x, grid::cell_y(row)),
                                         egui::Align2::CENTER_TOP,
@@ -634,7 +667,7 @@ impl Scrub {
                             // Шкала — только у готового плеера.
                             if state == PlayerState::Ready {
                                 let x0 = text_pos.x
-                                    + view::content_width(ui.ctx(), &pos_text, "")
+                                    + view::content_width(ui.ctx(), &pos_text)
                                     + grid::cell_x(3);
                                 let rect = egui::Rect::from_min_max(
                                     egui::pos2(x0, play_rect.top()),

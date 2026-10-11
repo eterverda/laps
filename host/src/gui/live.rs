@@ -47,12 +47,6 @@ pub struct Live {
     setup: Setup,
     assignments: HashMap<String, Pilot>,
     active_cameras: HashMap<String, CameraConfig>,
-    // Показываемый fps: считаем на UI по забранным кадрам, только по
-    // первой камере (как и остальные цифры статуса).
-    shown: crate::driver::camera::fps::FpsCounter,
-    /// Последний измеренный fps; 0.0 = замера ещё не было, UI покажет
-    /// "-- fps". Пауза кадров значение не затирает.
-    shown_fps: f32,
 }
 
 impl From<Box<Live>> for State {
@@ -90,8 +84,6 @@ impl Live {
             setup,
             assignments,
             active_cameras,
-            shown: crate::driver::camera::fps::FpsCounter::default(),
-            shown_fps: 0.0,
         }
     }
 
@@ -119,12 +111,9 @@ impl Live {
         // Pending while the webcam runs but produced nothing yet. A camera
         // absent from this map means Off for its viewports.
         let mut contents: HashMap<String, viewfinder::ViewfinderContents> = HashMap::new();
-        let primary_id = self.active_cameras.keys().next().cloned();
         for (id, webcam) in self.webcams.iter_mut() {
             let capture_state = webcam.capture_state();
-            if webcam.update_frame() && Some(id) == primary_id.as_ref() {
-                self.shown.on_frame();
-            }
+            webcam.update_frame();
             // Поток мёртв (камера не найдена, отвалилась) — testcard вместо
             // замершей последней текстуры. Starting тоже testcard: кадров
             // ещё нет (Live ставится по первому кадру).
@@ -134,11 +123,6 @@ impl Live {
                 viewfinder::ViewfinderContents::Pending
             };
             contents.insert(id.clone(), state);
-        }
-        // Пассивный замер: считается только по поступающим кадрам,
-        // пустое окно последнее значение не затирает.
-        if let Some(fps) = self.shown.fps() {
-            self.shown_fps = fps as f32;
         }
 
         view::Letterbox::new(grid::cell(160, 45))
@@ -172,6 +156,28 @@ impl Live {
                         );
                     }
                 }
+
+                // Alt: рамка вьюпорта каждого вьюфайндера — в линиях
+                // (эффективная высота = высота кадра × высота viewport'а).
+                // Мёртвый поток → error. Разрешение кадра берём здесь, до
+                // заимствований letterbox-замыкания.
+                let alt = ui.input(|i| i.modifiers.alt);
+                let frame_res: HashMap<String, Option<crate::config::camera::ResolutionConfig>> =
+                    if alt {
+                        self.active_cameras
+                            .iter()
+                            .map(|(id, cfg)| {
+                                let res = match self.webcams.get(id) {
+                                    Some(w) if w.capture_state() == CaptureState::Dead => None,
+                                    Some(w) => Some(w.resolution().unwrap_or(cfg.resolution)),
+                                    None => Some(cfg.resolution),
+                                };
+                                (id.clone(), res)
+                            })
+                            .collect()
+                    } else {
+                        HashMap::new()
+                    };
 
                 let bottom_right = grid::cell_at(ui.max_rect().max);
 
@@ -211,6 +217,31 @@ impl Live {
                                 webcam_contents,
                                 rect,
                             );
+                            // Alt: эффективное разрешение вьюпорта. Правый
+                            // нижний угол текста — на клетку влево и вверх
+                            // от правого нижнего угла картинки.
+                            if let Some(res) = frame_res.get(&pad.fpv.camera_id) {
+                                let val = res
+                                    .map(|r| {
+                                        let lines = r.height as f32
+                                            * (pad.fpv.viewport.bottom - pad.fpv.viewport.top);
+                                        format!("{}p", lines.round() as u32)
+                                    })
+                                    .unwrap_or_else(|| "error".to_owned());
+                                let row = grid::CELL_SIZE.y;
+                                let width =
+                                    super::measure_text(ui.ctx(), style::FONT_REGULAR, &val).x;
+                                let right = rect.right() - grid::cell_x(1);
+                                let bottom = rect.bottom() - grid::cell_y(1);
+                                // Пол-высоты клетки вниз — визуальная
+                                // центровка значка на картинке.
+                                let text = egui::Rect::from_min_max(
+                                    egui::pos2(right - width, bottom - row),
+                                    egui::pos2(right, bottom),
+                                )
+                                .translate(egui::vec2(0.0, row * 0.5));
+                                view::hint_badge(ui, text, egui::Align2::RIGHT_BOTTOM, &[val]);
+                            }
                         });
 
                         let graph_rect = viewfinder_rect
@@ -244,23 +275,12 @@ impl Live {
 
                 // Статус-бар: LIVE, REC, RACE. LIVE и REC — независимые
                 // виджеты: клик по LIVE тогглит захват, клик по REC —
-                // запись. Мелкий текст справа от названия: error при
-                // отвале, измеренный fps после замера, "-- fps" до замера,
-                // заявленный fps в покое. Кликабельна вся область.
+                // запись. Время сессии — под плашкой: одинарным шрифтом
+                // по центру, цветом подложки; пока сессии нет — не
+                // рисуется. Кликабельна вся область плашки.
                 let live_state = self.webcams.values().next().map(|w| w.capture_state());
                 let rec_active = self.webcams.values().any(|w| w.record_state().ok);
                 let feed_on = !matches!(self.feed, FeedState::Off);
-                let cfg_fps = self
-                    .active_cameras
-                    .values()
-                    .next()
-                    .map(|camera| camera.frame_rate);
-                let dvr_fps = self
-                    .active_cameras
-                    .values()
-                    .next()
-                    .map(|camera| camera.dvr.frame_rate.unwrap_or(camera.frame_rate));
-                let rec_fps = self.webcams.values().next().map(|w| w.record_state().fps);
 
                 // Шкала Status — напрямую из FeedState × CaptureState:
                 // Dead при включённом эфире — error; кадры идут или поток
@@ -271,33 +291,30 @@ impl Live {
                     _ if feed_on => Status::Active,
                     _ => Status::Idle,
                 };
-                let live_color = match live_status {
-                    Status::Idle => egui::Color32::DARK_GRAY,
-                    _ => egui::Color32::WHITE,
-                };
-                let live_text = match live_status {
-                    Status::Error => "error".to_owned(),
-                    Status::Active => {
-                        if self.shown_fps > 0.0 {
-                            format!("{:.0}fps", self.shown_fps)
-                        } else {
-                            "--fps".to_owned()
-                        }
-                    }
-                    Status::Idle => cfg_fps.map(|f| f.to_string()).unwrap_or_default(),
-                };
                 let live_timer = session_timer(self.feed.live_since());
                 let rec_timer = session_timer(self.feed.rec_since());
-                let live_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
-                    grid::whole_cols(view::content_width(ui.ctx(), "\u{e602} LIVE", &live_text)),
-                    -2,
-                );
-                let live_response =
-                    view::BigButton::new("\u{e602} LIVE", &live_timer, &live_text, live_color)
-                        .show(ui, live_rect, ui.make_persistent_id("status_live"));
-                if live_response.clicked() {
-                    action = Action::ToggleLive;
-                }
+                // Плашки-стрелки цепочкой (PowerShell): каждая правая
+                // наползает на наконечник левой, поэтому левая часть
+                // плашки начинается в 2 клетках левее текста и рисуются
+                // они справа налево — правая под левой. Вокруг текста —
+                // по две колонки воздуха с каждой стороны (левая часть
+                // уходит под наконечник соседа, тексты разнесены на 6
+                // колонок, чтобы воздух не съедался). Состояние — пара
+                // (подложка, текст):
+                // тусклая + чёрный в покое, насыщенная + белый в активе.
+                // Счётчик RACE — дальше, без плашки.
+                let tip = grid::cell_x(2);
+                let overlap = grid::cell_x(2);
+                let air = grid::cell_x(2);
+                let live_text_w = view::content_width(ui.ctx(), "\u{25b6} LIVE");
+                let live_rect = grid::cell(1, bottom_right.row)
+                    .translate(1, -1)
+                    .extrude(grid::whole_cols(live_text_w), -2);
+                let live_plate = live_rect
+                    .with_min_x(live_rect.left() - overlap - air)
+                    .with_max_x(live_rect.right() + air + tip);
+                let (live_plate_color, live_text_color) =
+                    plate_colors(live_status, PLATE_LIVE_IDLE, PLATE_LIVE);
 
                 let feed_rec = matches!(self.feed, FeedState::Rec { .. });
                 let rec_status =
@@ -308,60 +325,38 @@ impl Live {
                     } else {
                         Status::Idle
                     };
-                let rec_color = match rec_status {
-                    Status::Idle => egui::Color32::DARK_GRAY,
-                    _ => egui::Color32::RED,
-                };
-                let rec_text = match rec_status {
-                    Status::Error => "error".to_owned(),
-                    // feed == Rec (Active или переходный Idle): замерили —
-                    // fps, нет — "--fps".
-                    _ if feed_rec => {
-                        if rec_fps.unwrap_or_default() > 0.0 {
-                            format!("{:.0}fps", rec_fps.unwrap())
-                        } else {
-                            "--fps".to_owned()
-                        }
-                    }
-                    Status::Active if rec_fps.unwrap_or_default() > 0.0 => {
-                        format!("{:.0}fps", rec_fps.unwrap())
-                    }
-                    _ => dvr_fps.map(|f| f.to_string()).unwrap_or_default(),
-                };
+                let rec_text_w = view::content_width(ui.ctx(), "\u{f044a} REC");
                 let rec_rect = live_rect
                     .right_bottom()
                     .into_cell()
-                    .translate(2, 0)
-                    .extrude(
-                        grid::whole_cols(view::content_width(ui.ctx(), "\u{f044a} REC", &rec_text)),
-                        -2,
-                    );
-                let rec_response =
-                    view::BigButton::new("\u{f044a} REC", &rec_timer, &rec_text, rec_color).show(
-                        ui,
-                        rec_rect,
-                        ui.make_persistent_id("status_rec"),
-                    );
-                if rec_response.clicked() {
-                    action = Action::ToggleRec;
-                }
+                    .translate(6, 0)
+                    .extrude(grid::whole_cols(rec_text_w), -2);
+                let rec_plate = rec_rect
+                    .with_min_x(rec_rect.left() - overlap - air)
+                    .with_max_x(rec_rect.right() + air + tip);
+                let (rec_plate_color, rec_text_color) =
+                    plate_colors(rec_status, PLATE_REC_IDLE, PLATE_REC);
 
-                // RACE и счётчик — один контрол: кнопка + таймер одного
-                // размера и цвета. Ширина фиксирована — по полному тексту
-                // (счётчик фиксированной ширины, кнопка не прыгает).
+                // RACE и счётчик — один контрол: кликабельны плашка и
+                // счётчик. Ширина плашки — по слову RACE (счётчик вне её).
                 let race_active = self.race.active();
-                let race_color = if race_active {
-                    RACE_COLOR
-                } else {
-                    egui::Color32::DARK_GRAY
-                };
-                let race_rect = rec_rect.right_bottom().into_cell().translate(2, 0).extrude(
-                    grid::whole_cols(view::content_width(
-                        ui.ctx(),
-                        "\u{f140b} RACE 00:00.000",
-                        "",
-                    )),
-                    -2,
+                let race_text_w = view::content_width(ui.ctx(), "\u{f140b} RACE");
+                let race_rect = rec_rect
+                    .right_bottom()
+                    .into_cell()
+                    .translate(6, 0)
+                    .extrude(grid::whole_cols(race_text_w), -2);
+                let race_plate = race_rect
+                    .with_min_x(race_rect.left() - overlap - air)
+                    .with_max_x(race_rect.right() + air + tip);
+                let (race_plate_color, race_text_color) = plate_colors(
+                    if race_active {
+                        Status::Active
+                    } else {
+                        Status::Idle
+                    },
+                    PLATE_RACE_IDLE,
+                    PLATE_RACE,
                 );
                 // Мигание привязано к началу времени гонки (фазы по
                 // 500 мс назад от него): последняя фаза ПОГАС кончается
@@ -376,29 +371,184 @@ impl Live {
                             % 1000
                             >= 500
                 );
-                let race_response = view::BigButton::new("\u{f140b} RACE", "", "", race_color)
-                    .show(ui, race_rect, ui.make_persistent_id("status_race"));
+                let race_timer = race_text(&self.race, Instant::now());
+                let timer_pos = egui::pos2(
+                    race_plate.right() + grid::cell_x(1),
+                    race_rect.left_bottom().y,
+                );
+                // Плашки — справа налево: правая уходит под левую.
+                view::arrow_plate(ui, race_plate, race_plate_color);
+                view::arrow_plate(ui, rec_plate, rec_plate_color);
+                view::arrow_plate(ui, live_plate, live_plate_color);
+
+                let live_id = ui.make_persistent_id("status_live");
+                // Клик-бласть — плашка без наконечника: уголок не кликабелен.
+                let live_hit = live_plate.with_max_x(live_plate.right() - tip);
+                let live_response = view::BigButton::new("\u{25b6} LIVE", live_text_color)
+                    .show(ui, live_rect, live_id)
+                    .union(
+                        ui.interact(live_hit, live_id.with("hit"), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand),
+                    );
+                if live_response.clicked() {
+                    action = Action::ToggleLive;
+                }
+                // Время сессии — под плашкой, по левому краю текста (на 3
+                // колонки правее края плашки: иконка + пробел), цветом
+                // подложки.
+                if !live_timer.is_empty() {
+                    ui.painter().text(
+                        egui::pos2(live_rect.left() + grid::cell_x(3), live_plate.bottom()),
+                        egui::Align2::LEFT_TOP,
+                        &live_timer,
+                        style::FONT_REGULAR,
+                        live_plate_color,
+                    );
+                }
+
+                let rec_id = ui.make_persistent_id("status_rec");
+                // Клик-бласть — видимое тело плашки: без наконечника
+                // справа и без левого хвоста под наконечником соседа
+                // (начинается от левого воздуха).
+                let rec_hit = rec_plate
+                    .with_min_x(rec_rect.left() - air)
+                    .with_max_x(rec_plate.right() - tip);
+                let rec_response = view::BigButton::new("\u{f044a} REC", rec_text_color)
+                    .show(ui, rec_rect, rec_id)
+                    .union(
+                        ui.interact(rec_hit, rec_id.with("hit"), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand),
+                    );
+                if rec_response.clicked() {
+                    action = Action::ToggleRec;
+                }
+                if !rec_timer.is_empty() {
+                    ui.painter().text(
+                        egui::pos2(rec_rect.left() + grid::cell_x(3), rec_plate.bottom()),
+                        egui::Align2::LEFT_TOP,
+                        &rec_timer,
+                        style::FONT_REGULAR,
+                        rec_plate_color,
+                    );
+                }
+
+                // Alt: fps-подсказки над LIVE/REC — перечисление камер
+                // (первая — ближе всех к кнопке, дальше растём вверх).
+                // Трансляция/запись не идут — целевой fps камеры; поток
+                // мёртв или запись провалилась — error.
+                if ui.input(|i| i.modifiers.alt) {
+                    // Значок камеры (\u{f03d}) — в каждой строке LIVE;
+                    // значок записи (\u{f16df}) — в каждой строке
+                    // REC, а при ошибке именно камеры к ней добавляется и
+                    // значок камеры. Подсказки на 2 колонки левее колонки
+                    // текста кнопки — под эти значки.
+                    let live_lines: Vec<String> = self
+                        .active_cameras
+                        .iter()
+                        .map(|(id, cfg)| match self.webcams.get(id) {
+                            Some(w) if w.capture_state() == CaptureState::Dead => {
+                                "\u{f03d} error".to_owned()
+                            }
+                            Some(w) => w
+                                .fps()
+                                .map(|f| format!("\u{f03d} {f}fps"))
+                                .unwrap_or_else(|| format!("\u{f03d} {}", cfg.frame_rate)),
+                            None => format!("\u{f03d} {}", cfg.frame_rate),
+                        })
+                        .collect();
+                    fps_hint(
+                        ui,
+                        live_plate,
+                        live_rect.left() + grid::cell_x(1),
+                        &live_lines,
+                    );
+
+                    let rec_lines: Vec<String> = self
+                        .active_cameras
+                        .iter()
+                        .map(|(id, cfg)| {
+                            let target = cfg.dvr.frame_rate.unwrap_or(cfg.frame_rate);
+                            match self.webcams.get(id) {
+                                // Мёртвый захват тянет за собой ошибку
+                                // записи: error независимо от того,
+                                // стартовал ли writer (иначе до этой
+                                // ветки не доходит проверка и рисуется
+                                // целевой fps).
+                                Some(w) if w.capture_state() == CaptureState::Dead => {
+                                    "\u{f03d} error".to_owned()
+                                }
+                                Some(w) if rec_active && !w.record_state().ok => {
+                                    "\u{f16df} error".to_owned()
+                                }
+                                Some(w) if w.record_state().ok && w.record_state().fps > 0.0 => {
+                                    format!("\u{f16df} {:.0}fps", w.record_state().fps)
+                                }
+                                _ => format!("\u{f16df} {target}"),
+                            }
+                        })
+                        .collect();
+                    fps_hint(ui, rec_plate, rec_rect.left() + grid::cell_x(1), &rec_lines);
+
+                    // RACE: не идёт — длина гонки с заглавной сигмой
+                    // (суммарное время); идёт — остаток со знаком минус.
+                    let race_hint = match self.race {
+                        RaceState::Running { .. } => {
+                            let left = self
+                                .rules
+                                .duration
+                                .saturating_sub(self.race.elapsed(Instant::now()));
+                            format!("-{}", mmss(left))
+                        }
+                        _ => format!("Σ{}", mmss(self.rules.duration)),
+                    };
+                    fps_hint(
+                        ui,
+                        race_plate,
+                        race_rect.left() + grid::cell_x(3),
+                        &[race_hint],
+                    );
+                }
+
+                // Клик-бласть — видимое тело плашки (без наконечника и без
+                // левого хвоста под наконечником соседа) плюс счётчик.
+                let race_body = race_plate
+                    .with_min_x(race_rect.left() - air)
+                    .with_max_x(race_plate.right() - tip);
+                let race_timer_hit = egui::Rect::from_min_max(
+                    egui::pos2(race_plate.right() + grid::cell_x(1), race_plate.top()),
+                    egui::pos2(
+                        timer_pos.x
+                            + super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, &race_timer).x,
+                        race_plate.bottom(),
+                    ),
+                );
+                let race_id = ui.make_persistent_id("status_race");
+                let race_response = view::BigButton::new("\u{f140b} RACE", race_text_color)
+                    .show(ui, race_rect, race_id)
+                    .union(
+                        ui.interact(race_body, race_id.with("hit"), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand),
+                    )
+                    .union(
+                        ui.interact(race_timer_hit, race_id.with("timer"), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand),
+                    );
                 if race_response.clicked() {
                     action = Action::ToggleRace;
                 }
-                // Слово счётчика — тот же кегль и цвет, что у кнопки;
-                // яркость задаёт фаза мигания. Замерший итог состоявшейся
-                // гонки горит кислотно-жёлтым, пока кнопка серая; сброс
-                // в нули — без результата, цвет как в покое.
-                let timer_color = match self.race {
-                    _ if self.race.has_result() => RACE_COLOR,
-                    _ if blink_off => race_color.gamma_multiply(0.2),
-                    _ => race_color,
+                // Цвет счётчика: бежит белым; фаза ПОГАС мигания и нули
+                // вне отсчёта (покой, обнулённый финиш) — 20% белого.
+                let zeros_dim = matches!(self.race, RaceState::Idle)
+                    || matches!(&self.race, RaceState::Finished { elapsed } if elapsed.is_zero());
+                let timer_color = if blink_off || zeros_dim {
+                    egui::Color32::WHITE.gamma_multiply(0.2)
+                } else {
+                    egui::Color32::WHITE
                 };
                 ui.painter().text(
-                    egui::pos2(
-                        race_rect.left()
-                            + view::content_width(ui.ctx(), "\u{f140b} RACE", "")
-                            + grid::cell_x(2),
-                        race_rect.left_bottom().y,
-                    ),
+                    timer_pos,
                     egui::Align2::LEFT_BOTTOM,
-                    race_text(&self.race, Instant::now()),
+                    race_timer,
                     style::FONT_REGULAR_X2,
                     timer_color,
                 );
@@ -432,7 +582,6 @@ impl Live {
         match self.feed {
             FeedState::Off => {
                 self.start_captures(ctx);
-                self.reset_shown_fps();
                 self.screen_awake();
                 self.feed = FeedState::Live {
                     since: Instant::now(),
@@ -467,7 +616,6 @@ impl Live {
             FeedState::Off => {
                 self.start_captures(ctx);
                 self.start_recording_all();
-                self.reset_shown_fps();
                 self.screen_awake();
                 let now = Instant::now();
                 self.feed = FeedState::Rec {
@@ -521,14 +669,6 @@ impl Live {
             Ok(awake) => self.awake = Some(awake),
             Err(e) => log::warn!("screen inhibit failed: {e}"),
         }
-    }
-
-    // Сброс замера показа: fps считаем от старта захвата, иначе первые
-    // штампы тянут интервал с момента создания экрана. Пока замера нет —
-    // "-- fps".
-    fn reset_shown_fps(&mut self) {
-        self.shown.reset();
-        self.shown_fps = 0.0;
     }
 
     // --- Гонка (RACE) ----------------------------------------------------
@@ -735,22 +875,36 @@ impl RaceState {
             RaceState::Countdown { .. } | RaceState::Running { .. }
         )
     }
-
-    /// Гонка состоялась: замершее время ненулевое (итог горит, пока
-    /// кнопка серая). Сброс в нули результата не даёт.
-    fn has_result(&self) -> bool {
-        matches!(self, RaceState::Finished { elapsed } if !elapsed.is_zero())
-    }
 }
 
 /// Звуки гонки: live их и проигрывает. Бинари — в `assets`.
 const STAGE: audio::Sound = audio::Sound::from_bytes(crate::assets::STAGE_WAV);
 const BUZZER: audio::Sound = audio::Sound::from_bytes(crate::assets::BUZZER_WAV);
 
-/// Кислотно-жёлтый кнопки RACE в активной фазе — и замершего итога,
-/// если гонка состоялась (ненулевое время): кнопка гаснет, результат
-/// горит.
-const RACE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xCC, 0xFF, 0x00);
+/// Подложки кнопок-стрелок. Активные: LIVE — ярко-голубой, REC —
+/// gruvbox red, RACE — кислотный yellow-green: тройка далеко по кругу.
+/// В покое — пригашенные светлые оттенки. Текст всегда чёрный.
+const PLATE_LIVE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x54, 0x70, 0x7D);
+const PLATE_LIVE: egui::Color32 = egui::Color32::from_rgb(0x4F, 0xB3, 0xE0);
+const PLATE_REC_IDLE: egui::Color32 = egui::Color32::from_rgb(0x7E, 0x4C, 0x46);
+const PLATE_REC: egui::Color32 = egui::Color32::from_rgb(0xE0, 0x30, 0x24);
+const PLATE_RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x7C, 0x49);
+/// Активный RACE — кислотно-жёлтый гоночного режима (изначальный
+/// RACE_COLOR, см. git history).
+const PLATE_RACE: egui::Color32 = egui::Color32::from_rgb(0xCC, 0xFF, 0x00);
+
+/// (подложка, текст) кнопки-стрелки: в покое пригашенный оттенок, в
+/// активе насыщенный; текст всегда чёрный.
+fn plate_colors(
+    status: Status,
+    idle: egui::Color32,
+    active: egui::Color32,
+) -> (egui::Color32, egui::Color32) {
+    match status {
+        Status::Idle => (idle, egui::Color32::BLACK),
+        _ => (active, egui::Color32::BLACK),
+    }
+}
 
 /// Фиксированная фаза бипов отсчёта: PRE_BEEP_SECS бипов с периодом
 /// 1 с, затем случайный интервал из StartSignalDelay, затем гудок.
@@ -807,8 +961,34 @@ fn session_timer(since: Option<Instant>) -> String {
     let Some(since) = since else {
         return String::new();
     };
-    let secs = since.elapsed().as_secs();
+    mmss(since.elapsed())
+}
+
+/// mm:ss от длительности: полные минуты и секунды.
+fn mmss(dur: Duration) -> String {
+    let secs = dur.as_secs();
     format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+/// Блок fps-подсказки над кнопкой (по Alt): строки по камерам, первая —
+/// через одну ячейку над плашкой, остальные растут вверх. Левый край
+/// текста — по колонке текста кнопки.
+fn fps_hint(ui: &mut egui::Ui, anchor: egui::Rect, text_x: f32, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let row = grid::CELL_SIZE.y;
+    let bottom = anchor.top() - row;
+    let top = bottom - row * lines.len() as f32;
+    let width = lines
+        .iter()
+        .map(|line| super::measure_text(ui.ctx(), style::FONT_REGULAR, line).x)
+        .fold(0.0f32, f32::max);
+    // Пол-высоты клетки вниз — визуальная центровка значка.
+    let text =
+        egui::Rect::from_min_max(egui::pos2(text_x, top), egui::pos2(text_x + width, bottom))
+            .translate(egui::vec2(0.0, row * 0.5));
+    view::hint_badge(ui, text, egui::Align2::LEFT_BOTTOM, lines);
 }
 
 struct Res;

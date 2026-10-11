@@ -63,11 +63,6 @@ impl FpsCounter {
         }
         Some(((self.frames.len() - 1) as f64 / span.as_secs_f64()).round() as u32)
     }
-
-    /// Очистка: до следующего порога по `report_after` fps() снова None.
-    pub fn reset(&mut self) {
-        self.frames.clear();
-    }
 }
 
 /// Статистика кадровых задержек и длительностей фаз: num/min/avg/max/p90.
@@ -244,25 +239,6 @@ mod tests {
             counter.on_frame_at(base);
         }
         assert_eq!(counter.fps(), None);
-    }
-
-    #[test]
-    fn reset_clears_measurements() {
-        let base = Instant::now();
-        let mut counter = steady(base, 33_333, 40);
-        assert_eq!(counter.fps(), Some(30));
-
-        counter.reset();
-        assert_eq!(counter.fps(), None);
-
-        // Порог снова по span: 8 интервалов по 33.3 мс = 0.23 с — None,
-        // 9-й кадр доводит span до 0.27 с — отчёт.
-        for i in 1..=8 {
-            counter.on_frame_at(at(base, 2_000_000 + i * 33_333));
-        }
-        assert_eq!(counter.fps(), None);
-        counter.on_frame_at(at(base, 2_000_000 + 9 * 33_333));
-        assert_eq!(counter.fps(), Some(30));
     }
 
     mod frame_stats {

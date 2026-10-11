@@ -135,8 +135,7 @@ impl Letterbox {
 }
 
 /// Большая кнопка статуса: текст слева (слова через одинарные пробелы —
-/// по одной ячейке), верхняя мелкая строка у правого края, нижняя —
-/// правее крупного текста. Rect кнопки приходит снаружи целиком и должен
+/// по одной ячейке). Rect кнопки приходит снаружи целиком и должен
 /// покрывать весь контент — ширину считает вызывающий код (см.
 /// content_width). Ховер и клик — по пришедшему rect, Response
 /// возвращается наружу — действие решает вызывающий код.
@@ -144,19 +143,12 @@ pub struct BigButton<'a> {
     /// Левая строка кнопки: разбивается по пробелам, слова рисуются
     /// в ряд, между ними — одинарный (1 ячейка) пробел.
     pub text: &'a str,
-    pub top: &'a str,
-    pub bottom: &'a str,
     pub color: egui::Color32,
 }
 
 impl<'a> BigButton<'a> {
-    pub fn new(text: &'a str, top: &'a str, bottom: &'a str, color: egui::Color32) -> Self {
-        Self {
-            text,
-            top,
-            bottom,
-            color,
-        }
+    pub fn new(text: &'a str, color: egui::Color32) -> Self {
+        Self { text, color }
     }
 
     pub fn show(&self, ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id) -> egui::Response {
@@ -177,34 +169,13 @@ impl<'a> BigButton<'a> {
             pos.x += super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, word).x
                 + super::grid::cell_x(1);
         }
-        if !self.top.is_empty() {
-            painter.text(
-                rect.right_top(),
-                egui::Align2::RIGHT_TOP,
-                self.top,
-                super::style::FONT_REGULAR,
-                self.color,
-            );
-        }
-        if !self.bottom.is_empty() {
-            // Мелкая строка — правее крупного текста (курсор после цикла
-            // слов уже стоит на одну ячейку за его концом), а не у правого
-            // края rect: иначе она наезжает под слова.
-            painter.text(
-                pos,
-                egui::Align2::LEFT_BOTTOM,
-                self.bottom,
-                super::style::FONT_REGULAR,
-                self.color,
-            );
-        }
         response
     }
 }
 
-/// Ширина контента кнопки (крупный текст + нижняя строка) в пикселях —
-/// чтобы вызывающий код мог посчитать rect.
-pub fn content_width(ctx: &egui::Context, text: &str, bottom: &str) -> f32 {
+/// Ширина текста кнопки в пикселях — чтобы вызывающий код мог
+/// посчитать rect.
+pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
     let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
     let mut width: f32 = words
         .iter()
@@ -212,13 +183,6 @@ pub fn content_width(ctx: &egui::Context, text: &str, bottom: &str) -> f32 {
         .sum();
     if words.len() > 1 {
         width += super::grid::cell_x(1) * (words.len() - 1) as f32;
-    }
-    if !bottom.is_empty() {
-        // Ячейка между последним словом и нижней строкой; без нижней
-        // строки хвостовый пробел не считаем — ховер заканчивается ровно
-        // по тексту.
-        width +=
-            super::grid::cell_x(1) + super::measure_text(ctx, super::style::FONT_REGULAR, bottom).x;
     }
     width
 }
@@ -345,4 +309,59 @@ fn stripe(
     plate
         .with_min_x(plate.min.x + super::grid::cell_x(1))
         .with_max_x(plate.max.x - super::grid::cell_x(1))
+}
+
+/// Фон-плашка-стрелка в стиле промпта PowerShell: высота две клетки,
+/// справа наконечник — контур идёт от правого верхнего угла к середине
+/// правой стороны и к правому нижнему углу, фон образует стрелку (не
+/// глиф). Rect приходит целиком (вместе с наконечником и левой частью
+/// под соседнюю плашку). Только рисует: текст вызывающий код кладёт по
+/// своему rect'у сам.
+pub fn arrow_plate(ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32) {
+    let tip = super::grid::cell_x(2);
+    let outline = vec![
+        rect.left_top(),
+        egui::pos2(rect.right() - tip, rect.top()),
+        egui::pos2(rect.right(), rect.center().y),
+        egui::pos2(rect.right() - tip, rect.bottom()),
+        rect.left_bottom(),
+    ];
+    ui.painter().add(egui::Shape::convex_polygon(
+        outline,
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// Подсказка-значок: текст выравнивается к краям text по align (координаты
+/// — в границах текста: фон и обводка рисуются за его пределами). Фон —
+/// скруглённый rect: поле и радиус — по половине ширины ячейки (и по
+/// вертикали тоже), обводка белая 1 пункт прямо по границам фона
+/// (снаружи), той же скруглённости.
+pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, lines: &[String]) {
+    let pad = super::grid::CELL_SIZE.x * 0.5;
+    let row = super::grid::CELL_SIZE.y;
+    let bg = text.expand(pad);
+    ui.painter()
+        .rect_filled(bg, pad, egui::Color32::from_rgb(0x1E, 0x1E, 0x2E));
+    ui.painter().rect_stroke(
+        bg,
+        pad,
+        egui::Stroke::new(1.0, egui::Color32::WHITE),
+        egui::StrokeKind::Outside,
+    );
+    let x = match align {
+        egui::Align2::LEFT_BOTTOM => text.left(),
+        egui::Align2::RIGHT_BOTTOM => text.right(),
+        other => unreachable!("hint_badge: unsupported align {other:?}"),
+    };
+    for (i, line) in lines.iter().enumerate() {
+        ui.painter().text(
+            egui::pos2(x, text.top() + row * (i + 1) as f32),
+            align,
+            line,
+            super::style::FONT_REGULAR,
+            egui::Color32::WHITE,
+        );
+    }
 }

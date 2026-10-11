@@ -97,6 +97,8 @@ pub struct Player {
     position_ms: Arc<AtomicCell<u64>>,
     /// 0, пока идёт open.
     duration_ms: Arc<AtomicCell<u64>>,
+    /// Разрешение файла; 0×0, пока идёт open.
+    resolution: Arc<AtomicCell<crate::driver::dvr::Resolution>>,
     commands: crossbeam_channel::Sender<Command>,
     /// Останов и join worker-потока (Drop).
     running: Arc<AtomicBool>,
@@ -113,6 +115,10 @@ impl Player {
         let seeking = Arc::new(AtomicCell::new(false));
         let position_ms = Arc::new(AtomicCell::new(0u64));
         let duration_ms = Arc::new(AtomicCell::new(0u64));
+        let resolution = Arc::new(AtomicCell::new(crate::driver::dvr::Resolution {
+            width: 0,
+            height: 0,
+        }));
         let (commands, command_rx) = crossbeam_channel::bounded::<Command>(32);
         let running = Arc::new(AtomicBool::new(true));
         // 1×1-пустышка, как у Camera: id валиден с рождения, размер
@@ -130,6 +136,7 @@ impl Player {
             let seeking = Arc::clone(&seeking);
             let position_ms = Arc::clone(&position_ms);
             let duration_ms = Arc::clone(&duration_ms);
+            let resolution = Arc::clone(&resolution);
             let running = Arc::clone(&running);
             let path = path.to_path_buf();
             move || {
@@ -142,6 +149,7 @@ impl Player {
                     seeking,
                     position_ms,
                     duration_ms,
+                    resolution,
                     running,
                     command_rx,
                 );
@@ -155,6 +163,7 @@ impl Player {
             seeking,
             position_ms,
             duration_ms,
+            resolution,
             commands,
             running,
             thread: Some(thread),
@@ -251,6 +260,12 @@ impl Player {
     /// Общая длительность: pts последнего кадра, мс. 0, пока идёт open.
     pub fn duration_ms(&self) -> u64 {
         self.duration_ms.load()
+    }
+
+    /// Разрешение файла; None, пока идёт open.
+    pub fn resolution(&self) -> Option<crate::driver::dvr::Resolution> {
+        let r = self.resolution.load();
+        (r.height > 0).then_some(r)
     }
 
     /// Текстура последнего кадра. Id стабилен с open().
@@ -419,6 +434,7 @@ fn playback_loop(
     seeking: Arc<AtomicCell<bool>>,
     position_ms: Arc<AtomicCell<u64>>,
     duration_ms: Arc<AtomicCell<u64>>,
+    resolution: Arc<AtomicCell<crate::driver::dvr::Resolution>>,
     running: Arc<AtomicBool>,
     commands: crossbeam_channel::Receiver<Command>,
 ) {
@@ -783,6 +799,7 @@ fn playback_loop(
         }
     };
     let dims = reader.resolution();
+    resolution.store(dims);
     let pts: Vec<u64> = (0..reader.frame_count())
         .map(|i| reader.timestamp(i))
         .collect();

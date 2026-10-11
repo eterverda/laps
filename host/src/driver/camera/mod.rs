@@ -147,6 +147,12 @@ pub struct Camera {
     /// Латентность live на выходе: пишет UI-поток, логает capture-поток
     /// в конце сеанса.
     ui_latency: Arc<Mutex<fps::FrameStats>>,
+    /// Показываемый fps: UI считает по забранным в update_frame кадрам.
+    shown: fps::FpsCounter,
+    /// Неготиированное разрешение потока: пишет capture-поток после
+    /// открытия сессии, UI читает (подсказки, эффективное разрешение
+    /// вьюпортов).
+    resolution: Arc<AtomicCell<Option<crate::config::camera::ResolutionConfig>>>,
     /// Останов и join capture-потока (Drop).
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -184,6 +190,8 @@ impl Camera {
         let record_state_clone = Arc::clone(&record_state);
         let running_clone = Arc::clone(&running);
         let ui_latency_thread = Arc::clone(&ui_latency);
+        let resolution = Arc::new(AtomicCell::new(None));
+        let resolution_thread = Arc::clone(&resolution);
 
         let thread = thread::spawn(move || {
             capture_loop(
@@ -194,6 +202,7 @@ impl Camera {
                 running_clone,
                 commands_rx,
                 ui_latency_thread,
+                resolution_thread,
                 on_frame,
             );
         });
@@ -205,9 +214,17 @@ impl Camera {
             record_state,
             commands: commands_tx,
             ui_latency,
+            shown: fps::FpsCounter::default(),
+            resolution,
             running,
             thread: Some(thread),
         }
+    }
+
+    /// Неготиированное разрешение захвата; None, пока сессия не
+    /// открылась (или поток умер раньше открытия).
+    pub fn resolution(&self) -> Option<crate::config::camera::ResolutionConfig> {
+        self.resolution.load()
     }
 
     /// Стрим открыт, поток камеры жив.
@@ -244,6 +261,12 @@ impl Camera {
         }
     }
 
+    /// Последний измеренный fps (окно 1 с, порог 1/4 с); None, пока
+    /// замера нет или пауза кадров вытеснила окно.
+    pub fn fps(&self) -> Option<u32> {
+        self.shown.fps()
+    }
+
     /// Забрать новый кадр из слота, если есть, и обновить текстуру.
     /// true — из слота забран новый кадр.
     pub fn update_frame(&mut self) -> bool {
@@ -261,6 +284,7 @@ impl Camera {
                 .set((*rgba).clone(), egui::TextureOptions::NEAREST);
             // Замер латентности на выходе: кадр реально отдан в текстуру.
             self.ui_latency.lock().unwrap().on_frame(&frame);
+            self.shown.on_frame();
         }
 
         fresh
@@ -284,6 +308,7 @@ fn capture_loop(
     running: Arc<AtomicBool>,
     commands_rx: crossbeam_channel::Receiver<RecordCommand>,
     ui_latency: Arc<Mutex<fps::FrameStats>>,
+    resolution: Arc<AtomicCell<Option<crate::config::camera::ResolutionConfig>>>,
     on_frame: impl Fn() + Send + Sync + 'static,
 ) {
     let (mut session, matched) = match open_session(&desc) {
@@ -294,6 +319,7 @@ fn capture_loop(
         }
     };
     let fmt = session.negotiated();
+    resolution.store(Some(fmt.resolution));
     log::info!("capture stream opened, format: {:?}", fmt);
 
     let width = fmt.resolution.width;
@@ -478,7 +504,6 @@ fn log_session_stats(
         log::info!("live: yuyv→rgba decode duration: {s}");
     }
 }
-
 
 /// Конверсия + fan-out по подпискам sink'ов (P3/P4). Единственный декод
 /// на кадр: Jpeg → RGBA для UI, Yuyv → RGBA для обоих sink'ов. Вынесено

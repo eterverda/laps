@@ -3,10 +3,11 @@ use super::style;
 use super::view::{self, Corner};
 use time::format_description::{Component, FormatItem};
 
-/// Фон плашки LAPS и даты — colorSecondaryLight из laps-bar.
-const TITLE_BG_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x8C, 0xAD, 0xD1);
-/// Фон временной плашки — colorSecondaryDark из laps-bar.
-const TITLE_BG_DARK: egui::Color32 = egui::Color32::from_rgb(0x5B, 0x7F, 0xA9);
+/// Фон плашки LAPS и даты — голубой в логике catppuccin (blue mocha,
+/// чуть пригашенный под чёрный текст).
+const TITLE_BG_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x7F, 0xA3, 0xD4);
+/// Фон временной плашки — тот же оттенок глубже.
+const TITLE_BG_DARK: egui::Color32 = egui::Color32::from_rgb(0x54, 0x6E, 0x94);
 
 const DATE_FORMAT: &str = "[year]-[month]-[day] [weekday format:mn]";
 const TIME_FORMAT: &str = "[hour]:[minute]:[second].[subsecond digits:3]";

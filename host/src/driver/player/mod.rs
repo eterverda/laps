@@ -406,11 +406,11 @@ impl Clock {
     }
 
     /// Рампа к цели за dur, от текущей эффективной скорости. Часы
-    /// стояли — стартуются от текущей позиции с нуля.
+    /// стояли — стартуются от текущей позиции с нуля. Скоммиченную
+    /// скорость не трогает: она — память play-скорости, а не жеста.
     fn ramp_to(&mut self, to: f64, dur: Duration) {
         let (from, pos) = self.eval();
         self.base = pos;
-        self.speed = from;
         self.started = Some(Instant::now());
         self.ramp = Some(Ramp {
             from,
@@ -460,6 +460,10 @@ fn playback_loop(
         held: bool,
         /// Часы воспроизведения (позиция = base + ∫скорость).
         clock: Clock,
+        /// Скорость воспроизведения из SetSpeed (скролл PLAY). Play
+        /// стартует строго с неё: скорость жестов перемотки в неё не
+        /// попадает, иначе отжатый FF оставлял бы 10x на следующий Play.
+        play_speed: f64,
         /// Активный жест hold/release на перемотке: resume — скорость,
         /// к которой возвращаемся на release (0 — был стоп).
         seek: Option<SeekGesture>,
@@ -515,10 +519,12 @@ fn playback_loop(
         }
 
         /// Перезапуск часов от показанного кадра (после seek/hold).
+        /// Перезапуск часов от показанного кадра (после seek/hold). Только
+        /// с play_speed: эффективная скорость посередине жестовой рампы
+        /// (например отмены после клика) давала бы осевшую низкую
+        /// скорость — тот же класс утечки, что в SeekHold.
         fn resume(&mut self) {
-            let (speed, _) = self.clock.eval();
-            let speed = if speed == 0.0 { 1.0 } else { speed };
-            self.clock.start(self.pts[self.shown_idx], speed);
+            self.clock.start(self.pts[self.shown_idx], self.play_speed);
         }
 
         /// Кадр i: read в постоянный JPEG-буфер, декод in-place в image.
@@ -666,17 +672,13 @@ fn playback_loop(
                 // Дискретные: жест отменяют, эффект мгновенный.
                 Command::Play => {
                     if !self.playing.load() && self.cursor < self.pts.len() {
-                        // Возобновление всегда вперёд: после перемотки
-                        // назад скорость отрицательная, поднимаем до 1.
-                        let speed = if self.clock.speed <= 0.0 {
-                            1.0
-                        } else {
-                            self.clock.speed
-                        };
+                        // Старт строго с play_speed: committed-скорость
+                        // часов трогать нельзя — там может лежать скорость
+                        // отменённого жеста перемотки (10x).
                         self.playing.store(true);
                         self.gesture_end();
                         if !self.held {
-                            self.clock.start(self.pts[self.shown_idx], speed);
+                            self.clock.start(self.pts[self.shown_idx], self.play_speed);
                         }
                     }
                 }
@@ -700,6 +702,12 @@ fn playback_loop(
                                 self.position_ms.store(self.pts[i]);
                                 if self.playing.load() && !self.held {
                                     self.resume();
+                                } else if !self.clock.running() {
+                                    // Пауза: часы стоят, но показанный
+                                    // кадр сменился — базу подтягиваем,
+                                    // иначе жест hold стартует от позиции
+                                    // до тапов (отскок назад).
+                                    self.clock.base = self.pts[i];
                                 }
                             }
                             Err(e) => {
@@ -714,10 +722,13 @@ fn playback_loop(
                     if speed == 0.0 {
                         // Нулевая скорость дискретно — пауза.
                         self.stop();
-                    } else if self.playing.load() {
-                        self.clock.set_speed(speed as f64);
                     } else {
-                        self.clock.park(speed as f64);
+                        self.play_speed = speed as f64;
+                        if self.playing.load() {
+                            self.clock.set_speed(speed as f64);
+                        } else {
+                            self.clock.park(speed as f64);
+                        }
                     }
                 }
                 Command::SetHeld(held) => {
@@ -736,7 +747,11 @@ fn playback_loop(
                     let from = self.clock.eval().0;
                     if self.seek.is_none() {
                         let was_playing = self.playing.load();
-                        let resume = if was_playing { from } else { 0.0 };
+                        // resume — play-скорость из SetSpeed, не
+                        // эффективная: иначе серия быстрых жестов во
+                        // время незакончившейся рампы запоминала бы
+                        // посередине (0.7, 0.5…) и скорость оседавала.
+                        let resume = if was_playing { self.play_speed } else { 0.0 };
                         self.seek = Some(SeekGesture {
                             resume,
                             releasing: false,
@@ -823,6 +838,7 @@ fn playback_loop(
         shown_idx: 0,
         held: false,
         clock: Clock::stopped(0),
+        play_speed: 1.0,
         seek: None,
         last_present: Instant::now(),
         decode: FrameStats::default(),

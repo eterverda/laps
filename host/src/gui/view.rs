@@ -347,7 +347,7 @@ pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, line
     ui.painter().rect_stroke(
         bg,
         pad,
-        egui::Stroke::new(1.0, egui::Color32::WHITE),
+        egui::Stroke::new(1.0, egui::Color32::LIGHT_GRAY),
         egui::StrokeKind::Outside,
     );
     let x = match align {

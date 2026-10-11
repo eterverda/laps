@@ -373,7 +373,7 @@ impl Live {
                 );
                 let race_timer = race_text(&self.race, Instant::now());
                 let timer_pos = egui::pos2(
-                    race_plate.right() + grid::cell_x(1),
+                    race_plate.right() + grid::cell_x(2),
                     race_rect.left_bottom().y,
                 );
                 // Плашки — справа налево: правая уходит под левую.
@@ -515,7 +515,7 @@ impl Live {
                     .with_min_x(race_rect.left() - air)
                     .with_max_x(race_plate.right() - tip);
                 let race_timer_hit = egui::Rect::from_min_max(
-                    egui::pos2(race_plate.right() + grid::cell_x(1), race_plate.top()),
+                    egui::pos2(timer_pos.x, race_plate.top()),
                     egui::pos2(
                         timer_pos.x
                             + super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, &race_timer).x,

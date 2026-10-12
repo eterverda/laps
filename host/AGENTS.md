@@ -42,12 +42,22 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Widgets (all in `src/gui/`): `view::Stripe`/`StripeX2` — background
   plates (cut-corner polygon, corner-hugging), text drawn by the caller
   in a closure; `view::BigButton` — status buttons, hover covers the
-  drawn content; `viewfinder::ViewfinderFrame` — plate + label + name;
-  `header::Header` — LAPS + date/time for a full-width 2-row rect,
-  owns a private `Clock` (time by a format string; `[weekday format:mn]`
-  at the end is our placeholder, replaced with a Russian two-letter
-  weekday, lowercase)
+  drawn content; `paint` — same text without interactivity (passive
+  placeholder buttons); `view::arrow_plate` — PowerShell-prompt arrow
+  plate, per-edge `PlateEdge` (ChevronConvex nose / ChevronConcave
+  notch) + `PlatePaint` (fill/outline); `viewfinder::ViewfinderFrame` —
+  plate + label + name; `header::Header` — LAPS + date/time for a
+  full-width 2-row rect, owns a private `Clock` (time by a format
+  string; `[weekday format:mn]` at the end is our placeholder, replaced
+  with a Russian two-letter weekday, lowercase)
   our placeholder (replaced with a Russian two-letter weekday, lowercase)
+- Glyph mirroring: a word prefixed with the vendor marker
+  `view::GLYPH_FLIP` (PUA U+E6C0, no glyph in the font) draws its first
+  glyph mirrored horizontally — Nerd Fonts has no mirrored icon pairs
+  (exit-to-app only points right), so the flip is done at home: the
+  glyph quad is re-emitted from the font atlas (`TextureId::Managed(0)`)
+  with u mirrored. The marker is stripped before any layout/measuring
+  and never reaches epaint
 - Assets embedded via `src/assets.rs` (fonts, testcard SVG, default setup.yaml)
 - **resvg** + **usvg** + **tiny-skia** — render testcard SVG to texture
   (used while camera is off/connecting/dead)
@@ -136,8 +146,12 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 ## Video Playback
 
 - **Scrub mode** (`laps scrub`): playback of the latest per-camera recording
-  from `captures/`; same header/viewfinder layout as live, PLAY button +
-  timeline with hold-to-scrub (hold ≠ pause)
+  from `captures/`; same header/viewfinder layout as live. Bottom row:
+  EXIT plate (icon-only, passive), timeline with hold-to-scrub (hold ≠
+  pause) between EXIT and the clock, big clock at the same x as live's
+  RACE counter, transport (REW/PLAY/FF/RPT) right of the clock. Screen
+  layouts are per-screen private (copy-paste); only view-level geometry
+  (`plate_rect`, grid cells) is shared
 - Own readers (mirror writers): **MKV** (Cues / cluster scan, `mkv.rs`) and
   **MOV/MP4** (ISOBMFF: stts/stsz/stco|co64 parsed once into memory,
   `mp4.rs` `IsobmffReader` — one reader for both). Readers cover

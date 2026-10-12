@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::Navigator;
 use super::grid;
+use super::grid::IntoCell;
 use super::guidelines;
 use super::header;
 use super::live;
@@ -17,6 +17,7 @@ use super::menu;
 use super::style;
 use super::view;
 use super::viewfinder;
+use super::Navigator;
 use crate::config::setup::Setup;
 use crate::driver::player::{Player, PlayerState};
 use crate::model::pilot::Pilot;
@@ -55,6 +56,36 @@ const HSCROLL_RELEASE: std::time::Duration = std::time::Duration::from_millis(20
 /// Текст на плашках всегда чёрный.
 const TRANSPORT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xF0, 0xDC);
 const TRANSPORT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x6E, 0x62);
+
+/// Цвет заливки EXIT-плашки — копипаста из live (цвета частные).
+const PLATE_EXIT: egui::Color32 = egui::Color32::from_rgb(0x70, 0x70, 0x70);
+
+/// Копипаста из live: X счётчика RACE — правый край цепочки кнопок
+/// статуса + 2 колонки. Цепочка пересчитывается по live'овским
+/// литералам (EXIT — с текстом): таймер scrub'а стоит ровно там же,
+/// где счётчик RACE в live. Раскладки частные — при изменении цепочки
+/// в live пересчитать и здесь.
+fn status_timer_x(ctx: &egui::Context, bottom_row: isize) -> f32 {
+    let text_rect = |prev: Option<egui::Rect>, text: &str| {
+        let cols = grid::whole_cols(view::content_width(ctx, text));
+        match prev {
+            None => grid::cell(1, bottom_row).translate(1, -1).extrude(cols, -2),
+            Some(prev) => prev
+                .right_bottom()
+                .into_cell()
+                .translate(6, 0)
+                .extrude(cols, -2),
+        }
+    };
+    let exit = text_rect(None, "\u{e6c0}\u{f0206} EXIT");
+    let dvr = text_rect(Some(exit), "\u{f16df} DVR");
+    let live = text_rect(Some(dvr), "\u{25b6} LIVE");
+    let rec = text_rect(Some(live), "\u{f044a} REC");
+    let race = text_rect(Some(rec), "\u{f140b} RACE");
+    live::plate_rect(race, grid::cell_x(2), grid::cell_x(2), grid::cell_x(2)).right()
+        + grid::cell_x(2)
+}
+
 /// Масштаб скролл-скраба: миллисекунды файла на физический пиксель
 /// пальца. Осознанно фиксирован: не зависит от длины записи (бар при
 /// этом перестаёт отображать файл 1:1 — палец и кружок расходятся).
@@ -514,7 +545,7 @@ impl Scrub {
     /// Транспорт: плашки REW/PLAY/FF/RPT 3 клетки высотой (иконка
     /// по центру верхних двух + подпись шкалы в нижней), клик — вся
     /// плашка. Возвращает true, если PLAY тоглят. Раскладка — таблица
-    /// (ширина, зазор после): RPT на 2 колонки уже и отстоит на 2.
+    /// (ширина, зазор после), ряд начинается справа от таймера.
     fn draw_transport(&mut self, ui: &mut egui::Ui, bottom_right: grid::Cell) -> bool {
         let mut toggle_play = false;
         let btn_rect = |col: isize, cols: isize| {
@@ -560,10 +591,14 @@ impl Scrub {
                 );
             };
 
-        // Раскладка ряда: (ширина, зазор после кнопки) с колонки 2
-        // (1 колонка от левого края).
+        // Раскладка ряда: (ширина, зазор после кнопки). Начало — за
+        // таймером (1 колонка воздуха + 3 колонки правее). Ширина
+        // таймера считается по формату «ММ:СС.ммм», чтобы сообщение
+        // об ошибке позицию не двигало.
         let layout = [(8, 1), (8, 1), (8, 2), (6, 0)];
-        let mut col = 2isize;
+        let timer_right =
+            status_timer_x(ui.ctx(), bottom_right.row) + view::content_width(ui.ctx(), "00:00.000");
+        let mut col = grid::cell_at(egui::pos2(timer_right, 0.0)).col + 4;
         let mut rects = layout.iter().map(|&(w, gap)| {
             let r = btn_rect(col, w);
             col += w + gap;
@@ -695,6 +730,26 @@ impl Scrub {
                 let header_rect = grid::cell(0, 0).extrude(bottom_right.col, 2);
                 self.header.show(ui, header_rect);
 
+                // EXIT — копипаста из live (серая плашка, пассивная),
+                // но плашка из одной иконки (выход-налево) — раскладка
+                // EXIT'а в scrub своя. Таймер ниже — по live'овской
+                // цепочке (status_timer_x).
+                let exit_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
+                    grid::whole_cols(view::content_width(ui.ctx(), "\u{e6c0}\u{f0206}")),
+                    -2,
+                );
+                let exit_plate =
+                    live::plate_rect(exit_rect, grid::cell_x(2), grid::cell_x(2), grid::cell_x(2));
+                view::arrow_plate(
+                    ui,
+                    exit_plate,
+                    view::PlateEdge::ChevronConvex,
+                    view::PlateEdge::ChevronConcave,
+                    view::PlatePaint::Filled(PLATE_EXIT),
+                );
+                view::BigButton::new("\u{e6c0}\u{f0206}", egui::Color32::BLACK)
+                    .paint(ui, exit_rect);
+
                 if self.draw_transport(ui, bottom_right) {
                     action = Action::TogglePlay;
                 }
@@ -776,21 +831,20 @@ impl Scrub {
                 }
 
                 // Время первичного плеера крупно (мм:сс.ммм) — отдельно
-                // от таймлайна; таймлайну достаётся rect под линию.
-                // Позиция свойственна scrub'у: за правым краем ряда
-                // контролов (после RPT). Расчёт намеренно разведён с
-                // таймером RACE в live — сведём обратно, когда
-                // унифицируем ui.
+                // от таймлайна; таймлайну достаётся rect между EXIT-плашкой
+                // и таймером. Позиция — как у счётчика RACE в live: тот же
+                // X (status_timer_x пересчитывает ту же цепочку кнопок), Y —
+                // базлайн на строку выше низа экрана.
                 if let Some(primary) = self.primary() {
                     let (pos, dur, state) = (
                         primary.position_ms(),
                         primary.duration_ms(),
                         primary.open_state(),
                     );
-                    // Позиция — как у таймера RACE в live (колонка
-                    // снята с запущенного live, не прикидка): базлайн на
-                    // строку выше низа экрана.
-                    let text_pos = egui::pos2(grid::cell_x(51), grid::cell_y(bottom_right.row - 1));
+                    let text_pos = egui::pos2(
+                        status_timer_x(ui.ctx(), bottom_right.row),
+                        grid::cell_y(bottom_right.row - 1),
+                    );
                     match &state {
                         PlayerState::Failed(msg) => {
                             ui.painter().text(
@@ -834,22 +888,14 @@ impl Scrub {
                                     None
                                 };
                                 if let Some(offset) = offset {
-                                    // Под основным таймером, по центру его
-                                    // строки: глифы основного висят выше
-                                    // базлайна, доп-таймер — в строке под
-                                    // ними. Строка — под базлайном основного
-                                    // (play_rect выше кнопки на клетку).
-                                    // Строка под базлайном основного
-                                    // (низ иконочной части транспорта).
-                                    let row = grid::cell_at(egui::pos2(
-                                        0.0,
-                                        grid::cell_y(bottom_right.row - 1) + grid::CELL_SIZE.y,
-                                    ))
-                                    .row - 1;
+                                    // Под основным таймером, по центру
+                                    // его строки: глифы основного висят
+                                    // выше базлайна, доп-таймер — в
+                                    // строке под ними.
                                     let x =
                                         text_pos.x + view::content_width(ui.ctx(), &pos_text) / 2.0;
                                     ui.painter().text(
-                                        egui::pos2(x, grid::cell_y(row)),
+                                        egui::pos2(x, grid::cell_y(bottom_right.row - 1)),
                                         egui::Align2::CENTER_TOP,
                                         offset,
                                         style::FONT_REGULAR,
@@ -857,16 +903,16 @@ impl Scrub {
                                     );
                                 }
                             }
-                            // Шкала — только у готового плеера.
+                            // Шкала — только у готового плеера: между
+                            // EXIT-плашкой и таймером, по 3 колонки
+                            // воздуха с каждой стороны.
                             if state == PlayerState::Ready {
-                                let x0 = text_pos.x
-                                    + view::content_width(ui.ctx(), &pos_text)
-                                    + grid::cell_x(3);
-                                // По вертикали — на уровне таймера:
-                                // центр rect = середина его глифов.
                                 let rect = egui::Rect::from_min_max(
-                                    egui::pos2(x0, text_pos.y - grid::cell_y(2)),
-                                    egui::pos2(grid::cell_x(bottom_right.col - 3), text_pos.y),
+                                    egui::pos2(
+                                        exit_plate.right() + grid::cell_x(3),
+                                        text_pos.y - grid::cell_y(2),
+                                    ),
+                                    egui::pos2(text_pos.x - grid::cell_x(3), text_pos.y),
                                 );
                                 let frac = if dur > 0 {
                                     pos as f32 / dur as f32

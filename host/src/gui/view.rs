@@ -134,11 +134,116 @@ impl Letterbox {
     }
 }
 
+/// Маркер зеркалирования глифа: префикс слова в тексте кнопки — первый
+/// глиф слова рисуется зеркально по горизонтали. Зеркальных пар у иконок
+/// Nerd Fonts нет (exit-to-app, например, есть только со стрелкой
+/// вправо), поэтому разворачиваем сами. Кодпоинт — свободная дыра PUA в
+/// обоих начертаниях шрифта: глифа у него нет, в раскладку не попадает,
+/// ширины не даёт.
+pub const GLYPH_FLIP: char = '\u{e6c0}';
+
+/// Слово без маркера GLYPH_FLIP (измеряем и рисуем сам глиф).
+fn strip_flip_marker(word: &str) -> &str {
+    word.strip_prefix(GLYPH_FLIP).unwrap_or(word)
+}
+
+/// Округление позиции к физическим пикселям (паритет с тесселятором
+/// текста, у него это метод emath::GuiRounding за пределами крейта).
+fn round_to_pixels(pos: egui::Pos2, pixels_per_point: f32) -> egui::Pos2 {
+    egui::pos2(
+        (pos.x * pixels_per_point).round() / pixels_per_point,
+        (pos.y * pixels_per_point).round() / pixels_per_point,
+    )
+}
+
+/// Слово кнопки на позиции (левый нижний угол): обычное — painter.text,
+/// с маркером GLYPH_FLIP — первый глиф зеркально (paint_glyph_flipped),
+/// остаток слова следом. Возвращает ширину слова (как measure_text у
+/// обычного слова).
+fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color32) -> f32 {
+    let Some(rest) = word.strip_prefix(GLYPH_FLIP) else {
+        ui.painter().text(
+            pos,
+            egui::Align2::LEFT_BOTTOM,
+            word,
+            super::style::FONT_REGULAR_X2,
+            color,
+        );
+        return super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, word).x;
+    };
+    paint_glyph_flipped(ui, pos, rest, color)
+}
+
+/// Первый глиф текста зеркально по горизонтали, остаток (если есть) —
+/// обычным текстом со стандартным пробелом-ячейкой. Ширина — как у
+/// обычного текста: квад того же глифа из шрифтового атласа
+/// (TextureId::Managed(0)), u в uv отражена. Позиционирование повторяет
+/// painter.text с LEFT_BOTTOM (включая округление к физпикселям).
+fn paint_glyph_flipped(
+    ui: &mut egui::Ui,
+    pos: egui::Pos2,
+    text: &str,
+    color: egui::Color32,
+) -> f32 {
+    let font = super::style::FONT_REGULAR_X2;
+    let mut chars = text.chars();
+    let Some(chr) = chars.next() else {
+        return 0.0;
+    };
+    let rest: String = chars.collect();
+    let galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(chr.to_string(), font.clone(), color));
+    let Some(row) = galley.rows.first() else {
+        return 0.0;
+    };
+    let Some(glyph) = row.row.glyphs.first() else {
+        return 0.0;
+    };
+    let uv = glyph.uv_rect;
+    // Якорь LEFT_BOTTOM: галлея ставится origin'ом ниже pos на её высоту
+    // (округление к физпикселям — как тесселятор текста).
+    let ppp = ui.ctx().pixels_per_point();
+    let origin = round_to_pixels(egui::pos2(pos.x, pos.y - galley.rect.height()), ppp);
+    let min = origin + row.pos.to_vec2() + (glyph.pos + uv.offset).to_vec2();
+    let tex = ui.ctx().fonts(|fonts| fonts.font_image_size());
+    let u_norm = |u: u16, w: usize| u as f32 / w.max(1) as f32;
+    let (u_min, u_max) = (u_norm(uv.min[0], tex[0]), u_norm(uv.max[0], tex[0]));
+    let (v_min, v_max) = (u_norm(uv.min[1], tex[1]), u_norm(uv.max[1], tex[1]));
+    let rect = egui::Rect::from_min_size(min, uv.size);
+    let mut mesh = egui::Mesh::with_texture(egui::TextureId::Managed(0));
+    // Порядок вершин и пар треугольников — как у текста в атласе, u зеркалим.
+    for (p, u, v) in [
+        (rect.left_top(), u_max, v_min),
+        (rect.right_top(), u_min, v_min),
+        (rect.left_bottom(), u_max, v_max),
+        (rect.right_bottom(), u_min, v_max),
+    ] {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: p,
+            uv: egui::pos2(u, v),
+            color,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+
+    let advance = glyph.advance_width;
+    if !rest.is_empty() {
+        let rest_pos = egui::pos2(pos.x + advance + super::grid::cell_x(1), pos.y);
+        ui.painter()
+            .text(rest_pos, egui::Align2::LEFT_BOTTOM, rest, font, color);
+    }
+    advance
+}
+
 /// Большая кнопка статуса: текст слева (слова через одинарные пробелы —
 /// по одной ячейке). Rect кнопки приходит снаружи целиком и должен
 /// покрывать весь контент — ширину считает вызывающий код (см.
-/// content_width). Ховер и клик — по пришедшему rect, Response
-/// возвращается наружу — действие решает вызывающий код.
+/// content_width). Слово с маркером GLYPH_FLIP рисует первый глиф
+/// зеркально. Ховер и клик — по пришедшему rect, Response возвращается
+/// наружу — действие решает вызывающий код.
 pub struct BigButton<'a> {
     /// Левая строка кнопки: разбивается по пробелам, слова рисуются
     /// в ряд, между ними — одинарный (1 ячейка) пробел.
@@ -155,21 +260,16 @@ impl<'a> BigButton<'a> {
         let response = ui
             .interact(rect, id, egui::Sense::click())
             .on_hover_cursor(egui::CursorIcon::PointingHand);
+        self.paint(ui, rect);
+        response
+    }
 
-        let painter = ui.painter();
+    /// Только текст кнопки, без интерактива (пассивные кнопки-заглушки).
+    pub fn paint(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let mut pos = rect.left_bottom();
         for word in self.text.split(' ').filter(|word| !word.is_empty()) {
-            painter.text(
-                pos,
-                egui::Align2::LEFT_BOTTOM,
-                word,
-                super::style::FONT_REGULAR_X2,
-                self.color,
-            );
-            pos.x += super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, word).x
-                + super::grid::cell_x(1);
+            pos.x += paint_word(ui, pos, word, self.color) + super::grid::cell_x(1);
         }
-        response
     }
 }
 
@@ -179,7 +279,9 @@ pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
     let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
     let mut width: f32 = words
         .iter()
-        .map(|word| super::measure_text(ctx, super::style::FONT_REGULAR_X2, *word).x)
+        .map(|word| {
+            super::measure_text(ctx, super::style::FONT_REGULAR_X2, strip_flip_marker(word)).x
+        })
         .sum();
     if words.len() > 1 {
         width += super::grid::cell_x(1) * (words.len() - 1) as f32;
@@ -311,26 +413,72 @@ fn stripe(
         .with_max_x(plate.max.x - super::grid::cell_x(1))
 }
 
+/// Отступ контура плашки-стрелки (arrow_plate) от краёв её rect:
+/// вершина носа — в inset от края, тело впадины — в inset.
+const ARROW_PLATE_INSET: f32 = super::grid::CELL_SIZE.x / 4.0;
+
+/// Толщина обводки PlatePaint::Outlined.
+const PLATE_OUTLINE_WIDTH: f32 = super::grid::CELL_SIZE.x / 8.0;
+
+/// Край плашки-стрелки: геометрия шеврона относительно плашки.
+/// Convex — нос наружу, Concave — впадина внутрь; для любого края.
+/// Стык цепочки — Convex слева (нос) и Concave справа (впадина).
+#[derive(Clone, Copy)]
+pub enum PlateEdge {
+    ChevronConvex,
+    ChevronConcave,
+}
+
+/// Как рисовать плашку-стрелку: заливка или только обводка.
+pub enum PlatePaint {
+    Filled(egui::Color32),
+    Outlined(egui::Color32),
+}
+
 /// Фон-плашка-стрелка в стиле промпта PowerShell: высота две клетки,
-/// справа наконечник — контур идёт от правого верхнего угла к середине
-/// правой стороны и к правому нижнему углу, фон образует стрелку (не
-/// глиф). Rect приходит целиком (вместе с наконечником и левой частью
-/// под соседнюю плашку). Только рисует: текст вызывающий код кладёт по
-/// своему rect'у сам.
-pub fn arrow_plate(ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32) {
+/// края — по PlateEdge, заливка или обводка — по PlatePaint. Контур
+/// невыпуклый: epaint заливает веером из первой вершины, поэтому обход
+/// всегда начинается с левой средней точки — из неё весь контур виден
+/// для любых краёв. Rect приходит целиком (вместе с наконечником
+/// и левой частью под соседнюю плашку). Только рисует: текст вызывающий
+/// код кладёт по своему rect'у сам.
+pub fn arrow_plate(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    left: PlateEdge,
+    right: PlateEdge,
+    paint: PlatePaint,
+) {
     let tip = super::grid::cell_x(2);
+    let inset = ARROW_PLATE_INSET;
+    let mid = rect.center().y;
+    // (тело, вершина) края: нос — вершина близко к rect (inset), тело
+    // глубоко (tip); впадина — наоборот.
+    let (left_body, left_apex) = match left {
+        PlateEdge::ChevronConvex => (rect.left() + tip, rect.left() + inset),
+        PlateEdge::ChevronConcave => (rect.left() + inset, rect.left() + tip),
+    };
+    let (right_body, right_apex) = match right {
+        PlateEdge::ChevronConvex => (rect.right() - tip, rect.right() - inset),
+        PlateEdge::ChevronConcave => (rect.right() - inset, rect.right() - tip),
+    };
     let outline = vec![
-        rect.left_top(),
-        egui::pos2(rect.right() - tip, rect.top()),
-        egui::pos2(rect.right(), rect.center().y),
-        egui::pos2(rect.right() - tip, rect.bottom()),
-        rect.left_bottom(),
+        egui::pos2(left_apex, mid),
+        egui::pos2(left_body, rect.top()),
+        egui::pos2(right_body, rect.top()),
+        egui::pos2(right_apex, mid),
+        egui::pos2(right_body, rect.bottom()),
+        egui::pos2(left_body, rect.bottom()),
     ];
-    ui.painter().add(egui::Shape::convex_polygon(
-        outline,
-        color,
-        egui::Stroke::NONE,
-    ));
+    let (fill, stroke) = match paint {
+        PlatePaint::Filled(color) => (color, egui::Stroke::NONE),
+        PlatePaint::Outlined(color) => (
+            egui::Color32::TRANSPARENT,
+            egui::Stroke::new(PLATE_OUTLINE_WIDTH, color),
+        ),
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(outline, fill, stroke));
 }
 
 /// Подсказка-значок в правом нижнем углу anchor: правый нижний угол

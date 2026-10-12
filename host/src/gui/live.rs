@@ -280,23 +280,25 @@ impl Live {
                 };
                 let live_timer = session_timer(self.feed.live_since());
                 let rec_timer = session_timer(self.feed.rec_since());
-                // Плашки-стрелки цепочкой (PowerShell): каждая правая
-                // наползает на наконечник левой, поэтому левая часть
-                // плашки начинается в 2 клетках левее текста и рисуются
-                // они справа налево — правая под левой. Вокруг текста —
-                // по две колонки воздуха с каждой стороны (левая часть
-                // уходит под наконечник соседа, тексты разнесены на 6
-                // колонок, чтобы воздух не съедался). Состояние — пара
-                // (подложка, текст):
-                // тусклая + чёрный в покое, насыщенная + белый в активе.
+                // Плашки-стрелки цепочкой (PowerShell): EXIT, DVR, LIVE,
+                // REC, RACE. Rect'ы текстов — частная раскладка
+                // status_chain (scrub держит свою копию — там EXIT только
+                // иконка). Состояние — пара (подложка, текст): тусклая +
+                // чёрный в покое, насыщенная + белый в активе. EXIT — серая
+                // заливка, DVR — обводка в цвет неактивной заливки REC.
                 // Счётчик RACE — дальше, без плашки.
                 let tip = grid::cell_x(2);
                 let overlap = grid::cell_x(2);
                 let air = grid::cell_x(2);
-                let live_text_w = view::content_width(ui.ctx(), "\u{25b6} LIVE");
-                let live_rect = grid::cell(1, bottom_right.row)
-                    .translate(1, -1)
-                    .extrude(grid::whole_cols(live_text_w), -2);
+                let StatusChain {
+                    exit: exit_rect,
+                    dvr: dvr_rect,
+                    live: live_rect,
+                    rec: rec_rect,
+                    race: race_rect,
+                } = status_chain(ui.ctx(), bottom_right.row);
+                let exit_plate = plate_rect(exit_rect, tip, air, overlap);
+                let dvr_plate = plate_rect(dvr_rect, tip, air, overlap);
                 let live_plate = plate_rect(live_rect, tip, air, overlap);
                 let (live_plate_color, live_text_color) =
                     plate_colors(live_status, PLATE_LIVE_IDLE, PLATE_LIVE);
@@ -310,12 +312,6 @@ impl Live {
                     } else {
                         Status::Idle
                     };
-                let rec_text_w = view::content_width(ui.ctx(), "\u{f044a} REC");
-                let rec_rect = live_rect
-                    .right_bottom()
-                    .into_cell()
-                    .translate(6, 0)
-                    .extrude(grid::whole_cols(rec_text_w), -2);
                 let rec_plate = plate_rect(rec_rect, tip, air, overlap);
                 let (rec_plate_color, rec_text_color) =
                     plate_colors(rec_status, PLATE_REC_IDLE, PLATE_REC);
@@ -323,12 +319,6 @@ impl Live {
                 // RACE и счётчик — один контрол: кликабельны плашка и
                 // счётчик. Ширина плашки — по слову RACE (счётчик вне её).
                 let race_active = self.race.active();
-                let race_text_w = view::content_width(ui.ctx(), "\u{f140b} RACE");
-                let race_rect = rec_rect
-                    .right_bottom()
-                    .into_cell()
-                    .translate(6, 0)
-                    .extrude(grid::whole_cols(race_text_w), -2);
                 let race_plate = plate_rect(race_rect, tip, air, overlap);
                 let (race_plate_color, race_text_color) = plate_colors(
                     if race_active {
@@ -357,10 +347,47 @@ impl Live {
                     race_plate.right() + grid::cell_x(2),
                     race_rect.left_bottom().y,
                 );
-                // Плашки — справа налево: правая уходит под левую.
-                view::arrow_plate(ui, race_plate, race_plate_color);
-                view::arrow_plate(ui, rec_plate, rec_plate_color);
-                view::arrow_plate(ui, live_plate, live_plate_color);
+                // Не перекрываются — порядок любой, рисуем как читаются.
+                view::arrow_plate(
+                    ui,
+                    exit_plate,
+                    view::PlateEdge::ChevronConvex,
+                    view::PlateEdge::ChevronConcave,
+                    view::PlatePaint::Filled(PLATE_EXIT),
+                );
+                view::arrow_plate(
+                    ui,
+                    dvr_plate,
+                    view::PlateEdge::ChevronConvex,
+                    view::PlateEdge::ChevronConcave,
+                    view::PlatePaint::Outlined(PLATE_REC_IDLE),
+                );
+                view::arrow_plate(
+                    ui,
+                    live_plate,
+                    view::PlateEdge::ChevronConvex,
+                    view::PlateEdge::ChevronConvex,
+                    view::PlatePaint::Filled(live_plate_color),
+                );
+                view::arrow_plate(
+                    ui,
+                    rec_plate,
+                    view::PlateEdge::ChevronConcave,
+                    view::PlateEdge::ChevronConvex,
+                    view::PlatePaint::Filled(rec_plate_color),
+                );
+                view::arrow_plate(
+                    ui,
+                    race_plate,
+                    view::PlateEdge::ChevronConcave,
+                    view::PlateEdge::ChevronConvex,
+                    view::PlatePaint::Filled(race_plate_color),
+                );
+                // EXIT и DVR — пассивные: клик не обрабатывается. Иконка
+                // EXIT с маркером GLYPH_FLIP — стрелка влево (выход налево).
+                view::BigButton::new("\u{e6c0}\u{f0206} EXIT", egui::Color32::BLACK)
+                    .paint(ui, exit_rect);
+                view::BigButton::new("\u{f16df} DVR", PLATE_REC_IDLE).paint(ui, dvr_rect);
 
                 let live_id = ui.make_persistent_id("status_live");
                 // Клик-бласть — плашка без наконечника: уголок не кликабелен.
@@ -873,10 +900,51 @@ const PLATE_RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x7A, 0x7C, 0x49)
 /// Активный RACE — кислотно-жёлтый гоночного режима (изначальный
 /// RACE_COLOR, см. git history).
 const PLATE_RACE: egui::Color32 = egui::Color32::from_rgb(0xCC, 0xFF, 0x00);
+const PLATE_EXIT: egui::Color32 = egui::Color32::from_rgb(0x70, 0x70, 0x70);
+
+/// Rect'ы текстов цепочки кнопок статуса внизу слева (EXIT, DVR, LIVE,
+/// REC, RACE), слева направо. Раскладка частная для live; scrub держит
+/// свою копию (там EXIT — только иконка) — при изменении цепочки
+/// пересчитать и там.
+struct StatusChain {
+    exit: egui::Rect,
+    dvr: egui::Rect,
+    live: egui::Rect,
+    rec: egui::Rect,
+    race: egui::Rect,
+}
+
+/// Цепочка с колонки 2: высота две клетки, тексты разнесены на 6
+/// колонок (воздух по 2 колонки с каждой стороны у каждой плашки).
+fn status_chain(ctx: &egui::Context, bottom_row: isize) -> StatusChain {
+    let text_rect = |prev: Option<egui::Rect>, text: &str| {
+        let cols = grid::whole_cols(view::content_width(ctx, text));
+        match prev {
+            None => grid::cell(1, bottom_row).translate(1, -1).extrude(cols, -2),
+            Some(prev) => prev
+                .right_bottom()
+                .into_cell()
+                .translate(6, 0)
+                .extrude(cols, -2),
+        }
+    };
+    let exit = text_rect(None, "\u{e6c0}\u{f0206} EXIT");
+    let dvr = text_rect(Some(exit), "\u{f16df} DVR");
+    let live = text_rect(Some(dvr), "\u{25b6} LIVE");
+    let rec = text_rect(Some(live), "\u{f044a} REC");
+    let race = text_rect(Some(rec), "\u{f140b} RACE");
+    StatusChain {
+        exit,
+        dvr,
+        live,
+        rec,
+        race,
+    }
+}
 
 /// Плашка вокруг текстового rect: воздух по колонке с каждой стороны,
 /// наконечник справа, левый хвост — под наконечник соседа (overlap).
-fn plate_rect(text: egui::Rect, tip: f32, air: f32, overlap: f32) -> egui::Rect {
+pub fn plate_rect(text: egui::Rect, tip: f32, air: f32, overlap: f32) -> egui::Rect {
     text.with_min_x(text.left() - overlap - air)
         .with_max_x(text.right() + air + tip)
 }

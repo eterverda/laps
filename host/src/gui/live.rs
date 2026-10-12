@@ -670,8 +670,8 @@ impl Live {
                 self.stop_all();
                 self.session = Session::Idle;
             }
-            Session::Race { .. } => {
-                let (_, rec_since, race) = self.finish_race();
+            Session::Race { start, .. } => {
+                let (_, rec_since, race) = self.finish_race(start.elapsed());
                 self.stop_recording_all();
                 self.stop_all();
                 self.session = Session::Done {
@@ -731,9 +731,9 @@ impl Live {
                 self.stop_recording_all();
                 self.session = Session::LiveBefore { live_since };
             }
-            Session::Race { .. } => {
+            Session::Race { start, .. } => {
                 // Отжатие REC в гонке: запись стоп, сразу LiveAfter.
-                let (live_since, rec_since, race) = self.finish_race();
+                let (live_since, rec_since, race) = self.finish_race(start.elapsed());
                 self.stop_recording_all();
                 self.session = Session::LiveAfter {
                     live_since,
@@ -789,8 +789,8 @@ impl Live {
                     rec_since,
                 };
             }
-            Session::Race { .. } => {
-                self.finish_race();
+            Session::Race { start, .. } => {
+                self.finish_race(start.elapsed());
             }
             _ => {}
         }
@@ -821,18 +821,19 @@ impl Live {
     }
 
     /// Финиш гонки: гудок, время замирает, сессия — в RecordTail
-    /// (запись хвоста продолжается). Возвращает (эфир с, запись с,
+    /// (запись хвоста продолжается). race — замороженное время гонки,
+    /// его выбор — за вызывающим кодом: реальный момент (клик) или ровно
+    /// лимит (таймаут: момент кадра опоздал бы на до ~16 мс, отсечки
+    /// обязаны быть миллисекундными). Возвращает (эфир с, запись с,
     /// замороженное время). Из не-Race — no-op.
-    fn finish_race(&mut self) -> (Instant, Instant, Duration) {
+    fn finish_race(&mut self, race: Duration) -> (Instant, Instant, Duration) {
         if let Session::Race {
             live_since,
             rec_since,
-            start,
             ..
         } = self.session
         {
             self.audio.play(BUZZER);
-            let race = start.elapsed();
             self.session = Session::RecordTail {
                 live_since,
                 rec_since,
@@ -898,8 +899,7 @@ impl Live {
 
     /// Перевод часов: конец отсчёта — в Race (звук гудка уже в программе
     /// отсчёта — здесь только переход состояния), лимит времени вылета —
-    /// в RecordTail (RACE отжимается сама). Предупреждение о лимите —
-    /// один гудок за прогон.
+    /// в RecordTail (RACE отжимается сама).
     fn session_tick(&mut self) {
         let now = Instant::now();
         match self.session {
@@ -913,22 +913,13 @@ impl Live {
                     live_since,
                     rec_since,
                     start: race_time_start(start, delay),
-                    warned: false,
                 };
             }
-            Session::Race {
-                start,
-                ref mut warned,
-                ..
-            } => {
-                let elapsed = now.saturating_duration_since(start);
-                let limit = self.rules.duration;
-                if !*warned && limit > BUZZER.duration() && elapsed >= limit - BUZZER.duration() {
-                    self.audio.play(BUZZER);
-                    *warned = true;
-                }
-                if elapsed >= limit {
-                    self.finish_race();
+            Session::Race { start, .. } => {
+                // Таймаут: фиксируем ровно лимит, не момент кадра —
+                // таймер обязан остановиться на 00:15.000.
+                if now.saturating_duration_since(start) >= self.rules.duration {
+                    self.finish_race(self.rules.duration);
                 }
             }
             _ => {}
@@ -1019,7 +1010,6 @@ enum Session {
         live_since: Instant,
         rec_since: Instant,
         start: Instant,
-        warned: bool,
     },
     /// Гонка кончилась, запись хвоста продолжается; race — замороженное
     /// время гонки для счётчика.
@@ -1395,7 +1385,6 @@ mod tests {
                     live_since: now,
                     rec_since: now,
                     start: now,
-                    warned: false,
                 },
                 (true, true, true),
                 (true, true, true, false),

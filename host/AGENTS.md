@@ -41,11 +41,20 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - One camera frame → one texture → N viewfinders via UV viewport cropping
 - Widgets (all in `src/gui/`): `view::Stripe`/`StripeX2` — background
   plates (cut-corner polygon, corner-hugging), text drawn by the caller
-  in a closure; `view::BigButton` — status buttons, hover covers the
-  drawn content; `paint` — same text without interactivity (passive
-  placeholder buttons); `view::arrow_plate` — PowerShell-prompt arrow
-  plate, per-edge `PlateEdge` (ChevronConvex nose / ChevronConcave
-  notch) + `PlatePaint` (fill/outline); `viewfinder::ViewfinderFrame` —
+  in a closure; `view::NavButton` — status-bar chain button (live +
+  scrub EXIT): arrow plate + top text (words, 1-cell gaps, first word
+  is an icon, `GLYPH_FLIP` supported) + bottom sub-text (доптаймер,
+  aligned to the text after the icon, +3 cols, plate color), 3 states
+  (`NavState`: Idle/Active/Disabled — Disabled is outline + text in the
+  idle color, `show` returns None), widget 3 cells tall (plate covers
+  the top 2), click area = whole widget without the chevron tips;
+  generic over `AsRef<str>` text/sub; `view::TransportButton` — scrub
+  transport (REW/PLAY/FF/RPT): filled rect, icon centered in the top
+  2 cells, sub centered in the 3rd with 1-cell side insets, 2 states
+  (`TransportState`: Idle/Active), colors passed in, `interact`/`paint`
+  split (seek logic between them); `view::arrow_plate` — the plate
+  geometry shared by NavButton (per-edge `PlateEdge` + `PlatePaint`,
+  outline drawn StrokeKind::Inside); `viewfinder::ViewfinderFrame` —
   plate + label + name; `header::Header` — LAPS + date/time for a
   full-width 2-row rect, owns a private `Clock` (time by a format
   string; `[weekday format:mn]` at the end is our placeholder, replaced
@@ -105,9 +114,13 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   get `opt-level` bumps in dev profile (`zune-jpeg`/`jpeg-rusturbo`/
   `jpeg-encoder`/`memchr` = 3, `yuv`/`epaint` = 2) instead of optimizing
   our own crate in dev
-- Camera lifecycle states (`CaptureState`: Starting/Live/Dead) and
-  feed states (`FeedState`: Off/Live/Rec) signaled UI-ward via
-  `crossbeam_utils::AtomicCell`
+- Camera lifecycle states (`CaptureState`: Starting/Live/Dead) signaled
+  UI-ward via `crossbeam_utils::AtomicCell`. Кнопки LIVE/REC/RACE в
+  live-экране живут в общей машине состояний `Session`
+  (`gui/live.rs`): Idle → LiveBefore → RecordHead → RaceCountdown →
+  Race → RecordTail → LiveAfter → Done; до старта гонки отжатия шагают
+  назад, после — только вперёд, Done терминальное. Доступность кнопок
+  по фазам — в юнит-тесте `session_flags_and_availability`
 
 ## Video Recording (DVR)
 

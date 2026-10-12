@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
-use crate::driver::audio;
+use crate::driver::audio::{Audio, Sound};
 use crate::driver::camera::CaptureState;
 use crate::gui::grid::IntoCell;
 use crate::model::pilot::Pilot;
@@ -32,15 +32,15 @@ pub fn viewfinder_cols(count: usize) -> isize {
 }
 
 pub struct Live {
-    // Эфир: состояние кнопок LIVE/REC и потоки камер за ними.
-    feed: FeedState,
+    // Сессия: единая машина состояний эфира/записи/гонки за кнопками
+    // LIVE/REC/RACE; потоки камер живут за ней.
+    session: Session,
     webcams: HashMap<String, crate::driver::camera::Camera>,
     /// Запрет засыпания экрана, пока идёт эфир.
     awake: Option<keepawake::KeepAwake>,
-    // Гонка: правила (пока default на месте вызова), состояние, звук.
+    // Гонка: правила (пока default на месте вызова) и звук.
     rules: RaceRules,
-    race: RaceState,
-    audio: crate::driver::audio::Audio,
+    audio: Audio,
     // Экран: ресурсы, заголовок, сетап и раскладка.
     res: Option<Res>,
     header: header::Header,
@@ -73,12 +73,11 @@ impl Live {
             .take(MAX_PADS)
             .collect();
         Self {
-            feed: FeedState::Off,
+            session: Session::Idle,
             webcams: HashMap::new(),
             awake: None,
             rules,
-            race: RaceState::Idle,
-            audio: crate::driver::audio::Audio::spawn(),
+            audio: Audio::spawn(),
             res: None,
             header: header::Header::new(),
             setup,
@@ -94,10 +93,11 @@ impl Live {
             ToggleRec,
             ToggleRace,
             GotoMenu,
+            GotoScrub,
             None,
         }
         let mut action = Action::None;
-        self.race_tick();
+        self.session_tick();
         self.arm_race_repaint(ui.ctx());
 
         if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::W)) {
@@ -260,50 +260,31 @@ impl Live {
                     }
                 }
 
-                // Статус-бар: LIVE, REC, RACE. LIVE и REC — независимые
-                // виджеты: клик по LIVE тогглит захват, клик по REC —
-                // запись. Время сессии — под плашкой: одинарным шрифтом
-                // по центру, цветом подложки; пока сессии нет — не
-                // рисуется. Кликабельна вся область плашки.
+                // Статус-бар: кнопки-стрелки EXIT, DVR, LIVE, REC, RACE —
+                // отражение машины состояний сессии (см. Session): клик
+                // шлёт тоггл, сессия решает переход. Порядок блоков:
+                // входы и шкалы статусов, раскладка цепочки, счётчик
+                // гонки, кнопки, подсказки, отрисовка счётчика.
+
+                // Входы: состояние потоков (шкалы статусов) и эфира.
                 let live_state = self.webcams.values().next().map(|w| w.capture_state());
                 let rec_active = self.webcams.values().any(|w| w.record_state().ok);
-                let feed_on = !matches!(self.feed, FeedState::Off);
+                let feed_on = self.session.live_on();
 
-                // Шкала Status — напрямую из FeedState × CaptureState:
-                // Dead при включённом эфире — error; кадры идут или поток
-                // ещё поднимается (Starting — не отвал) — active; иначе idle.
+                // Шкалы статусов. LIVE — из сессии × CaptureState: Dead
+                // при включённом эфире — error; кадры идут или поток ещё
+                // поднимается (Starting — не отвал) — active; иначе idle.
                 let live_status = match live_state {
                     Some(CaptureState::Dead) if feed_on => Status::Error,
                     Some(CaptureState::Live) => Status::Active,
                     _ if feed_on => Status::Active,
                     _ => Status::Idle,
                 };
-                let live_timer = session_timer(self.feed.live_since());
-                let rec_timer = session_timer(self.feed.rec_since());
-                // Плашки-стрелки цепочкой (PowerShell): EXIT, DVR, LIVE,
-                // REC, RACE. Rect'ы текстов — частная раскладка
-                // status_chain (scrub держит свою копию — там EXIT только
-                // иконка). Состояние — пара (подложка, текст): тусклая +
-                // чёрный в покое, насыщенная + белый в активе. EXIT — серая
-                // заливка, DVR — обводка в цвет неактивной заливки REC.
-                // Счётчик RACE — дальше, без плашки.
-                let tip = grid::cell_x(2);
-                let overlap = grid::cell_x(2);
-                let air = grid::cell_x(2);
-                let StatusChain {
-                    exit: exit_rect,
-                    dvr: dvr_rect,
-                    live: live_rect,
-                    rec: rec_rect,
-                    race: race_rect,
-                } = status_chain(ui.ctx(), bottom_right.row);
-                let exit_plate = plate_rect(exit_rect, tip, air, overlap);
-                let dvr_plate = plate_rect(dvr_rect, tip, air, overlap);
-                let live_plate = plate_rect(live_rect, tip, air, overlap);
-                let (live_plate_color, live_text_color) =
-                    plate_colors(live_status, PLATE_LIVE_IDLE, PLATE_LIVE);
-
-                let feed_rec = matches!(self.feed, FeedState::Rec { .. });
+                let live_timer = session_timer(self.session.live_since());
+                let rec_timer = session_timer(self.session.rec_since());
+                // REC: включена запись, но кадров нет (поток мёртв или
+                // стартовал слишком недавно) — error; иначе по факту.
+                let feed_rec = self.session.rec_on();
                 let rec_status =
                     if feed_rec && !rec_active && live_state != Some(CaptureState::Starting) {
                         Status::Error
@@ -312,132 +293,227 @@ impl Live {
                     } else {
                         Status::Idle
                     };
-                let rec_plate = plate_rect(rec_rect, tip, air, overlap);
-                let (rec_plate_color, rec_text_color) =
-                    plate_colors(rec_status, PLATE_REC_IDLE, PLATE_REC);
+                // RACE: активна фаза отсчёта или гонки (кислотный цвет).
+                let race_active = self.session.race_active();
 
-                // RACE и счётчик — один контрол: кликабельны плашка и
-                // счётчик. Ширина плашки — по слову RACE (счётчик вне её).
-                let race_active = self.race.active();
-                let race_plate = plate_rect(race_rect, tip, air, overlap);
-                let (race_plate_color, race_text_color) = plate_colors(
-                    if race_active {
-                        Status::Active
-                    } else {
-                        Status::Idle
-                    },
-                    PLATE_RACE_IDLE,
-                    PLATE_RACE,
+                // Раскладка цепочки. Кнопки-стрелки (PowerShell) —
+                // виджеты NavButton: плашка с уголками + верхний текст +
+                // нижний текст-доптаймер, 3 состояния (Idle/Active/
+                // Disabled), высота виджета 3 клетки. Rect'ы текстов —
+                // частная раскладка status_chain (scrub держит свою копию
+                // — там EXIT только иконка). Гонка началась (Race и
+                // дальше): все наконечники плашек разворачиваются влево,
+                // иконки LIVE/REC/RACE меняются на стоп.
+                let running = self.session.race_started();
+                let (live_label, rec_label, race_label) = if running {
+                    let stop = "\u{f04d}";
+                    (
+                        format!("{stop} LIVE"),
+                        format!("{stop} REC"),
+                        format!("{stop} RACE"),
+                    )
+                } else {
+                    (
+                        "\u{f04b} LIVE".to_owned(),
+                        "\u{f044a} REC".to_owned(),
+                        "\u{f140b} RACE".to_owned(),
+                    )
+                };
+                let StatusChain {
+                    exit: exit_rect,
+                    dvr: dvr_rect,
+                    live: live_rect,
+                    rec: rec_rect,
+                    race: race_rect,
+                } = status_chain(
+                    ui.ctx(),
+                    bottom_right.row,
+                    [
+                        "\u{e6c0}\u{f0206} EXIT",
+                        "\u{f16df} DVR",
+                        &live_label,
+                        &rec_label,
+                        &race_label,
+                    ],
                 );
+                // Плашки-якоря подсказок (по Alt) — рисует NavButton, тут
+                // только rect для позиционирования.
+                let live_plate = view::nav_plate_rect(live_rect);
+                let rec_plate = view::nav_plate_rect(rec_rect);
+                let race_plate = view::nav_plate_rect(race_rect);
+
+                // Счётчик гонки — правее цепочки, без плашки. RACE и
+                // счётчик — один контрол (кликабельны оба).
                 // Мигание привязано к началу времени гонки (фазы по
                 // 500 мс назад от него): последняя фаза ПОГАС кончается
                 // ровно на нём — дальше счётчик ГОРИТ И ТИКАЕТ. ПОГАС —
                 // пригашение на 80% (яркость 20%), не исчезновение.
                 let blink_off = matches!(
-                    self.race,
-                    RaceState::Countdown { start, delay }
+                    self.session,
+                    Session::RaceCountdown { start, delay, .. }
                         if race_time_start(start, delay)
                             .saturating_duration_since(Instant::now())
                             .as_millis() as u64
                             % 1000
                             >= 500
                 );
-                let race_timer = race_text(&self.race, Instant::now());
+                let race_timer = race_text(&self.session, Instant::now());
                 let timer_pos = egui::pos2(
                     race_plate.right() + grid::cell_x(2),
                     race_rect.left_bottom().y,
                 );
-                // Не перекрываются — порядок любой, рисуем как читаются.
-                view::arrow_plate(
-                    ui,
-                    exit_plate,
-                    view::PlateEdge::ChevronConvex,
-                    view::PlateEdge::ChevronConcave,
-                    view::PlatePaint::Filled(PLATE_EXIT),
-                );
-                view::arrow_plate(
-                    ui,
-                    dvr_plate,
-                    view::PlateEdge::ChevronConvex,
-                    view::PlateEdge::ChevronConcave,
-                    view::PlatePaint::Outlined(PLATE_REC_IDLE),
-                );
-                view::arrow_plate(
-                    ui,
-                    live_plate,
-                    view::PlateEdge::ChevronConvex,
-                    view::PlateEdge::ChevronConvex,
-                    view::PlatePaint::Filled(live_plate_color),
-                );
-                view::arrow_plate(
-                    ui,
-                    rec_plate,
-                    view::PlateEdge::ChevronConcave,
-                    view::PlateEdge::ChevronConvex,
-                    view::PlatePaint::Filled(rec_plate_color),
-                );
-                view::arrow_plate(
-                    ui,
-                    race_plate,
-                    view::PlateEdge::ChevronConcave,
-                    view::PlateEdge::ChevronConvex,
-                    view::PlatePaint::Filled(race_plate_color),
-                );
-                // EXIT и DVR — пассивные: клик не обрабатывается. Иконка
-                // EXIT с маркером GLYPH_FLIP — стрелка влево (выход налево).
-                view::BigButton::new("\u{e6c0}\u{f0206} EXIT", egui::Color32::BLACK)
-                    .paint(ui, exit_rect);
-                view::BigButton::new("\u{f16df} DVR", PLATE_REC_IDLE).paint(ui, dvr_rect);
 
-                let live_id = ui.make_persistent_id("status_live");
-                // Клик-бласть — плашка без наконечника: уголок не кликабелен.
-                let live_hit = live_plate.with_max_x(live_plate.right() - tip);
-                let live_response = view::BigButton::new("\u{25b6} LIVE", live_text_color)
-                    .show(ui, live_rect, live_id)
-                    .union(
-                        ui.interact(live_hit, live_id.with("hit"), egui::Sense::click())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand),
-                    );
-                if live_response.clicked() {
+                // Края плашек: обычно цепочка смотрит вправо (EXIT — нос
+                // влево, дальше стык «нос соседа → впадина»); в бегущей
+                // гонке все наконечники — влево (стык тот же, развёрнутый).
+                // Кнопки рисуем в порядке следования: соседние плашки
+                // наползают друг на друга.
+                let leftward = (
+                    view::PlateEdge::ChevronConvex,
+                    view::PlateEdge::ChevronConcave,
+                );
+                let rightward = if running {
+                    leftward
+                } else {
+                    (
+                        view::PlateEdge::ChevronConcave,
+                        view::PlateEdge::ChevronConvex,
+                    )
+                };
+                let live_edges = if running {
+                    leftward
+                } else {
+                    (
+                        view::PlateEdge::ChevronConvex,
+                        view::PlateEdge::ChevronConvex,
+                    )
+                };
+                // Доступность → состояние NavButton: недоступна —
+                // Disabled (контур), иначе Idle/Active (error — активный:
+                // включено, но поток мёртв).
+                let nav_state = |available: bool, status: Status| {
+                    if !available {
+                        view::NavState::Disabled
+                    } else {
+                        match status {
+                            Status::Idle => view::NavState::Idle,
+                            _ => view::NavState::Active,
+                        }
+                    }
+                };
+
+                // Кнопки цепочки, в порядке следования.
+                // EXIT — выход из режима Live (в меню).
+                if view::NavButton::new(
+                    "\u{e6c0}\u{f0206} EXIT",
+                    "",
+                    view::NavState::Idle,
+                    PLATE_EXIT,
+                    PLATE_EXIT,
+                    leftward.0,
+                    leftward.1,
+                )
+                .show(ui, exit_rect, ui.make_persistent_id("status_exit"))
+                .is_some_and(|r| r.clicked())
+                {
+                    action = Action::GotoMenu;
+                }
+
+                // DVR: недоступна до LiveAfter; с LiveAfter (запись
+                // закончена) — обычная залитая кнопка, клик ведёт в scrub.
+                // «Сколько записано» — нижним текстом (фиксируется в
+                // момент отжатия REC).
+                if view::NavButton::new(
+                    "\u{f16df} DVR",
+                    self.session.recorded().map(mmss).unwrap_or_default(),
+                    if self.session.dvr_available() {
+                        view::NavState::Idle
+                    } else {
+                        view::NavState::Disabled
+                    },
+                    PLATE_REC_IDLE,
+                    PLATE_REC_IDLE,
+                    leftward.0,
+                    leftward.1,
+                )
+                .show(ui, dvr_rect, ui.make_persistent_id("status_dvr"))
+                .is_some_and(|r| r.clicked())
+                {
+                    action = Action::GotoScrub;
+                }
+
+                // LIVE; время сессии — нижним текстом.
+                if view::NavButton::new(
+                    &live_label,
+                    &live_timer,
+                    nav_state(self.session.live_available(), live_status),
+                    PLATE_LIVE_IDLE,
+                    PLATE_LIVE,
+                    live_edges.0,
+                    live_edges.1,
+                )
+                .show(ui, live_rect, ui.make_persistent_id("status_live"))
+                .is_some_and(|r| r.clicked())
+                {
                     action = Action::ToggleLive;
                 }
-                // Время сессии — под плашкой, по левому краю текста (на 3
-                // колонки правее края плашки: иконка + пробел), цветом
-                // подложки.
-                if !live_timer.is_empty() {
-                    ui.painter().text(
-                        egui::pos2(live_rect.left() + grid::cell_x(3), live_plate.bottom()),
-                        egui::Align2::LEFT_TOP,
-                        &live_timer,
-                        style::FONT_REGULAR,
-                        live_plate_color,
-                    );
-                }
 
-                let rec_id = ui.make_persistent_id("status_rec");
-                // Клик-бласть — видимое тело плашки: без наконечника
-                // справа и без левого хвоста под наконечником соседа
-                // (начинается от левого воздуха).
-                let rec_hit = rec_plate
-                    .with_min_x(rec_rect.left() - air)
-                    .with_max_x(rec_plate.right() - tip);
-                let rec_response = view::BigButton::new("\u{f044a} REC", rec_text_color)
-                    .show(ui, rec_rect, rec_id)
-                    .union(
-                        ui.interact(rec_hit, rec_id.with("hit"), egui::Sense::click())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand),
-                    );
-                if rec_response.clicked() {
+                // REC; пока пишем — живой таймер нижним текстом.
+                if view::NavButton::new(
+                    &rec_label,
+                    &rec_timer,
+                    nav_state(self.session.rec_available(), rec_status),
+                    PLATE_REC_IDLE,
+                    PLATE_REC,
+                    rightward.0,
+                    rightward.1,
+                )
+                .show(ui, rec_rect, ui.make_persistent_id("status_rec"))
+                .is_some_and(|r| r.clicked())
+                {
                     action = Action::ToggleRec;
                 }
-                if !rec_timer.is_empty() {
-                    ui.painter().text(
-                        egui::pos2(rec_rect.left() + grid::cell_x(3), rec_plate.bottom()),
-                        egui::Align2::LEFT_TOP,
-                        &rec_timer,
-                        style::FONT_REGULAR,
-                        rec_plate_color,
+
+                // RACE. Счётчику — отдельная клик-бласть (иконка + текст).
+                let timer_icon = "\u{f43a}";
+                let timer_icon_w =
+                    super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
+                let race_timer_hit = egui::Rect::from_min_max(
+                    egui::pos2(timer_pos.x, race_plate.top()),
+                    egui::pos2(
+                        timer_pos.x
+                            + timer_icon_w
+                            + grid::cell_x(1)
+                            + super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, &race_timer).x,
+                        race_plate.bottom(),
+                    ),
+                );
+                let race_id = ui.make_persistent_id("status_race");
+                if let Some(race_response) = view::NavButton::new(
+                    &race_label,
+                    "",
+                    nav_state(
+                        self.session.race_available(),
+                        if race_active {
+                            Status::Active
+                        } else {
+                            Status::Idle
+                        },
+                    ),
+                    PLATE_RACE_IDLE,
+                    PLATE_RACE,
+                    rightward.0,
+                    rightward.1,
+                )
+                .show(ui, race_rect, race_id)
+                {
+                    let race_response = race_response.union(
+                        ui.interact(race_timer_hit, race_id.with("timer"), egui::Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand),
                     );
+                    if race_response.clicked() {
+                        action = Action::ToggleRace;
+                    }
                 }
 
                 // Alt: fps-подсказки над LIVE/REC — перечисление камер
@@ -499,12 +575,12 @@ impl Live {
 
                     // RACE: не идёт — длина гонки с заглавной сигмой
                     // (суммарное время); идёт — остаток со знаком минус.
-                    let race_hint = match self.race {
-                        RaceState::Running { .. } => {
+                    let race_hint = match self.session {
+                        Session::Race { .. } => {
                             let left = self
                                 .rules
                                 .duration
-                                .saturating_sub(self.race.elapsed(Instant::now()));
+                                .saturating_sub(self.session.race_elapsed(Instant::now()));
                             format!("-{}", mmss(left))
                         }
                         _ => format!("Σ{}", mmss(self.rules.duration)),
@@ -517,44 +593,27 @@ impl Live {
                     );
                 }
 
-                // Клик-бласть — видимое тело плашки (без наконечника и без
-                // левого хвоста под наконечником соседа) плюс счётчик.
-                let race_body = race_plate
-                    .with_min_x(race_rect.left() - air)
-                    .with_max_x(race_plate.right() - tip);
-                let race_timer_hit = egui::Rect::from_min_max(
-                    egui::pos2(timer_pos.x, race_plate.top()),
-                    egui::pos2(
-                        timer_pos.x
-                            + super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, &race_timer).x,
-                        race_plate.bottom(),
-                    ),
-                );
-                let race_id = ui.make_persistent_id("status_race");
-                let race_response = view::BigButton::new("\u{f140b} RACE", race_text_color)
-                    .show(ui, race_rect, race_id)
-                    .union(
-                        ui.interact(race_body, race_id.with("hit"), egui::Sense::click())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand),
-                    )
-                    .union(
-                        ui.interact(race_timer_hit, race_id.with("timer"), egui::Sense::click())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand),
-                    );
-                if race_response.clicked() {
-                    action = Action::ToggleRace;
-                }
-                // Цвет счётчика: бежит белым; фаза ПОГАС мигания и нули
-                // вне отсчёта (покой, обнулённый финиш) — 20% белого.
-                let zeros_dim = matches!(self.race, RaceState::Idle)
-                    || matches!(&self.race, RaceState::Finished { elapsed } if elapsed.is_zero());
+                // Отрисовка счётчика. Цвет: бежит белым; фаза ПОГАС
+                // мигания и нули вне отсчёта (покой, отменённый старт) —
+                // 20% белого.
+                let zeros_dim = self.session.race_elapsed(Instant::now()).is_zero()
+                    && !self.session.countdown();
                 let timer_color = if blink_off || zeros_dim {
                     egui::Color32::WHITE.gamma_multiply(0.2)
                 } else {
                     egui::Color32::WHITE
                 };
+                // Иконка и текст счётчика — одним цветом, зазор ровно
+                // колонка (font space шире ячейки — позиционируем руками).
                 ui.painter().text(
                     timer_pos,
+                    egui::Align2::LEFT_BOTTOM,
+                    timer_icon,
+                    style::FONT_REGULAR_X2,
+                    timer_color,
+                );
+                ui.painter().text(
+                    egui::pos2(timer_pos.x + timer_icon_w + grid::cell_x(1), timer_pos.y),
                     egui::Align2::LEFT_BOTTOM,
                     race_timer,
                     style::FONT_REGULAR_X2,
@@ -575,6 +634,12 @@ impl Live {
 
         match action {
             Action::GotoMenu => navigator.goto(menu::Menu),
+            Action::GotoScrub => navigator.goto(Box::new(scrub::Scrub::new(
+                ui.ctx(),
+                self.setup.clone(),
+                self.assignments.clone(),
+                crate::driver::dvr::CAPTURES_DIR.into(),
+            ))),
             Action::ToggleLive => self.toggle_live(ui.ctx()),
             Action::ToggleRec => self.toggle_rec(ui.ctx()),
             Action::ToggleRace => self.toggle_race(ui.ctx()),
@@ -582,63 +647,200 @@ impl Live {
         }
     }
 
-    // --- Эфир (LIVE/REC) -------------------------------------------------
+    // --- Сессия (LIVE/REC/RACE) ------------------------------------------
 
+    /// LIVE: из Idle — включить эфир. Отжатие до старта гонки — назад
+    /// (в Idle), после старта — сразу Done (хвост не дописываем).
     fn toggle_live(&mut self, ctx: &egui::Context) {
-        // Любое нажатие LIVE/REC замирает время гонки.
-        self.stop_race();
-        match self.feed {
-            FeedState::Off => {
+        match self.session {
+            Session::Idle => {
                 self.start_captures(ctx);
                 self.screen_awake();
-                self.feed = FeedState::Live {
-                    since: Instant::now(),
+                self.session = Session::LiveBefore {
+                    live_since: Instant::now(),
                 };
             }
-            FeedState::Live { .. } | FeedState::Rec { .. } => {
-                self.webcams.clear();
-                log::info!("webcams stopped");
-                self.awake = None;
-                self.feed = FeedState::Off;
+            Session::LiveBefore { .. } | Session::RaceCountdown { .. } => {
+                self.audio.cancel();
+                self.stop_all();
+                self.session = Session::Idle;
             }
+            Session::RecordHead { .. } => {
+                self.stop_recording_all();
+                self.stop_all();
+                self.session = Session::Idle;
+            }
+            Session::Race { .. } => {
+                let (_, rec_since, race) = self.finish_race();
+                self.stop_recording_all();
+                self.stop_all();
+                self.session = Session::Done {
+                    recorded: rec_since.elapsed(),
+                    race,
+                };
+            }
+            Session::RecordTail {
+                rec_since, race, ..
+            } => {
+                self.stop_recording_all();
+                self.stop_all();
+                self.session = Session::Done {
+                    recorded: rec_since.elapsed(),
+                    race,
+                };
+            }
+            Session::LiveAfter { recorded, race, .. } => {
+                self.stop_all();
+                self.session = Session::Done { recorded, race };
+            }
+            Session::Done { .. } => {}
         }
     }
 
+    /// REC: нажатие из Idle стартует и захват (REC-on транзитивно
+    /// нажимает LIVE), из LiveBefore — только запись; отжатие — до
+    /// LiveAfter. В Race+ отжатие стопает запись и фиксирует её длину;
+    /// в Race переход сразу в LiveAfter (RecordTail — только через
+    /// финиш RACE: клик или лимит).
     fn toggle_rec(&mut self, ctx: &egui::Context) {
-        self.stop_race();
-        match self.feed {
-            FeedState::Off | FeedState::Live { .. } => self.ensure_recording(ctx),
-            FeedState::Rec { live_since, .. } => {
-                for webcam in self.webcams.values() {
-                    webcam.stop_recording();
-                }
-                self.feed = FeedState::Live { since: live_since };
-            }
-        }
-    }
-
-    /// REC-on: с выключенного — захват + запись (+ inhibit), с LIVE —
-    /// только запись. Уже пишем — no-op.
-    fn ensure_recording(&mut self, ctx: &egui::Context) {
-        match self.feed {
-            FeedState::Off => {
+        match self.session {
+            Session::Idle => {
                 self.start_captures(ctx);
                 self.start_recording_all();
                 self.screen_awake();
                 let now = Instant::now();
-                self.feed = FeedState::Rec {
+                self.session = Session::RecordHead {
                     live_since: now,
                     rec_since: now,
                 };
             }
-            FeedState::Live { since } => {
+            Session::LiveBefore { live_since } => {
                 self.start_recording_all();
-                self.feed = FeedState::Rec {
-                    live_since: since,
+                self.session = Session::RecordHead {
+                    live_since,
                     rec_since: Instant::now(),
                 };
             }
-            FeedState::Rec { .. } => {}
+            Session::RecordHead { live_since, .. } => {
+                self.stop_recording_all();
+                self.session = Session::LiveBefore { live_since };
+            }
+            Session::RaceCountdown { live_since, .. } => {
+                // Отжатие REC отменяет и отсчёт (ход назад).
+                self.audio.cancel();
+                self.stop_recording_all();
+                self.session = Session::LiveBefore { live_since };
+            }
+            Session::Race { .. } => {
+                // Отжатие REC в гонке: запись стоп, сразу LiveAfter.
+                let (live_since, rec_since, race) = self.finish_race();
+                self.stop_recording_all();
+                self.session = Session::LiveAfter {
+                    live_since,
+                    recorded: rec_since.elapsed(),
+                    race,
+                };
+            }
+            Session::RecordTail {
+                live_since,
+                rec_since,
+                race,
+            } => {
+                self.stop_recording_all();
+                self.session = Session::LiveAfter {
+                    live_since,
+                    recorded: rec_since.elapsed(),
+                    race,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    /// RACE: нажатие из Idle/LiveBefore/RecordHead — старт отсчёта
+    /// (REC транзитивно нажат, с Idle — и LIVE). Отжатие в RaceCountdown
+    /// — отмена (назад в RecordHead), в Race — финиш (вперёд в
+    /// RecordTail, кнопка дальше недоступна).
+    fn toggle_race(&mut self, ctx: &egui::Context) {
+        match self.session {
+            Session::Idle => {
+                self.start_captures(ctx);
+                self.start_recording_all();
+                self.screen_awake();
+                let now = Instant::now();
+                self.start_countdown(now, now);
+            }
+            Session::LiveBefore { live_since } => {
+                self.start_recording_all();
+                self.start_countdown(live_since, Instant::now());
+            }
+            Session::RecordHead {
+                live_since,
+                rec_since,
+            } => self.start_countdown(live_since, rec_since),
+            Session::RaceCountdown {
+                live_since,
+                rec_since,
+                ..
+            } => {
+                self.audio.cancel();
+                self.session = Session::RecordHead {
+                    live_since,
+                    rec_since,
+                };
+            }
+            Session::Race { .. } => {
+                self.finish_race();
+            }
+            _ => {}
+        }
+    }
+
+    /// Старт отсчёта: звуковая программа (бипы + случайная пауза +
+    /// гудок) и состояние RaceCountdown.
+    fn start_countdown(&mut self, live_since: Instant, rec_since: Instant) {
+        let interval = sample_start_delay(&self.rules.start_signal_delay);
+        let (steps, delay) = if interval.is_zero() {
+            (vec![(Duration::ZERO, BUZZER)], Duration::ZERO)
+        } else {
+            let mut steps: Vec<(Duration, Sound)> = (0..PRE_BEEP_SECS)
+                .map(Duration::from_secs)
+                .map(|t| (t, STAGE))
+                .collect();
+            let delay = Duration::from_secs(PRE_BEEP_SECS) + interval;
+            steps.push((delay, BUZZER));
+            (steps, delay)
+        };
+        self.audio.sequence(steps);
+        self.session = Session::RaceCountdown {
+            live_since,
+            rec_since,
+            start: Instant::now(),
+            delay,
+        };
+    }
+
+    /// Финиш гонки: гудок, время замирает, сессия — в RecordTail
+    /// (запись хвоста продолжается). Возвращает (эфир с, запись с,
+    /// замороженное время). Из не-Race — no-op.
+    fn finish_race(&mut self) -> (Instant, Instant, Duration) {
+        if let Session::Race {
+            live_since,
+            rec_since,
+            start,
+            ..
+        } = self.session
+        {
+            self.audio.play(BUZZER);
+            let race = start.elapsed();
+            self.session = Session::RecordTail {
+                live_since,
+                rec_since,
+                race,
+            };
+            (live_since, rec_since, race)
+        } else {
+            (Instant::now(), Instant::now(), Duration::ZERO)
         }
     }
 
@@ -662,6 +864,19 @@ impl Live {
         }
     }
 
+    fn stop_recording_all(&mut self) {
+        for webcam in self.webcams.values() {
+            webcam.stop_recording();
+        }
+    }
+
+    /// Выключить эфир целиком: захват, подавление сна.
+    fn stop_all(&mut self) {
+        self.webcams.clear();
+        log::info!("webcams stopped");
+        self.awake = None;
+    }
+
     /// Запретить засыпание экрана на время эфира; ошибка inhibit — warn,
     /// не причина отказа от показа.
     fn screen_awake(&mut self) {
@@ -679,75 +894,32 @@ impl Live {
         }
     }
 
-    // --- Гонка (RACE) ----------------------------------------------------
+    // --- Часы сессии ------------------------------------------------------
 
-    /// Старт/отмена гонки. Старт: RACE «нажимает» REC (с выключенного —
-    /// транзитивно захват, LIVE); PRE_BEEP_SECS бипов с периодом 1 с,
-    /// затем интервал из start_signal_delay, затем гудок. Отмена: звуки
-    /// обрываем, время замирает.
-    fn toggle_race(&mut self, ctx: &egui::Context) {
-        match self.race {
-            RaceState::Idle | RaceState::Finished { .. } => {
-                self.ensure_recording(ctx);
-                let interval = sample_start_delay(&self.rules.start_signal_delay);
-                let (steps, delay) = if interval.is_zero() {
-                    (vec![(Duration::ZERO, BUZZER)], Duration::ZERO)
-                } else {
-                    let mut steps: Vec<(Duration, audio::Sound)> = (0..PRE_BEEP_SECS)
-                        .map(Duration::from_secs)
-                        .map(|t| (t, STAGE))
-                        .collect();
-                    let delay = Duration::from_secs(PRE_BEEP_SECS) + interval;
-                    steps.push((delay, BUZZER));
-                    (steps, delay)
-                };
-                self.audio.sequence(steps);
-                self.race = RaceState::Countdown {
-                    start: Instant::now(),
-                    delay,
-                };
-            }
-            RaceState::Countdown { .. } | RaceState::Running { .. } => self.stop_race(),
-        }
-    }
-
-    /// Отжать гонку (кнопкой RACE или транзитивно REC/LIVE). До начала
-    /// времени гонки: звуки отменяем, счётчик сбрасываем в 0. После:
-    /// финишный гудок, время замирает и остаётся гореть кислотно-жёлтым,
-    /// кнопка серая. Из Idle/Finished — no-op.
-    fn stop_race(&mut self) {
-        match self.race {
-            RaceState::Countdown { .. } => {
-                self.audio.cancel();
-                self.race = RaceState::Finished {
-                    elapsed: Duration::ZERO,
-                };
-            }
-            RaceState::Running { .. } => {
-                self.audio.play(BUZZER);
-                self.race = RaceState::Finished {
-                    elapsed: self.race.elapsed(Instant::now()),
-                };
-            }
-            _ => {}
-        }
-    }
-
-    /// Перевод часов гонки: конец отсчёта (звук гудка уже в программе
-    /// отсчёта — здесь только переход состояния), предупреждение о лимите,
-    /// финиш по лимиту.
-    fn race_tick(&mut self) {
+    /// Перевод часов: конец отсчёта — в Race (звук гудка уже в программе
+    /// отсчёта — здесь только переход состояния), лимит времени вылета —
+    /// в RecordTail (RACE отжимается сама). Предупреждение о лимите —
+    /// один гудок за прогон.
+    fn session_tick(&mut self) {
         let now = Instant::now();
-        match self.race {
-            RaceState::Countdown { start, delay } if now >= race_time_start(start, delay) => {
-                self.race = RaceState::Running {
+        match self.session {
+            Session::RaceCountdown {
+                live_since,
+                rec_since,
+                start,
+                delay,
+            } if now >= race_time_start(start, delay) => {
+                self.session = Session::Race {
+                    live_since,
+                    rec_since,
                     start: race_time_start(start, delay),
                     warned: false,
                 };
             }
-            RaceState::Running {
+            Session::Race {
                 start,
                 ref mut warned,
+                ..
             } => {
                 let elapsed = now.saturating_duration_since(start);
                 let limit = self.rules.duration;
@@ -756,7 +928,7 @@ impl Live {
                     *warned = true;
                 }
                 if elapsed >= limit {
-                    self.race = RaceState::Finished { elapsed: limit };
+                    self.finish_race();
                 }
             }
             _ => {}
@@ -769,7 +941,7 @@ impl Live {
     /// полом частоты (не чаще ~23 fps): счётчику хватает, CPU бережём.
     /// Зависшая трансляция — зависший счётчик, осознанно.
     fn arm_race_repaint(&self, ctx: &egui::Context) {
-        if !self.race.active() {
+        if !self.session.race_active() {
             return;
         }
         let streaming = self
@@ -816,78 +988,186 @@ impl Live {
     }
 }
 
-/// Состояние потока: Rec возможен только внутри Live (REC-on стартует
-/// захват и запись; LIVE-off гасит всё; REC тогглится независимо внутри
-/// захвата). В вариантах — момент старта: таймеры кнопок читают его
-/// отсюда, отдельных полей не требуется.
-#[derive(Clone, Copy)]
-enum FeedState {
-    Off,
-    Live {
-        since: Instant,
+/// Сессия эфира: единая машина состояний за кнопками LIVE/REC/RACE.
+/// Основная последовательность:
+/// Idle → LiveBefore → RecordHead → RaceCountdown → Race → RecordTail →
+/// LiveAfter → Done. До старта гонки отжатия кнопок шагают назад по
+/// цепочке, после старта — только вперёд. Done терминальное (сброса
+/// нет). В вариантах — моменты старта для таймеров кнопок и часы гонки.
+#[derive(Clone, Copy, Debug)]
+enum Session {
+    Idle,
+    /// Эфир без записи.
+    LiveBefore {
+        live_since: Instant,
     },
-    Rec {
+    /// Эфир + запись (голова записи).
+    RecordHead {
         live_since: Instant,
         rec_since: Instant,
     },
+    /// Отсчёт до старта; start/delay — программа звуков (см.
+    /// race_time_start).
+    RaceCountdown {
+        live_since: Instant,
+        rec_since: Instant,
+        start: Instant,
+        delay: Duration,
+    },
+    /// Гонка идёт; start — начало времени гонки.
+    Race {
+        live_since: Instant,
+        rec_since: Instant,
+        start: Instant,
+        warned: bool,
+    },
+    /// Гонка кончилась, запись хвоста продолжается; race — замороженное
+    /// время гонки для счётчика.
+    RecordTail {
+        live_since: Instant,
+        rec_since: Instant,
+        race: Duration,
+    },
+    /// Запись отжата, эфир жив; recorded — зафиксированная длина
+    /// записи (момент отжатия REC): таймер «сколько записано» живёт
+    /// под DVR.
+    LiveAfter {
+        live_since: Instant,
+        recorded: Duration,
+        race: Duration,
+    },
+    /// Всё отжато; recorded/race — как в LiveAfter.
+    Done {
+        recorded: Duration,
+        race: Duration,
+    },
 }
 
-impl FeedState {
-    /// Момент старта эфира (таймер LIVE); в Rec эфир не прерывался.
+impl Session {
+    /// Эфир включён (LIVE нажата): всё, кроме Idle и Done.
+    fn live_on(&self) -> bool {
+        !matches!(self, Session::Idle | Session::Done { .. })
+    }
+
+    /// Запись идёт: RecordHead … RecordTail.
+    fn rec_on(&self) -> bool {
+        matches!(
+            self,
+            Session::RecordHead { .. }
+                | Session::RaceCountdown { .. }
+                | Session::Race { .. }
+                | Session::RecordTail { .. }
+        )
+    }
+
+    /// Гонка началась (Race и дальше): хвостики плашек влево, иконки
+    /// stop, отжатия ходят только вперёд.
+    fn race_started(&self) -> bool {
+        matches!(
+            self,
+            Session::Race { .. }
+                | Session::RecordTail { .. }
+                | Session::LiveAfter { .. }
+                | Session::Done { .. }
+        )
+    }
+
+    /// Идёт отсчёт (счётчик мигает, RACE кликабельна на отмену).
+    fn countdown(&self) -> bool {
+        matches!(self, Session::RaceCountdown { .. })
+    }
+
+    /// Отсчёт или гонка: период активного счётчика (самовзвод repaint).
+    fn race_active(&self) -> bool {
+        matches!(self, Session::RaceCountdown { .. } | Session::Race { .. })
+    }
+
+    /// LIVE кликабельна: всё, кроме Done.
+    fn live_available(&self) -> bool {
+        !matches!(self, Session::Done { .. })
+    }
+
+    /// REC кликабельна: из Idle (REC-on стартует и захват) и с эфира до
+    /// конца хвоста. LiveAfter+ — недоступна.
+    fn rec_available(&self) -> bool {
+        matches!(
+            self,
+            Session::Idle
+                | Session::LiveBefore { .. }
+                | Session::RecordHead { .. }
+                | Session::RaceCountdown { .. }
+                | Session::Race { .. }
+                | Session::RecordTail { .. }
+        )
+    }
+
+    /// RACE кликабельна: нажатие до старта (Idle/LiveBefore/RecordHead),
+    /// отжатие в Countdown/Race. RecordTail+ — недоступна.
+    fn race_available(&self) -> bool {
+        matches!(
+            self,
+            Session::Idle
+                | Session::LiveBefore { .. }
+                | Session::RecordHead { .. }
+                | Session::RaceCountdown { .. }
+                | Session::Race { .. }
+        )
+    }
+
+    /// DVR кликабельна: с LiveAfter (клик пока без действия).
+    fn dvr_available(&self) -> bool {
+        matches!(self, Session::LiveAfter { .. } | Session::Done { .. })
+    }
+
+    /// Момент старта эфира (таймер LIVE).
     fn live_since(&self) -> Option<Instant> {
-        match self {
-            FeedState::Off => None,
-            FeedState::Live { since } => Some(*since),
-            FeedState::Rec { live_since, .. } => Some(*live_since),
+        match *self {
+            Session::Idle | Session::Done { .. } => None,
+            Session::LiveBefore { live_since } => Some(live_since),
+            Session::RecordHead { live_since, .. }
+            | Session::RaceCountdown { live_since, .. }
+            | Session::Race { live_since, .. }
+            | Session::RecordTail { live_since, .. }
+            | Session::LiveAfter { live_since, .. } => Some(live_since),
         }
     }
 
-    /// Момент старта записи (таймер REC).
+    /// Момент начала записи (живой таймер REC; только пока пишем).
     fn rec_since(&self) -> Option<Instant> {
-        match self {
-            FeedState::Rec { rec_since, .. } => Some(*rec_since),
+        match *self {
+            Session::RecordHead { rec_since, .. }
+            | Session::RaceCountdown { rec_since, .. }
+            | Session::Race { rec_since, .. }
+            | Session::RecordTail { rec_since, .. } => Some(rec_since),
             _ => None,
         }
     }
-}
 
-/// Гонка: отсчёт → таймер → финиш.
-enum RaceState {
-    /// Кнопка серая, счётчик на нулях.
-    Idle,
-    /// start — нажатие RACE, delay — длительность отсчёта
-    /// (бипы + интервал из RaceRules.start_signal_delay).
-    Countdown { start: Instant, delay: Duration },
-    /// start — старт таймера: конец гудка; пока гудок не
-    /// отыграл, elapsed == 0. warned — предупреждающий гудок до лимита
-    /// уже сыгран (один раз на прогон).
-    Running { start: Instant, warned: bool },
-    /// Время замерло (лимит или отмена), кнопка серая.
-    Finished { elapsed: Duration },
-}
-
-impl RaceState {
-    /// Текущее время гонки; у Countdown таймер ещё не шёл — 0.
-    fn elapsed(&self, now: Instant) -> Duration {
-        match self {
-            RaceState::Idle | RaceState::Countdown { .. } => Duration::ZERO,
-            RaceState::Running { start, .. } => now.saturating_duration_since(*start),
-            RaceState::Finished { elapsed } => *elapsed,
+    /// Зафиксированная длина записи (фиксируется в момент отжатия REC):
+    /// таймер «сколько записано» под DVR. None, пока записи не было.
+    fn recorded(&self) -> Option<Duration> {
+        match *self {
+            Session::LiveAfter { recorded, .. } | Session::Done { recorded, .. } => Some(recorded),
+            _ => None,
         }
     }
 
-    /// Активная фаза: кнопка кислотно-жёлтая.
-    fn active(&self) -> bool {
-        matches!(
-            self,
-            RaceState::Countdown { .. } | RaceState::Running { .. }
-        )
+    /// Время гонки для счётчика: 0 до старта, бежит в Race, заморожено
+    /// после.
+    fn race_elapsed(&self, now: Instant) -> Duration {
+        match *self {
+            Session::Race { start, .. } => now.saturating_duration_since(start),
+            Session::RecordTail { race, .. }
+            | Session::LiveAfter { race, .. }
+            | Session::Done { race, .. } => race,
+            _ => Duration::ZERO,
+        }
     }
 }
 
 /// Звуки гонки: live их и проигрывает. Бинари — в `assets`.
-const STAGE: audio::Sound = audio::Sound::from_bytes(crate::assets::STAGE_WAV);
-const BUZZER: audio::Sound = audio::Sound::from_bytes(crate::assets::BUZZER_WAV);
+const STAGE: Sound = Sound::from_bytes(crate::assets::STAGE_WAV);
+const BUZZER: Sound = Sound::from_bytes(crate::assets::BUZZER_WAV);
 
 /// Подложки кнопок-стрелок. Активные: LIVE — ярко-голубой, REC —
 /// gruvbox red, RACE — кислотный yellow-green: тройка далеко по кругу.
@@ -914,9 +1194,13 @@ struct StatusChain {
     race: egui::Rect,
 }
 
-/// Цепочка с колонки 2: высота две клетки, тексты разнесены на 6
+/// Цепочка с колонки 2: текстовые rect'ы 2 клетки высотой, прижаты
+/// низом к нижней строке; виджет кнопки 3 клетки — нижняя строка
+/// (доптекст) уходит ниже текста. Тексты разнесены на 6
 /// колонок (воздух по 2 колонки с каждой стороны у каждой плашки).
-fn status_chain(ctx: &egui::Context, bottom_row: isize) -> StatusChain {
+/// Подписи пяти кнопок приходят снаружи — иконки зависят от состояния
+/// (в гонке LIVE/REC/RACE — стоп).
+fn status_chain(ctx: &egui::Context, bottom_row: isize, labels: [&str; 5]) -> StatusChain {
     let text_rect = |prev: Option<egui::Rect>, text: &str| {
         let cols = grid::whole_cols(view::content_width(ctx, text));
         match prev {
@@ -928,37 +1212,18 @@ fn status_chain(ctx: &egui::Context, bottom_row: isize) -> StatusChain {
                 .extrude(cols, -2),
         }
     };
-    let exit = text_rect(None, "\u{e6c0}\u{f0206} EXIT");
-    let dvr = text_rect(Some(exit), "\u{f16df} DVR");
-    let live = text_rect(Some(dvr), "\u{25b6} LIVE");
-    let rec = text_rect(Some(live), "\u{f044a} REC");
-    let race = text_rect(Some(rec), "\u{f140b} RACE");
+    let [exit_t, dvr_t, live_t, rec_t, race_t] = labels;
+    let exit = text_rect(None, exit_t);
+    let dvr = text_rect(Some(exit), dvr_t);
+    let live = text_rect(Some(dvr), live_t);
+    let rec = text_rect(Some(live), rec_t);
+    let race = text_rect(Some(rec), race_t);
     StatusChain {
         exit,
         dvr,
         live,
         rec,
         race,
-    }
-}
-
-/// Плашка вокруг текстового rect: воздух по колонке с каждой стороны,
-/// наконечник справа, левый хвост — под наконечник соседа (overlap).
-pub fn plate_rect(text: egui::Rect, tip: f32, air: f32, overlap: f32) -> egui::Rect {
-    text.with_min_x(text.left() - overlap - air)
-        .with_max_x(text.right() + air + tip)
-}
-
-/// (подложка, текст) кнопки-стрелки: в покое пригашенный оттенок, в
-/// активе насыщенный; текст всегда чёрный.
-fn plate_colors(
-    status: Status,
-    idle: egui::Color32,
-    active: egui::Color32,
-) -> (egui::Color32, egui::Color32) {
-    match status {
-        Status::Idle => (idle, egui::Color32::BLACK),
-        _ => (active, egui::Color32::BLACK),
     }
 }
 
@@ -975,9 +1240,10 @@ fn race_time_start(start: Instant, delay: Duration) -> Instant {
 
 /// Текст счётчика гонки как последнее «слово» кнопки RACE. Формат
 /// строго mm:ss.mmm. Во время отсчёта — нули (мигают, см. blink ниже),
-/// после гудка — время гонки бежит вверх, в покое и на финише — как есть.
-fn race_text(state: &RaceState, now: Instant) -> String {
-    let total = state.elapsed(now).as_millis() as u64;
+/// после гудка — время гонки бежит вверх, в покое и после финиша —
+/// замороженное.
+fn race_text(session: &Session, now: Instant) -> String {
+    let total = session.race_elapsed(now).as_millis() as u64;
     format!(
         "{:02}:{:02}.{:03}",
         total / 60_000,
@@ -1085,5 +1351,98 @@ mod tests {
             delay >= Duration::from_secs(2) && delay < Duration::from_secs(4),
             "random delay {delay:?} outside [2s, 4s)"
         );
+    }
+
+    /// Таблица доступности кнопок и флагов по фазам сессии — спека
+    /// машины состояний (см. комментарий к Session). Парами флагов:
+    /// (live_on, rec_on, race_started) и (live, rec, race, dvr) —
+    /// кликабельность.
+    #[test]
+    fn session_flags_and_availability() {
+        let now = Instant::now();
+        let zero = Duration::ZERO;
+        let phases = [
+            (
+                Session::Idle,
+                (false, false, false),
+                (true, true, true, false),
+            ),
+            (
+                Session::LiveBefore { live_since: now },
+                (true, false, false),
+                (true, true, true, false),
+            ),
+            (
+                Session::RecordHead {
+                    live_since: now,
+                    rec_since: now,
+                },
+                (true, true, false),
+                (true, true, true, false),
+            ),
+            (
+                Session::RaceCountdown {
+                    live_since: now,
+                    rec_since: now,
+                    start: now,
+                    delay: zero,
+                },
+                (true, true, false),
+                (true, true, true, false),
+            ),
+            (
+                Session::Race {
+                    live_since: now,
+                    rec_since: now,
+                    start: now,
+                    warned: false,
+                },
+                (true, true, true),
+                (true, true, true, false),
+            ),
+            (
+                Session::RecordTail {
+                    live_since: now,
+                    rec_since: now,
+                    race: zero,
+                },
+                (true, true, true),
+                (true, true, false, false),
+            ),
+            (
+                Session::LiveAfter {
+                    live_since: now,
+                    recorded: zero,
+                    race: zero,
+                },
+                (true, false, true),
+                (true, false, false, true),
+            ),
+            (
+                Session::Done {
+                    recorded: zero,
+                    race: zero,
+                },
+                (false, false, true),
+                (false, false, false, true),
+            ),
+        ];
+        for (session, (on, rec, started), (live, rec_a, race, dvr)) in phases {
+            assert_eq!(
+                (session.live_on(), session.rec_on(), session.race_started()),
+                (on, rec, started),
+                "flags {session:?}"
+            );
+            assert_eq!(
+                (
+                    session.live_available(),
+                    session.rec_available(),
+                    session.race_available(),
+                    session.dvr_available()
+                ),
+                (live, rec_a, race, dvr),
+                "availability {session:?}"
+            );
+        }
     }
 }

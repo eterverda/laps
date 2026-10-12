@@ -238,41 +238,6 @@ fn paint_glyph_flipped(
     advance
 }
 
-/// Большая кнопка статуса: текст слева (слова через одинарные пробелы —
-/// по одной ячейке). Rect кнопки приходит снаружи целиком и должен
-/// покрывать весь контент — ширину считает вызывающий код (см.
-/// content_width). Слово с маркером GLYPH_FLIP рисует первый глиф
-/// зеркально. Ховер и клик — по пришедшему rect, Response возвращается
-/// наружу — действие решает вызывающий код.
-pub struct BigButton<'a> {
-    /// Левая строка кнопки: разбивается по пробелам, слова рисуются
-    /// в ряд, между ними — одинарный (1 ячейка) пробел.
-    pub text: &'a str,
-    pub color: egui::Color32,
-}
-
-impl<'a> BigButton<'a> {
-    pub fn new(text: &'a str, color: egui::Color32) -> Self {
-        Self { text, color }
-    }
-
-    pub fn show(&self, ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id) -> egui::Response {
-        let response = ui
-            .interact(rect, id, egui::Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        self.paint(ui, rect);
-        response
-    }
-
-    /// Только текст кнопки, без интерактива (пассивные кнопки-заглушки).
-    pub fn paint(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let mut pos = rect.left_bottom();
-        for word in self.text.split(' ').filter(|word| !word.is_empty()) {
-            pos.x += paint_word(ui, pos, word, self.color) + super::grid::cell_x(1);
-        }
-    }
-}
-
 /// Ширина текста кнопки в пикселях — чтобы вызывающий код мог
 /// посчитать rect.
 pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
@@ -470,15 +435,213 @@ pub fn arrow_plate(
         egui::pos2(right_body, rect.bottom()),
         egui::pos2(left_body, rect.bottom()),
     ];
+    // Обводка (Outlined) — внутрь: внешний край disabled-плашки
+    // совпадает со залитой, контур не вылезает за геометрию цепочки.
     let (fill, stroke) = match paint {
-        PlatePaint::Filled(color) => (color, egui::Stroke::NONE),
+        PlatePaint::Filled(color) => (color, egui::epaint::PathStroke::NONE),
         PlatePaint::Outlined(color) => (
             egui::Color32::TRANSPARENT,
-            egui::Stroke::new(PLATE_OUTLINE_WIDTH, color),
+            egui::epaint::PathStroke::new(PLATE_OUTLINE_WIDTH, color).inside(),
         ),
     };
     ui.painter()
         .add(egui::Shape::convex_polygon(outline, fill, stroke));
+}
+
+/// Состояние кнопки навигации: покой (неактивные цвета), активная
+/// работа (насыщенный цвет), недоступна (контур и текст цветом
+/// неактивного фона, клика нет).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NavState {
+    Idle,
+    Active,
+    Disabled,
+}
+
+/// Кнопка навигации статус-бара: плашка-стрелка (с уголками) + верхний
+/// текст + нижний текст. Верхний текст — слова через пробел-ячейку,
+/// первое слово — иконка (поддерживает GLYPH_FLIP-маркер).
+/// Нижний текст (доптаймер, "" = без) — по левому краю текста после
+/// иконки (+3 колонки), цветом подложки. Базовая высота виджета —
+/// 3 клетки: две верхнего текста, одна нижнего. Плашка накрывает
+/// только верхние две; нижняя строка (доптекст) — без фона. Размещение
+/// по границам текста ± 2 колонки (NAV_AIR); плашка шире ещё на 2 с
+/// каждой стороны под уголки (симметрично: nose = tail = 2 колонки).
+/// Клик-бласть — весь виджет (все три строки), уголки вне её.
+/// Направления уголков приходят снаружи: цепочка рисует кнопки в
+/// порядке следования.
+pub struct NavButton<T: AsRef<str>, U: AsRef<str>> {
+    text: T,
+    sub: U,
+    state: NavState,
+    idle: egui::Color32,
+    active: egui::Color32,
+    left: PlateEdge,
+    right: PlateEdge,
+}
+
+/// Rect виджета NavButton: текст ± 2 колонки, +1 клетка вниз (строка
+/// sub).
+pub fn nav_widget_rect(text: egui::Rect) -> egui::Rect {
+    text.expand2(egui::vec2(super::grid::cell_x(2), 0.0))
+        .with_max_y(text.bottom() + super::grid::CELL_SIZE.y)
+}
+
+/// Rect плашки NavButton: текст ± (2 воздух + 2 под уголки) по
+/// горизонтали; по вертикали — только две верхние клетки виджета
+/// (нижняя строка с доптекстом без плашки).
+pub fn nav_plate_rect(text: egui::Rect) -> egui::Rect {
+    text.expand2(egui::vec2(super::grid::cell_x(4), 0.0))
+}
+
+impl<T: AsRef<str>, U: AsRef<str>> NavButton<T, U> {
+    pub fn new(
+        text: T,
+        sub: U,
+        state: NavState,
+        idle: egui::Color32,
+        active: egui::Color32,
+        left: PlateEdge,
+        right: PlateEdge,
+    ) -> Self {
+        Self {
+            text,
+            sub,
+            state,
+            idle,
+            active,
+            left,
+            right,
+        }
+    }
+
+    /// Покрасить и, если кнопка не Disabled, принять клик. None —
+    /// недоступна (только покраска).
+    pub fn show(
+        &self,
+        ui: &mut egui::Ui,
+        text_rect: egui::Rect,
+        id: egui::Id,
+    ) -> Option<egui::Response> {
+        let text = self.text.as_ref();
+        let sub = self.sub.as_ref();
+        let widget = nav_widget_rect(text_rect);
+        let plate = nav_plate_rect(text_rect);
+        let (paint, text_color) = match self.state {
+            NavState::Idle => (PlatePaint::Filled(self.idle), egui::Color32::BLACK),
+            NavState::Active => (PlatePaint::Filled(self.active), egui::Color32::BLACK),
+            NavState::Disabled => (PlatePaint::Outlined(self.idle), self.idle),
+        };
+        arrow_plate(ui, plate, self.left, self.right, paint);
+        // Верхний текст — пословно (как считает content_width): иконка,
+        // затем ровно колонка пробела, затем слово. Одним painter.text
+        // нельзя: пробел шрифта шире ячейки и текст не ложится в rect.
+        let mut pos = text_rect.left_bottom();
+        for word in text.split(' ').filter(|word| !word.is_empty()) {
+            pos.x += paint_word(ui, pos, word, text_color) + super::grid::cell_x(1);
+        }
+        if !sub.is_empty() {
+            let sub_color = match self.state {
+                NavState::Active => self.active,
+                _ => self.idle,
+            };
+            ui.painter().text(
+                egui::pos2(text_rect.left() + super::grid::cell_x(3), widget.bottom()),
+                egui::Align2::LEFT_BOTTOM,
+                sub,
+                super::style::FONT_REGULAR,
+                sub_color,
+            );
+        }
+        if self.state == NavState::Disabled {
+            return None;
+        }
+        Some(
+            ui.interact(widget, id, egui::Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand),
+        )
+    }
+}
+
+/// Состояние заливки транспортной кнопки: покой / активна (нажата).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TransportState {
+    Idle,
+    Active,
+}
+
+/// Кнопка транспорта (scrub): залитый прямоугольник 3 клетки высотой,
+/// верхний текст (иконка) по центру верхних двух клеток, нижний текст —
+/// в третьей клетке, с отступом в колонку с каждой стороны (не касается
+/// краёв кнопки). Текст всегда чёрный, цвета заливки приходят снаружи.
+/// Клик-бласть — rect целиком (уголков нет). interact и paint раздельны:
+/// между ними кладётся логика нажатия, чтобы кадр клика рисовался уже
+/// нажатым (иначе вспышка нажатия теряется между кадрами).
+pub struct TransportButton<T: AsRef<str>, U: AsRef<str>> {
+    text: T,
+    sub: U,
+    state: TransportState,
+    idle: egui::Color32,
+    active: egui::Color32,
+}
+
+impl<T: AsRef<str>, U: AsRef<str>> TransportButton<T, U> {
+    pub fn new(
+        text: T,
+        sub: U,
+        state: TransportState,
+        idle: egui::Color32,
+        active: egui::Color32,
+    ) -> Self {
+        Self {
+            text,
+            sub,
+            state,
+            idle,
+            active,
+        }
+    }
+
+    /// Принять клик по rect целиком.
+    pub fn interact(&self, ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id) -> egui::Response {
+        ui.interact(rect, id, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+
+    /// Покрасить кнопку.
+    pub fn paint(&self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let text = self.text.as_ref();
+        let sub = self.sub.as_ref();
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            match self.state {
+                TransportState::Idle => self.idle,
+                TransportState::Active => self.active,
+            },
+        );
+        let icon_w = super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, text).x;
+        ui.painter().text(
+            egui::pos2(
+                rect.center().x - icon_w / 2.0,
+                rect.top() + super::grid::cell_y(1),
+            ),
+            egui::Align2::LEFT_CENTER,
+            text,
+            super::style::FONT_REGULAR_X2,
+            egui::Color32::BLACK,
+        );
+        if !sub.is_empty() {
+            let sub_rect = rect.shrink2(egui::vec2(super::grid::cell_x(1), 0.0));
+            ui.painter().text(
+                egui::pos2(sub_rect.center().x, rect.bottom()),
+                egui::Align2::CENTER_BOTTOM,
+                sub,
+                super::style::FONT_REGULAR,
+                egui::Color32::BLACK,
+            );
+        }
+    }
 }
 
 /// Подсказка-значок в правом нижнем углу anchor: правый нижний угол

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::Navigator;
 use super::grid;
 use super::grid::IntoCell;
 use super::guidelines;
@@ -17,7 +18,6 @@ use super::menu;
 use super::style;
 use super::view;
 use super::viewfinder;
-use super::Navigator;
 use crate::config::setup::Setup;
 use crate::driver::player::{Player, PlayerState};
 use crate::model::pilot::Pilot;
@@ -79,11 +79,10 @@ fn status_timer_x(ctx: &egui::Context, bottom_row: isize) -> f32 {
     };
     let exit = text_rect(None, "\u{e6c0}\u{f0206} EXIT");
     let dvr = text_rect(Some(exit), "\u{f16df} DVR");
-    let live = text_rect(Some(dvr), "\u{25b6} LIVE");
+    let live = text_rect(Some(dvr), "\u{f04b} LIVE");
     let rec = text_rect(Some(live), "\u{f044a} REC");
     let race = text_rect(Some(rec), "\u{f140b} RACE");
-    live::plate_rect(race, grid::cell_x(2), grid::cell_x(2), grid::cell_x(2)).right()
-        + grid::cell_x(2)
+    view::nav_plate_rect(race).right() + grid::cell_x(2)
 }
 
 /// Масштаб скролл-скраба: миллисекунды файла на физический пиксель
@@ -170,21 +169,22 @@ impl Timeline {
         let mut events = Vec::new();
         let y = rect.center().y;
         let x = |f: f32| rect.left() + rect.width() * f;
-        let gray = egui::Stroke::new(2.0, egui::Color32::from_gray(96));
+        // Трек — 40% белого, активный фрагмент — белый.
+        let track = egui::Stroke::new(2.0, egui::Color32::WHITE.gamma_multiply(0.4));
         let white = egui::Stroke::new(2.0, egui::Color32::WHITE);
         match window {
             Some((start, end)) => {
                 ui.painter()
-                    .line_segment([egui::pos2(rect.left(), y), egui::pos2(x(start), y)], gray);
+                    .line_segment([egui::pos2(rect.left(), y), egui::pos2(x(start), y)], track);
                 ui.painter()
                     .line_segment([egui::pos2(x(start), y), egui::pos2(x(end), y)], white);
                 ui.painter()
-                    .line_segment([egui::pos2(x(end), y), egui::pos2(rect.right(), y)], gray);
+                    .line_segment([egui::pos2(x(end), y), egui::pos2(rect.right(), y)], track);
             }
             None => {
                 ui.painter().line_segment(
                     [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                    gray,
+                    track,
                 );
             }
         }
@@ -542,10 +542,10 @@ impl Scrub {
         }
     }
 
-    /// Транспорт: плашки REW/PLAY/FF/RPT 3 клетки высотой (иконка
-    /// по центру верхних двух + подпись шкалы в нижней), клик — вся
-    /// плашка. Возвращает true, если PLAY тоглят. Раскладка — таблица
-    /// (ширина, зазор после), ряд начинается справа от таймера.
+    /// Транспорт: кнопки REW/PLAY/FF/RPT (TransportButton) 3 клетки
+    /// высотой, клик — вся плашка. Возвращает true, если PLAY тоглят.
+    /// Раскладка — таблица (ширина, зазор после), ряд начинается справа
+    /// от таймера.
     fn draw_transport(&mut self, ui: &mut egui::Ui, bottom_right: grid::Cell) -> bool {
         let mut toggle_play = false;
         let btn_rect = |col: isize, cols: isize| {
@@ -556,48 +556,18 @@ impl Scrub {
                 egui::pos2(x + grid::cell_x(cols), y + grid::CELL_SIZE.y),
             )
         };
-        // Кнопка — interact и paint раздельно: seek_tick между
-        // ними, чтобы кадр нажатия рисовался уже нажатым
-        // (иначе белая вспышка терялась между кадрами).
-        let transport_interact = |ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id| {
-            ui.interact(rect, id, egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-        };
-        let transport_paint =
-            |ui: &mut egui::Ui, rect: egui::Rect, icon: &str, pressed: bool, label: &str| {
-                ui.painter().rect_filled(
-                    rect,
-                    0.0,
-                    if pressed {
-                        TRANSPORT_ACTIVE
-                    } else {
-                        TRANSPORT_IDLE
-                    },
-                );
-                let icon_w = super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, icon).x;
-                ui.painter().text(
-                    egui::pos2(rect.center().x - icon_w / 2.0, rect.top() + grid::cell_y(1)),
-                    egui::Align2::LEFT_CENTER,
-                    icon,
-                    style::FONT_REGULAR_X2,
-                    egui::Color32::BLACK,
-                );
-                ui.painter().text(
-                    egui::pos2(rect.center().x, rect.bottom()),
-                    egui::Align2::CENTER_BOTTOM,
-                    label,
-                    style::FONT_REGULAR,
-                    egui::Color32::BLACK,
-                );
-            };
 
         // Раскладка ряда: (ширина, зазор после кнопки). Начало — за
         // таймером (1 колонка воздуха + 3 колонки правее). Ширина
         // таймера считается по формату «ММ:СС.ммм», чтобы сообщение
         // об ошибке позицию не двигало.
         let layout = [(8, 1), (8, 1), (8, 2), (6, 0)];
-        let timer_right =
-            status_timer_x(ui.ctx(), bottom_right.row) + view::content_width(ui.ctx(), "00:00.000");
+        // Таймер рисуется с иконкой и зазором в колонку перед текстом —
+        // они входят в занимаемую ширину.
+        let timer_right = status_timer_x(ui.ctx(), bottom_right.row)
+            + super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, "\u{f43a}").x
+            + grid::cell_x(1)
+            + view::content_width(ui.ctx(), "00:00.000");
         let mut col = grid::cell_at(egui::pos2(timer_right, 0.0)).col + 4;
         let mut rects = layout.iter().map(|&(w, gap)| {
             let r = btn_rect(col, w);
@@ -608,56 +578,69 @@ impl Scrub {
         let play_rect = rects.next().unwrap();
         let ff_rect = rects.next().unwrap();
         let loop_rect = rects.next().unwrap();
-        let rew_id = ui.make_persistent_id("status_rew");
-        let rew_response = transport_interact(ui, rew_rect, rew_id);
-        // Тап может уложиться в один кадр — виден только clicked(),
-        // как на таймлайне.
-        self.seek_tick(ui, &rew_response, true);
-        transport_paint(
-            ui,
-            rew_rect,
+        let state = |lit: bool| {
+            if lit {
+                view::TransportState::Active
+            } else {
+                view::TransportState::Idle
+            }
+        };
+
+        let rew = view::TransportButton::new(
             "\u{25c0}\u{25c0}",
-            self.rew.lit(),
-            &format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
+            format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
+            state(self.rew.lit()),
+            TRANSPORT_IDLE,
+            TRANSPORT_ACTIVE,
         );
+        let rew_id = ui.make_persistent_id("status_rew");
+        // interact → логика нажатия → paint: кадр клика рисуется уже
+        // нажатым. Тап может уложиться в один кадр — виден только
+        // clicked(), как на таймлайне.
+        let rew_response = rew.interact(ui, rew_rect, rew_id);
+        self.seek_tick(ui, &rew_response, true);
+        rew.paint(ui, rew_rect);
 
         let playing = self
             .primary()
             .is_some_and(|p| p.is_playing() && !p.is_seeking());
+        let play = view::TransportButton::new(
+            "\u{25b6}",
+            format!("{}%", PLAY_SPEEDS[self.play_speed]),
+            state(playing),
+            TRANSPORT_IDLE,
+            TRANSPORT_ACTIVE,
+        );
         let play_id = ui.make_persistent_id("status_play");
-        let play_response = transport_interact(ui, play_rect, play_id);
+        let play_response = play.interact(ui, play_rect, play_id);
         if play_response.clicked() {
             toggle_play = true;
         }
-        transport_paint(
-            ui,
-            play_rect,
-            "\u{25b6}",
-            playing,
-            &format!("{}%", PLAY_SPEEDS[self.play_speed]),
-        );
+        play.paint(ui, play_rect);
 
-        let ff_id = ui.make_persistent_id("status_ff");
-        let ff_response = transport_interact(ui, ff_rect, ff_id);
-        self.seek_tick(ui, &ff_response, false);
-        transport_paint(
-            ui,
-            ff_rect,
+        let ff = view::TransportButton::new(
             "\u{25b6}\u{25b6}",
-            self.ff.lit(),
-            &format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
+            format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
+            state(self.ff.lit()),
+            TRANSPORT_IDLE,
+            TRANSPORT_ACTIVE,
         );
+        let ff_id = ui.make_persistent_id("status_ff");
+        let ff_response = ff.interact(ui, ff_rect, ff_id);
+        self.seek_tick(ui, &ff_response, false);
+        ff.paint(ui, ff_rect);
 
         // RPT: пока некликабельна (повтор фрагмента — потом).
-        let loop_id = ui.make_persistent_id("status_loop");
-        let loop_response = transport_interact(ui, loop_rect, loop_id);
-        transport_paint(
-            ui,
-            loop_rect,
+        let rpt = view::TransportButton::new(
             "\u{F0456}",
-            false,
-            &format!("±{:.1}s", RPT_SIZES[self.rpt_size]),
+            format!("±{:.1}s", RPT_SIZES[self.rpt_size]),
+            state(false),
+            TRANSPORT_IDLE,
+            TRANSPORT_ACTIVE,
         );
+        let loop_id = ui.make_persistent_id("status_loop");
+        let loop_response = rpt.interact(ui, loop_rect, loop_id);
+        rpt.paint(ui, loop_rect);
 
         // Скролл над контролом — шаг по его шкале. Вверх всегда
         // «больше» (натуральный скролл: знак дельты как есть).
@@ -730,25 +713,30 @@ impl Scrub {
                 let header_rect = grid::cell(0, 0).extrude(bottom_right.col, 2);
                 self.header.show(ui, header_rect);
 
-                // EXIT — копипаста из live (серая плашка, пассивная),
-                // но плашка из одной иконки (выход-налево) — раскладка
-                // EXIT'а в scrub своя. Таймер ниже — по live'овской
-                // цепочке (status_timer_x).
+                // EXIT — клик ведёт в меню (выход из scrub). NavButton:
+                // виджет 3 клетки (клик-бласть), плашка — верхние две.
+                // Текст — одиночное слово-иконка (нижней строки нет).
+                // Плашка из одной иконки (выход-налево) — раскладка EXIT'а
+                // в scrub своя. Таймер ниже — по live'овской цепочке
+                // (status_timer_x).
                 let exit_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
                     grid::whole_cols(view::content_width(ui.ctx(), "\u{e6c0}\u{f0206}")),
                     -2,
                 );
-                let exit_plate =
-                    live::plate_rect(exit_rect, grid::cell_x(2), grid::cell_x(2), grid::cell_x(2));
-                view::arrow_plate(
-                    ui,
-                    exit_plate,
+                if view::NavButton::new(
+                    "\u{e6c0}\u{f0206}",
+                    "",
+                    view::NavState::Idle,
+                    PLATE_EXIT,
+                    PLATE_EXIT,
                     view::PlateEdge::ChevronConvex,
                     view::PlateEdge::ChevronConcave,
-                    view::PlatePaint::Filled(PLATE_EXIT),
-                );
-                view::BigButton::new("\u{e6c0}\u{f0206}", egui::Color32::BLACK)
-                    .paint(ui, exit_rect);
+                )
+                .show(ui, exit_rect, ui.make_persistent_id("scrub_exit"))
+                .is_some_and(|r| r.clicked())
+                {
+                    action = Action::GotoMenu;
+                }
 
                 if self.draw_transport(ui, bottom_right) {
                     action = Action::TogglePlay;
@@ -869,12 +857,27 @@ impl Scrub {
                                 (race_pos / 1_000) % 60,
                                 race_pos % 1_000
                             );
+                            // Таймер: иконка + ровно колонка + текст
+                            // (font space шире ячейки — позиционируем
+                            // руками), одним цветом. За пределами гонки
+                            // допстрока ниже — 20% белого.
+                            let timer_icon = "\u{f43a}";
+                            let timer_icon_w =
+                                super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
+                            let timer_text_x = text_pos.x + timer_icon_w + grid::cell_x(1);
                             ui.painter().text(
                                 text_pos,
                                 egui::Align2::LEFT_BOTTOM,
+                                timer_icon,
+                                style::FONT_REGULAR_X2,
+                                egui::Color32::WHITE,
+                            );
+                            ui.painter().text(
+                                egui::pos2(timer_text_x, text_pos.y),
+                                egui::Align2::LEFT_BOTTOM,
                                 &pos_text,
                                 style::FONT_REGULAR_X2,
-                                egui::Color32::GRAY,
+                                egui::Color32::WHITE,
                             );
                             // В отрезках до/после гонки — отступление от
                             // старта/финиша, строкой ниже по центру,
@@ -892,14 +895,17 @@ impl Scrub {
                                     // его строки: глифы основного висят
                                     // выше базлайна, доп-таймер — в
                                     // строке под ними.
-                                    let x =
-                                        text_pos.x + view::content_width(ui.ctx(), &pos_text) / 2.0;
+                                    let x = text_pos.x
+                                        + (timer_icon_w
+                                            + grid::cell_x(1)
+                                            + view::content_width(ui.ctx(), &pos_text))
+                                            / 2.0;
                                     ui.painter().text(
                                         egui::pos2(x, grid::cell_y(bottom_right.row - 1)),
                                         egui::Align2::CENTER_TOP,
                                         offset,
                                         style::FONT_REGULAR,
-                                        egui::Color32::GRAY,
+                                        egui::Color32::WHITE.gamma_multiply(0.4),
                                     );
                                 }
                             }
@@ -909,7 +915,7 @@ impl Scrub {
                             if state == PlayerState::Ready {
                                 let rect = egui::Rect::from_min_max(
                                     egui::pos2(
-                                        exit_plate.right() + grid::cell_x(3),
+                                        view::nav_plate_rect(exit_rect).right() + grid::cell_x(3),
                                         text_pos.y - grid::cell_y(2),
                                     ),
                                     egui::pos2(text_pos.x - grid::cell_x(3), text_pos.y),

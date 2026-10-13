@@ -8,7 +8,7 @@
 //! позицию/флаги через атомики.
 
 pub mod playhead;
-pub use playhead::Playhead;
+pub use playhead::{Circle, Playhead};
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,8 +49,8 @@ pub enum PlayerState {
 
 /// Команды в worker: пришедшие до готовности ждут в очереди канала.
 /// Все — намерения для головки; первые пять дискретны (мгновенный
-/// эффект, жест отменяют), последние две — жест hold/release на
-/// перемотке (единственный источник рамп скорости).
+/// эффект, жест отменяют), последние две — шаттл (единственный
+/// источник рамп скорости).
 enum Command {
     Play,
     Pause,
@@ -68,6 +68,11 @@ enum Command {
     ShuttleRelease {
         dur: Duration,
     },
+    /// Зацикливание: Some(круг) включает (центр ставит головка),
+    /// None выключает.
+    SetCircle(Option<Circle>),
+    /// Радиус круга (скролл по кнопке LOOP), центр не трогаем.
+    SetCircleRadius(u64),
 }
 
 pub struct Player {
@@ -79,9 +84,14 @@ pub struct Player {
     state: Arc<Mutex<PlayerState>>,
     /// Авторитет у worker'а: конец файла гасит кнопку сам.
     playing: Arc<AtomicCell<bool>>,
-    /// Жест hold/release, начатый из паузы: PLAY при нём тёмный, хотя
+    /// Шаттл, начатый из паузы: PLAY при нём тёмный, хотя
     /// время крутится (playing выше — про «время бежит», не про UI).
     seeking: Arc<AtomicCell<bool>>,
+    /// Круг включён (кнопка LOOP нажата) — для подсветки.
+    circled: Arc<AtomicCell<bool>>,
+    /// Параметры круга (центр/радиус в мс, во времени видео) —
+    /// для индикатора на таймлайне.
+    circle: Arc<AtomicCell<Option<Circle>>>,
     position: Arc<AtomicCell<u64>>,
     /// 0, пока идёт open.
     duration: Arc<AtomicCell<u64>>,
@@ -101,6 +111,8 @@ impl Player {
         let state = Arc::new(Mutex::new(PlayerState::Opening));
         let playing = Arc::new(AtomicCell::new(false));
         let seeking = Arc::new(AtomicCell::new(false));
+        let circled = Arc::new(AtomicCell::new(false));
+        let circle = Arc::new(AtomicCell::new(None));
         let position = Arc::new(AtomicCell::new(0u64));
         let duration = Arc::new(AtomicCell::new(0u64));
         let resolution = Arc::new(AtomicCell::new(crate::driver::dvr::Resolution {
@@ -122,6 +134,8 @@ impl Player {
             let state = Arc::clone(&state);
             let playing = Arc::clone(&playing);
             let seeking = Arc::clone(&seeking);
+            let circled = Arc::clone(&circled);
+            let circle = Arc::clone(&circle);
             let position = Arc::clone(&position);
             let duration = Arc::clone(&duration);
             let resolution = Arc::clone(&resolution);
@@ -129,17 +143,8 @@ impl Player {
             let path = path.to_path_buf();
             move || {
                 playback_loop(
-                    path,
-                    ctx,
-                    slot,
-                    state,
-                    playing,
-                    seeking,
-                    position,
-                    duration,
-                    resolution,
-                    running,
-                    command_rx,
+                    path, ctx, slot, state, playing, seeking, circled, circle, position, duration,
+                    resolution, running, command_rx,
                 );
             }
         });
@@ -149,6 +154,8 @@ impl Player {
             state,
             playing,
             seeking,
+            circled,
+            circle,
             position,
             duration,
             resolution,
@@ -179,18 +186,53 @@ impl Player {
         self.playing.load()
     }
 
-    /// Жест hold/release, начатый из паузы: PLAY при этом не
+    /// Шаттл, начатый из паузы: PLAY при этом не
     /// подсвечен (во время play удержание FF/REW играющей кнопки
     /// не гасит).
     pub fn is_seeking(&self) -> bool {
         self.seeking.load()
     }
 
+    /// Круг включён (кнопка LOOP нажата) — для подсветки.
+    pub fn is_circled(&self) -> bool {
+        self.circled.load()
+    }
+
+    /// Параметры круга (центр/радиус в мс, во времени видео).
+    /// None — круг выключен.
+    pub fn circle(&self) -> Option<Circle> {
+        self.circle.load()
+    }
+
+    /// Зацикливание: Some(круг) включает (центр — текущая позиция),
+    /// None выключает. Работает только в чистом play: шаттл и скраб
+    /// ходят свободно, центр при этом следует за позицией.
+    pub fn set_circle(&self, circle: Option<Circle>) {
+        if self.commands.try_send(Command::SetCircle(circle)).is_err() {
+            log::warn!("player: set_circle ignored (worker gone)");
+        }
+    }
+
+    /// Радиус круга (скролл по кнопке LOOP), центр не трогаем.
+    pub fn set_circle_radius(&self, radius: u64) {
+        if self
+            .commands
+            .try_send(Command::SetCircleRadius(radius))
+            .is_err()
+        {
+            log::warn!("player: set_circle_radius ignored (worker gone)");
+        }
+    }
+
     /// Жест шаттла (удержание REW/FF): рампа к ±velocity (длительность
     /// — у головки). Если время стояло — стартует от показанного кадра,
     /// отпускание вернёт его в стоп.
     pub fn shuttle(&self, velocity: f64) {
-        if self.commands.try_send(Command::Shuttle { velocity }).is_err() {
+        if self
+            .commands
+            .try_send(Command::Shuttle { velocity })
+            .is_err()
+        {
             log::warn!("player: shuttle ignored (worker gone)");
         }
     }
@@ -282,6 +324,8 @@ fn playback_loop(
     state: Arc<Mutex<PlayerState>>,
     playing: Arc<AtomicCell<bool>>,
     seeking: Arc<AtomicCell<bool>>,
+    circled: Arc<AtomicCell<bool>>,
+    circle: Arc<AtomicCell<Option<Circle>>>,
     position: Arc<AtomicCell<u64>>,
     duration: Arc<AtomicCell<u64>>,
     resolution: Arc<AtomicCell<crate::driver::dvr::Resolution>>,
@@ -294,6 +338,8 @@ fn playback_loop(
         slot: FrameSlot,
         playing: Arc<AtomicCell<bool>>,
         seeking: Arc<AtomicCell<bool>>,
+        circled: Arc<AtomicCell<bool>>,
+        circle: Arc<AtomicCell<Option<Circle>>>,
         position: Arc<AtomicCell<u64>>,
         reader: Box<dyn VideoReader>,
         /// pts всех кадров — тайм-карта: позиция → индекс.
@@ -305,6 +351,12 @@ fn playback_loop(
         dims: crate::driver::dvr::Resolution,
         /// Сейчас на экране (индекс в pts).
         shown_idx: usize,
+        /// Позиция на прошлом тике: скачок против хода движения —
+        /// заворот круга, включает догон shown.
+        last_position: u64,
+        /// Догон после заворота: shown отстаёт от позиции (прыгнула
+        /// назад/вперёд), показываем каждый кадр до встречи с ней.
+        catching: bool,
         /// Захват шкалы мышью/скроллом: время заморожено, само по
         /// себе не играет (playing сохраняется).
         held: bool,
@@ -436,6 +488,16 @@ fn playback_loop(
                 return Some(RAMP_POLL);
             }
             let position = self.head.position();
+            // Заворот круга: позиция скачет против хода движения —
+            // «кадр впереди есть всегда», дедлайн по pts не ждём.
+            let wrapped = (velocity > 0.0 && position < self.last_position)
+                || (velocity < 0.0 && position > self.last_position);
+            if wrapped {
+                // Заворот круга: shown догоняет позицию покадрово,
+                // монотонная логика дедлайнов до конца круга не работает.
+                self.catching = true;
+            }
+            self.last_position = position;
             let fwd = velocity > 0.0;
             let last = self.pts.len() - 1;
             // Границы: конец файла вперёд, ноль назад — стоп-кадр.
@@ -451,7 +513,9 @@ fn playback_loop(
             // Клапан: показ due-не чаще MIN_PRESENT_SPAN — иначе индекс
             // едет дальше без декода, декодируем «устоявшийся» кадр.
             if self.last_present.elapsed() < MIN_PRESENT_SPAN {
-                let due = if fwd {
+                let due = if self.catching {
+                    target != self.shown_idx
+                } else if fwd {
                     target > self.shown_idx
                 } else {
                     target < self.shown_idx
@@ -468,7 +532,7 @@ fn playback_loop(
                 if ramping { d.min(RAMP_POLL) } else { d }
             };
             let show = if fwd {
-                if target <= self.shown_idx {
+                if target <= self.shown_idx && !self.catching {
                     // Дальше shown ничего не due: ждём дедлайн кадра.
                     return Some(wait_ms(
                         self.pts[self.shown_idx + 1].saturating_sub(position),
@@ -476,7 +540,7 @@ fn playback_loop(
                 }
                 target
             } else {
-                if target >= self.shown_idx {
+                if target >= self.shown_idx && !self.catching {
                     // position ещё не ушёл ниже shown: ждём пересечения.
                     return Some(wait_ms(position.saturating_sub(self.pts[self.shown_idx])));
                 }
@@ -495,8 +559,17 @@ fn playback_loop(
                 self.stop();
                 return None;
             }
-            self.skips += self.shown_idx.abs_diff(show) as u64 - 1;
+            // Скачок при догоне заворота — переход кольца, не пропуск:
+            // каждый кадр кольца всё равно показываем.
+            if !self.catching {
+                self.skips += self.shown_idx.abs_diff(show) as u64 - 1;
+            }
             self.shown_idx = show;
+            // Догон завершён: shown встретил позицию — до следующего
+            // заворота работает монотонная логика дедлайнов.
+            if self.catching && self.shown_idx == target {
+                self.catching = false;
+            }
             self.position.store(self.pts[show]);
             if show == last && fwd {
                 self.stop(); // конец файла — стоп-кадр
@@ -560,6 +633,17 @@ fn playback_loop(
                 // Шаттл — единственный источник рамп скорости.
                 Command::Shuttle { velocity } => self.head.shuttle(velocity),
                 Command::ShuttleRelease { dur } => self.head.shuttle_release(dur),
+                Command::SetCircle(zone) => {
+                    self.circled.store(zone.is_some());
+                    self.head.set_circle(zone);
+                    // Головка ставит центр текущей позицией: забираем
+                    // фактические параметры для индикатора.
+                    self.circle.store(self.head.circle());
+                }
+                Command::SetCircleRadius(radius) => {
+                    self.head.set_circle_radius(radius);
+                    self.circle.store(self.head.circle());
+                }
             }
         }
 
@@ -570,6 +654,9 @@ fn playback_loop(
                     break;
                 }
                 let wait = self.tick().unwrap_or(IDLE_WAIT);
+                // Индикатор круга: центр живёт в головке (seek'и и
+                // шаттл его смещают) — публикуем актуальное каждый тик.
+                self.circle.store(self.head.circle());
                 match commands.recv_timeout(wait) {
                     Ok(cmd) => self.command(cmd),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -605,6 +692,8 @@ fn playback_loop(
         slot,
         playing,
         seeking,
+        circled,
+        circle,
         position,
         reader,
         pts,
@@ -612,6 +701,8 @@ fn playback_loop(
         image,
         dims,
         shown_idx: 0,
+        last_position: 0,
+        catching: false,
         held: false,
         head: Playhead::new(Instant::now(), 0),
         last_present: Instant::now(),

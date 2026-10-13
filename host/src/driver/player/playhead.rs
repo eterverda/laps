@@ -1,7 +1,7 @@
 //! Головка воспроизведения: модель путешествия по времени записи.
 //! Чистая логика — ни потоков, ни декодера, ни UI: позиция = base +
-//! ∫скорость (скорость кусочная: дискретные команды мгновенны, жест
-//! hold/release на перемотке — с рампой ease-out). Единственный
+//! ∫скорость (скорость кусочная: дискретные команды мгновенны,
+//! шаттл — с рампой ease-out). Единственный
 //! источник времени для всех: плееру головка говорит, какую позицию
 //! показывать, трекерам (таймер, шкала) — сколько сейчас времени.
 //!
@@ -28,12 +28,25 @@ struct Ramp {
     dur: Duration,
 }
 
-/// Активный жест hold/release на перемотке: resume — скорость, к
+/// Активный жест шаттла: resume — скорость, к
 /// которой возвращаемся на отпускании (0 — шаттл из паузы, возврат
 /// — мгновенный стоп). releasing — идёт возврат после отпускания.
 struct Gesture {
     resume: f64,
     releasing: bool,
+}
+
+/// Круг зацикливания: центр и радиус (мс) — в ВРЕМЕНИ ВИДЕО, не
+/// в реальном: круг ±1.5 с покрывает 3 с записи при любой скорости
+/// плеера, реальная длительность кольца масштабируется часами
+/// (на 200% круг 3 с проигрывается за 1.5 с, на 25% — за 12 с).
+/// Центр запоминается при включении и следует за позицией при любой
+/// перемотке (seek, шаттл). Границы кольца прижимаются к границам
+/// записи (у края файла «отскакивает чуть раньше»).
+#[derive(Clone, Copy)]
+pub struct Circle {
+    pub center: u64,
+    pub radius: u64,
 }
 
 /// Головка воспроизведения. Все моменты времени — мс от начала записи.
@@ -55,6 +68,10 @@ pub struct Playhead {
     /// Захват таймлайна мышью/скроллом: время заморожено, позицию
     /// двигают дискретными seek'ами; это не пауза — running сохраняется.
     drag_held: bool,
+    /// Круг зацикливания: заворот позиции по кольцу. Работает только
+    /// в чистом play (без шаттла, драга и рампы) — в остальных
+    /// режимах позиция свободна, круг не отменяется.
+    circle: Option<Circle>,
     duration: u64,
 }
 
@@ -69,6 +86,7 @@ impl Playhead {
             resume_speed: 1.0,
             gesture: None,
             drag_held: false,
+            circle: None,
             duration,
         }
     }
@@ -118,6 +136,21 @@ impl Playhead {
         self.set_drag_held_at(Instant::now(), held);
     }
 
+    /// Зацикливание: Some(круг) включает, None выключает.
+    pub fn set_circle(&mut self, circle: Option<Circle>) {
+        self.set_circle_at(Instant::now(), circle);
+    }
+
+    /// Радиус круга (скролл по кнопке LOOP): центр не трогаем.
+    pub fn set_circle_radius(&mut self, radius: u64) {
+        self.set_circle_radius_at(Instant::now(), radius);
+    }
+
+    /// Параметры круга (для индикатора на таймлайне).
+    pub fn circle(&self) -> Option<Circle> {
+        self.circle
+    }
+
     /// Позиция на момент now (трекеры читают это каждый кадр).
     fn position_at(&self, now: Instant) -> u64 {
         self.eval_at(now).1
@@ -134,7 +167,7 @@ impl Playhead {
         self.running
     }
 
-    /// Жест hold/release, начатый из паузы: PLAY при нём тёмный.
+    /// Шаттл, начатый из паузы: PLAY при нём тёмный.
     pub fn is_seeking(&self) -> bool {
         self.gesture.as_ref().is_some_and(|g| g.resume == 0.0)
     }
@@ -153,14 +186,28 @@ impl Playhead {
         if !self.running {
             return;
         }
+        // Круг таскается целиком за перемоткой: пока идёт шаттл или
+        // рампа, центр следует за позицией (чистый play держит центр).
+        if (self.gesture.is_some() || self.ramp.is_some()) && !self.drag_held {
+            let position = self.position_at(now);
+            if let Some(circle) = &mut self.circle {
+                circle.center = position;
+            }
+        }
+        // Заворот: интеграл перепривязываем к завёрнутой позиции —
+        // при выключении круга время продолжается с позиции курсора,
+        // а не с накопленного «сырого» интеграла за кольца.
+        if self.circle.is_some() && self.ramp.is_none() && self.gesture.is_none() && !self.drag_held
+        {
+            self.base_position = self.position_at(now);
+            self.base_at = now;
+        }
         // Границы файла: вперёд — конец, назад — ноль, стоп-кадр.
         // Среди активной рампы не стопаемся: скорость ещё меняется,
         // пусть прижимается к границе (см. eval: clamp).
         if self.ramp.is_none() {
             let (velocity, position) = self.eval_at(now);
-            if (velocity > 0.0 && position >= self.duration)
-                || (velocity < 0.0 && position == 0)
-            {
+            if (velocity > 0.0 && position >= self.duration) || (velocity < 0.0 && position == 0) {
                 self.pause_at(now);
             }
         }
@@ -214,6 +261,11 @@ impl Playhead {
     /// в стоп.
     fn shuttle_at(&mut self, now: Instant, velocity: f64) {
         let from = self.eval_at(now).0;
+        // Перемотка смещает центр круга.
+        let position = self.position_at(now);
+        if let Some(circle) = &mut self.circle {
+            circle.center = position;
+        }
         if self.gesture.is_none() {
             self.gesture = Some(Gesture {
                 resume: if self.running { self.resume_speed } else { 0.0 },
@@ -254,6 +306,10 @@ impl Playhead {
     fn seek_at(&mut self, now: Instant, position: u64) {
         self.gesture = None;
         let position = position.min(self.duration);
+        if let Some(circle) = &mut self.circle {
+            // Перемотка смещает центр круга.
+            circle.center = position;
+        }
         if self.running && !self.drag_held {
             self.start_at(now, position, self.resume_speed);
         } else {
@@ -261,6 +317,23 @@ impl Playhead {
             self.base_at = now;
             self.base_speed = 0.0;
             self.ramp = None;
+        }
+    }
+
+    /// Зацикливание: Some(круг) включает (центр — позиция now),
+    /// None выключает.
+    fn set_circle_at(&mut self, now: Instant, circle: Option<Circle>) {
+        self.circle = circle.map(|c| Circle {
+            center: self.position_at(now),
+            radius: c.radius,
+        });
+    }
+
+    /// Радиус круга: центр не трогаем.
+    fn set_circle_radius_at(&mut self, now: Instant, radius: u64) {
+        let _ = now;
+        if let Some(circle) = &mut self.circle {
+            circle.radius = radius;
         }
     }
 
@@ -330,7 +403,29 @@ impl Playhead {
                 )
             }
         };
-        (sample.0, sample.1.min(self.duration))
+        let position = sample.1.min(self.duration);
+        (sample.0, self.circle_wrap(position))
+    }
+
+    /// Заворот позиции по кольцу круга. Работает только в чистом play:
+    /// без рампы, жеста и драга — шаттл и скраб ходят свободно, круг
+    /// ждёт их завершения. Границы кольца — center ± radius (времени
+    /// видео), прижатые к записи (у края файла круг «отскакивает
+    /// раньше»).
+    fn circle_wrap(&self, position: u64) -> u64 {
+        let Some(circle) = &self.circle else {
+            return position;
+        };
+        if !self.running || self.ramp.is_some() || self.gesture.is_some() || self.drag_held {
+            return position;
+        }
+        let lo = circle.center.saturating_sub(circle.radius);
+        let hi = (circle.center + circle.radius).min(self.duration);
+        if hi <= lo {
+            return position;
+        }
+        let span = (hi - lo) as i64;
+        lo + (position as i64 - lo as i64).rem_euclid(span) as u64
     }
 
     /// Завершившуюся рампу зафиксировать: скорость = to, головка
@@ -353,6 +448,10 @@ impl Playhead {
         self.running = to != 0.0;
         if !self.running || releasing {
             self.gesture = None;
+            if let Some(circle) = &mut self.circle {
+                // Шаттл кончился: центр — там, где остановились.
+                circle.center = self.base_position;
+            }
         }
     }
 
@@ -559,6 +658,139 @@ mod tests {
         p.sync_at(clock.now);
         assert!(!p.is_running());
         assert_eq!(p.position_at(clock.now), 0);
+    }
+
+    #[test]
+    fn circle_wraps_forward_between_edges() {
+        let mut clock = FakeClock::new();
+        let t0 = clock.now;
+        let mut p = Playhead::new(t0, DUR);
+        p.seek_at(t0, 10_000);
+        // Зона ±1 с на 1x: [9000, 11000). Центр — позиция включения.
+        p.set_circle_at(
+            t0,
+            Some(Circle {
+                center: 0,
+                radius: 1000,
+            }),
+        );
+        p.play_at(t0);
+        assert_eq!(p.position_at(clock.advance(500)), 10_500);
+        // +1500: сыграли за + край [9000, 11000) → заворот на − край.
+        assert_eq!(p.position_at(clock.advance(1000)), 9_500);
+        assert_eq!(p.position_at(clock.advance(500)), 10_000);
+    }
+
+    #[test]
+    fn circle_center_follows_seek_and_shuttle() {
+        let mut clock = FakeClock::new();
+        let t0 = clock.now;
+        let mut p = Playhead::new(t0, DUR);
+        p.set_circle_at(
+            t0,
+            Some(Circle {
+                center: 0,
+                radius: 1000,
+            }),
+        );
+        p.play_at(t0);
+        clock.advance(300);
+        p.seek_at(clock.now, 20_000);
+        // Центр сместился: новое кольцо [19000, 21000).
+        assert_eq!(p.position_at(clock.advance(500)), 20_500);
+        // +500: ровно + край — заворот на − край.
+        assert_eq!(p.position_at(clock.advance(500)), 19_000);
+        // Шаттл: позиция свободна (без заворота)…
+        p.shuttle_at(clock.now, 5.0);
+        clock.advance(2000);
+        assert!(p.position_at(clock.now) > 25_000, "шаттл зажат кругом");
+        // …и по завершении центр — там, где остановились.
+        p.shuttle_release_at(clock.now, Duration::from_millis(500));
+        clock.advance(700);
+        p.sync_at(clock.now);
+        let center = p.position_at(clock.now);
+        // Часовой ход ровно в 30 колец: позиция на центре.
+        assert_eq!(p.position_at(clock.advance(60_000)), center);
+    }
+
+    #[test]
+    fn circle_clamps_to_file_edges() {
+        let mut clock = FakeClock::new();
+        let t0 = clock.now;
+        // Файл 20 с, круг у самого края: «отскакивает чуть раньше».
+        let mut p = Playhead::new(t0, 20_000);
+        p.seek_at(t0, 19_000);
+        p.set_circle_at(
+            t0,
+            Some(Circle {
+                center: 0,
+                radius: 2000,
+            }),
+        );
+        p.play_at(t0);
+        // Кольцо [17000, 20000]: 2 с игры пересекает и его край, и
+        // конец файла (сыграли бы до 21000) — завернулось на − край.
+        assert_eq!(p.position_at(clock.advance(2000)), 17_000);
+    }
+
+    #[test]
+    fn circle_covers_video_time_regardless_of_play_speed() {
+        let mut clock = FakeClock::new();
+        let t0 = clock.now;
+        let mut p = Playhead::new(t0, DUR);
+        p.seek_at(t0, 10_000);
+        // Круг — во времени видео: на 2x круг 3 с контента проигрывается
+        // за 1.5 с реального времени.
+        p.set_speed_at(t0, 2.0);
+        p.set_circle_at(
+            t0,
+            Some(Circle {
+                center: 0,
+                radius: 1500,
+            }),
+        );
+        p.play_at(t0);
+        // Кольцо [8500, 11500): 1.5 с игры на 2x = 3 с контента = круг.
+        assert_eq!(p.position_at(clock.advance(1500)), 10_000);
+        // На 25% круг проигрывается за 12 с реального времени.
+        // Свои часы: сценарий независим.
+        let mut clock2 = FakeClock::new();
+        let t1 = clock2.now;
+        let mut q = Playhead::new(t1, DUR);
+        q.seek_at(t1, 10_000);
+        q.set_speed_at(t1, 0.25);
+        q.set_circle_at(
+            t1,
+            Some(Circle {
+                center: 0,
+                radius: 1500,
+            }),
+        );
+        q.play_at(t1);
+        assert_eq!(q.position_at(clock2.advance(12_000)), 10_000);
+    }
+
+    #[test]
+    fn disabling_circle_continues_from_cursor_position() {
+        let mut clock = FakeClock::new();
+        let t0 = clock.now;
+        let mut p = Playhead::new(t0, DUR);
+        p.seek_at(t0, 10_000);
+        p.set_circle_at(
+            t0,
+            Some(Circle {
+                center: 0,
+                radius: 1000,
+            }),
+        );
+        p.play_at(t0);
+        // Три кольца: «сырой» интеграл уехал бы на +9 с за пределы.
+        let t = clock.advance(9000);
+        p.sync_at(t);
+        let at_cursor = p.position_at(t);
+        p.set_circle_at(t, None);
+        // Продолжаем с позиции курсора: +300 мс = +300 мс, без скачка.
+        assert_eq!(p.position_at(clock.advance(300)), at_cursor + 300);
     }
 
     #[test]

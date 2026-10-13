@@ -19,7 +19,7 @@ use super::style;
 use super::view;
 use super::viewfinder;
 use crate::config::setup::Setup;
-use crate::driver::player::{Player, PlayerState};
+use crate::driver::player::{Circle, Player, PlayerState};
 use crate::model::pilot::Pilot;
 
 const GRID_WIDTH: isize = 160;
@@ -157,7 +157,10 @@ impl Timeline {
     /// и response шкалы (hover — хозяину, для горизонтального скролла).
     /// frac — доля позиции (0..1), dur_ms — для перевода доли в мс.
     /// window — доли (начало, конец) фрагмента активного вылета: рисуем
-    /// белым, края полоски — серым; None — вся линия серая.
+    /// белым, края полоски — серым; None — вся линия серая. circle —
+    /// доли (начало, конец) круга зацикливания: вместо кружка головки
+    /// — белая капсула (сосиска) на весь круг, точная позиция —
+    /// чёрный кружок меньшего диаметра поверх.
     fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -165,6 +168,7 @@ impl Timeline {
         frac: f32,
         dur_ms: u64,
         window: Option<(f32, f32)>,
+        circle: Option<(f32, f32)>,
     ) -> (egui::Response, Vec<TimelineEvent>) {
         let mut events = Vec::new();
         let y = rect.center().y;
@@ -188,12 +192,82 @@ impl Timeline {
                 );
             }
         }
-        ui.painter().circle(
-            egui::pos2(x(frac), y),
-            grid::CELL_SIZE.y * 0.24,
-            egui::Color32::WHITE,
-            egui::Stroke::NONE,
-        );
+        let knob_r = grid::CELL_SIZE.y * 0.24;
+        match circle {
+            Some((lo, hi)) => {
+                // Круг: белая капсула между его границами (крупнее
+                // одиночного кружка), головка — чёрный кружок поверх:
+                // больше точки-«пипки», меньше высоты капсулы. Драг
+                // таскает всю конструкцию: seek ставит позицию под
+                // курсор, центр круга встаёт на позицию.
+                let cap_r = knob_r * 1.4;
+                // Стадион: центры полуовалов — в точках круга lo/hi
+                // (расстояние центров = диаметр круга), овалы выпирают
+                // за них на радиус. Вырождение lo==hi — ровно кружок,
+                // отдельный минимум не нужен. Сначала — чёрное «эхо»
+                // чуть большего диаметра: выделяет каретку на треке.
+                let echo = knob_r * 0.4;
+                let x0 = x(lo);
+                let x1 = x(hi);
+                ui.painter().rect(
+                    egui::Rect::from_center_size(
+                        egui::pos2((x0 + x1) / 2.0, y),
+                        egui::vec2((x1 - x0).max(0.0) + echo * 2.0, (cap_r + echo) * 2.0),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    egui::Color32::BLACK,
+                    egui::Stroke::NONE,
+                    egui::StrokeKind::Inside,
+                );
+                for cx in [x0, x1] {
+                    ui.painter().circle(
+                        egui::pos2(cx, y),
+                        cap_r + echo,
+                        egui::Color32::BLACK,
+                        egui::Stroke::NONE,
+                    );
+                }
+                ui.painter().rect(
+                    egui::Rect::from_center_size(
+                        egui::pos2((x0 + x1) / 2.0, y),
+                        egui::vec2((x1 - x0).max(0.0), cap_r * 2.0),
+                    ),
+                    egui::CornerRadius::ZERO,
+                    egui::Color32::WHITE,
+                    egui::Stroke::NONE,
+                    egui::StrokeKind::Inside,
+                );
+                for cx in [x0, x1] {
+                    ui.painter().circle(
+                        egui::pos2(cx, y),
+                        cap_r,
+                        egui::Color32::WHITE,
+                        egui::Stroke::NONE,
+                    );
+                }
+                ui.painter().circle(
+                    egui::pos2(x(frac), y),
+                    knob_r * 0.95,
+                    egui::Color32::BLACK,
+                    egui::Stroke::NONE,
+                );
+            }
+            None => {
+                // Круглая каретка с чёрным «эхом» чуть большего диаметра.
+                ui.painter().circle(
+                    egui::pos2(x(frac), y),
+                    knob_r * 1.4,
+                    egui::Color32::BLACK,
+                    egui::Stroke::NONE,
+                );
+                ui.painter().circle(
+                    egui::pos2(x(frac), y),
+                    knob_r,
+                    egui::Color32::WHITE,
+                    egui::Stroke::NONE,
+                );
+            }
+        }
         let response = ui.interact(
             rect,
             ui.make_persistent_id("scrub_timeline"),
@@ -355,6 +429,12 @@ impl HScroll {
         self.acc = 0.0;
         Some(ms)
     }
+}
+
+/// Событие транспортного ряда.
+enum TransportEvent {
+    TogglePlay,
+    ToggleLoop,
 }
 
 /// Кнопка перемотки: клик — позиционный шаг, удержание — разгон плеера
@@ -543,11 +623,15 @@ impl Scrub {
     }
 
     /// Транспорт: кнопки REW/PLAY/FF/RPT (TransportButton) 3 клетки
-    /// высотой, клик — вся плашка. Возвращает true, если PLAY тоглят.
+    /// высотой, клик — вся плашка. Возвращает событие кнопки.
     /// Раскладка — таблица (ширина, зазор после), ряд начинается справа
     /// от таймера.
-    fn draw_transport(&mut self, ui: &mut egui::Ui, bottom_right: grid::Cell) -> bool {
-        let mut toggle_play = false;
+    fn draw_transport(
+        &mut self,
+        ui: &mut egui::Ui,
+        bottom_right: grid::Cell,
+    ) -> Option<TransportEvent> {
+        let mut event = None;
         let btn_rect = |col: isize, cols: isize| {
             let x = grid::cell_x(col);
             let y = grid::cell_y(bottom_right.row - 1);
@@ -614,7 +698,7 @@ impl Scrub {
         let play_id = ui.make_persistent_id("status_play");
         let play_response = play.interact(ui, play_rect, play_id);
         if play_response.clicked() {
-            toggle_play = true;
+            event = Some(TransportEvent::TogglePlay);
         }
         play.paint(ui, play_rect);
 
@@ -630,16 +714,22 @@ impl Scrub {
         self.seek_tick(ui, &ff_response, false);
         ff.paint(ui, ff_rect);
 
-        // RPT: пока некликабельна (повтор фрагмента — потом).
+        // RPT (LOOP): круг зацикливания вокруг центра — позиции
+        // нажатия; радиус — шкала кнопки, во времени видео (круг
+        // ±1.5 с покрывает 3 с записи при любой скорости плеера).
+        let circled = self.primary().is_some_and(|p| p.is_circled());
         let rpt = view::TransportButton::new(
             "\u{F0456}",
             format!("±{:.1}s", RPT_SIZES[self.rpt_size]),
-            state(false),
+            state(circled),
             TRANSPORT_IDLE,
             TRANSPORT_ACTIVE,
         );
         let loop_id = ui.make_persistent_id("status_loop");
         let loop_response = rpt.interact(ui, loop_rect, loop_id);
+        if loop_response.clicked() {
+            event = Some(TransportEvent::ToggleLoop);
+        }
         rpt.paint(ui, loop_rect);
 
         // Скролл над контролом — шаг по его шкале. Вверх всегда
@@ -671,15 +761,25 @@ impl Scrub {
                     }
                 }
             } else if loop_response.hovered() {
+                let before = self.rpt_size;
                 shift(&mut self.rpt_size, RPT_SIZES.len(), if up { -1 } else { 1 });
+                // Радиус круга живёт на кнопке: при включённом
+                // зацикливании скролл его переставляет (центр не трогаем).
+                if self.rpt_size != before && self.primary().is_some_and(|p| p.is_circled()) {
+                    let radius = (RPT_SIZES[self.rpt_size] * 1000.0) as u64;
+                    for player in self.players.values() {
+                        player.set_circle_radius(radius);
+                    }
+                }
             }
         }
-        toggle_play
+        event
     }
 
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
         enum Action {
             TogglePlay,
+            ToggleLoop,
             GotoMenu,
             None,
         }
@@ -738,8 +838,10 @@ impl Scrub {
                     action = Action::GotoMenu;
                 }
 
-                if self.draw_transport(ui, bottom_right) {
-                    action = Action::TogglePlay;
+                match self.draw_transport(ui, bottom_right) {
+                    Some(TransportEvent::TogglePlay) => action = Action::TogglePlay,
+                    Some(TransportEvent::ToggleLoop) => action = Action::ToggleLoop,
+                    None => {}
                 }
 
                 let pads: Vec<_> = self.setup.pads.iter().take(MAX_PADS).collect();
@@ -824,11 +926,8 @@ impl Scrub {
                 // X (status_timer_x пересчитывает ту же цепочку кнопок), Y —
                 // базлайн на строку выше низа экрана.
                 if let Some(primary) = self.primary() {
-                    let (pos, dur, state) = (
-                        primary.position(),
-                        primary.duration(),
-                        primary.open_state(),
-                    );
+                    let (pos, dur, state) =
+                        (primary.position(), primary.duration(), primary.open_state());
                     let text_pos = egui::pos2(
                         status_timer_x(ui.ctx(), bottom_right.row),
                         grid::cell_y(bottom_right.row - 1),
@@ -935,8 +1034,17 @@ impl Scrub {
                                 });
                                 // Команды ждут готовности в очереди
                                 // worker'а — прозрачно.
+                                // Круг зацикливания: доли (начало,
+                                // конец) для стрелки-индикатора.
+                                let circle = self.primary().and_then(|p| p.circle()).map(|c| {
+                                    let lo = c.center.saturating_sub(c.radius) as f32
+                                        / dur.max(1) as f32;
+                                    let hi =
+                                        (c.center + c.radius).min(dur) as f32 / dur.max(1) as f32;
+                                    (lo, hi)
+                                });
                                 let (response, events) =
-                                    self.timeline.show(ui, rect, frac, dur, window);
+                                    self.timeline.show(ui, rect, frac, dur, window, circle);
                                 for event in events {
                                     match event {
                                         TimelineEvent::SetDragHeld(held) => {
@@ -1005,6 +1113,18 @@ impl Scrub {
                     }
                 }
             }
+            Action::ToggleLoop => {
+                let circled = self.primary().is_some_and(|p| p.is_circled());
+                let radius = (RPT_SIZES[self.rpt_size] * 1000.0) as u64;
+                for player in self.players.values() {
+                    player.set_circle(if circled {
+                        None
+                    } else {
+                        // Центр ставит головка — текущей позицией.
+                        Some(Circle { center: 0, radius })
+                    });
+                }
+            }
             Action::None => {}
         }
     }
@@ -1065,6 +1185,22 @@ impl Scrub {
                 };
                 for player in self.players.values() {
                     player.shuttle(speed);
+                }
+                Some(crate::remote::Response {
+                    message: String::new(),
+                    code: 0,
+                })
+            }
+            // Зацикливание: circle включает/выключает (радиус — шкала RPT).
+            "circle" => {
+                let circled = self.primary().is_some_and(|p| p.is_circled());
+                let radius = (RPT_SIZES[self.rpt_size] * 1000.0) as u64;
+                for player in self.players.values() {
+                    player.set_circle(if circled {
+                        None
+                    } else {
+                        Some(Circle { center: 0, radius })
+                    });
                 }
                 Some(crate::remote::Response {
                     message: String::new(),

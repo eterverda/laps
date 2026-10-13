@@ -193,12 +193,22 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   position; shuttle is the jog/shuttle term: скоростная прокрутка с
   разгоном, не путать с дискретным seek);
   the worker maps position → frame index via its pts map, paces
-  decodes by frame deadlines (`MIN_PRESENT_SPAN` gate at high speeds),
-  and publishes the shown frame's pts to trackers (timer, timeline)
-  through an atomic. Release during play ramps back to the play speed;
-  release from pause is an instant stop on the current frame (no drift
-  — precise scrubbing). Timeline drag = discrete `Seek` per frame,
-  sticks to the cursor, no ramps
+  decodes by frame deadlines (`MIN_PRESENT_SPAN` gate at high speeds;
+  backpressure: slot unclaimed by UI — no decode at all, no wasted
+  work for occluded windows; under/over-decode counters logged per
+  session). Release during play ramps back to the play speed; release
+  from pause is an instant stop on the current frame (no drift —
+  precise scrubbing). Timeline drag = discrete `Seek` per frame,
+  sticks to the cursor, no ramps. Two API layers: real-time wrappers
+  (`play()`, `seek()`…) for the worker and an `_at(now)` core —
+  private, tests drive it with a fake clock (instant, ms-exact).
+  Circle (`Circle { center, radius }`, the LOOP/RPT button): looping
+  in VIDEO time (radius ±1.5 s covers 3 s of content at any play
+  speed); wrap is pure position arithmetic in the playhead, active
+  only in clean play (shuttle/drag run free, center follows any
+  rewind); on disable time continues from the cursor position. The
+  worker detects wraps via position jumps (sticky catch-up) and draws
+  the knob as a stadium spanning the circle
 - Remote: `toggle-play`, `set-play-speed <pct>`, `shuttle <velocity>`,
   `shuttle-release` (the latter two mirror the shuttle gesture for
   testing)

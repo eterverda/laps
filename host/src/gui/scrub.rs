@@ -127,7 +127,7 @@ fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
 /// События таймлайна: команды хозяину (scrub) на все плееры разом.
 enum TimelineEvent {
     /// Захват/отпускание шкалы — hold (не пауза).
-    SetHeld(bool),
+    SetDragHeld(bool),
     /// Перемотать на t мс от начала.
     Seek(u64),
 }
@@ -210,7 +210,7 @@ impl Timeline {
         // только clicked().
         let down = response.is_pointer_button_down_on();
         if down && !self.down {
-            events.push(TimelineEvent::SetHeld(true));
+            events.push(TimelineEvent::SetDragHeld(true));
         }
         // Позиция указателя: пока зажато — interact_pointer_pos, клик —
         // hover_pos.
@@ -238,7 +238,7 @@ impl Timeline {
             }
         }
         if !down && self.down {
-            events.push(TimelineEvent::SetHeld(false));
+            events.push(TimelineEvent::SetDragHeld(false));
         }
         if !down {
             self.last_seek = None;
@@ -487,7 +487,7 @@ impl Scrub {
                         self.ff.hold_sent
                     } {
                         for player in self.players.values() {
-                            player.seek_release(SEEK_RELEASE_RAMP);
+                            player.shuttle_release(SEEK_RELEASE_RAMP);
                         }
                     }
                     let state = if back { &mut self.rew } else { &mut self.ff };
@@ -496,7 +496,7 @@ impl Scrub {
                     self.seek_by(if back { -step } else { step });
                 } else {
                     for player in self.players.values() {
-                        player.seek_release(SEEK_RELEASE_RAMP);
+                        player.shuttle_release(SEEK_RELEASE_RAMP);
                     }
                 }
             }
@@ -528,7 +528,7 @@ impl Scrub {
         if arm {
             let speed = SEEK_SPEEDS[self.seek_speed] as f64 * if back { -1.0 } else { 1.0 };
             for player in self.players.values() {
-                player.seek_hold(speed);
+                player.shuttle(speed);
             }
         }
     }
@@ -537,7 +537,7 @@ impl Scrub {
     /// зажатием в границы файла.
     fn seek_by(&self, delta: i64) {
         for player in self.players.values() {
-            let t = (player.position_ms() as i64 + delta).clamp(0, player.duration_ms() as i64);
+            let t = (player.position() as i64 + delta).clamp(0, player.duration() as i64);
             player.seek(t as u64);
         }
     }
@@ -825,8 +825,8 @@ impl Scrub {
                 // базлайн на строку выше низа экрана.
                 if let Some(primary) = self.primary() {
                     let (pos, dur, state) = (
-                        primary.position_ms(),
-                        primary.duration_ms(),
+                        primary.position(),
+                        primary.duration(),
                         primary.open_state(),
                     );
                     let text_pos = egui::pos2(
@@ -939,9 +939,9 @@ impl Scrub {
                                     self.timeline.show(ui, rect, frac, dur, window);
                                 for event in events {
                                     match event {
-                                        TimelineEvent::SetHeld(held) => {
+                                        TimelineEvent::SetDragHeld(held) => {
                                             for player in self.players.values() {
-                                                player.set_held(held);
+                                                player.set_drag_held(held);
                                             }
                                         }
                                         TimelineEvent::Seek(t) => {
@@ -997,8 +997,12 @@ impl Scrub {
         match action {
             Action::GotoMenu => navigator.goto(menu::Menu),
             Action::TogglePlay => {
-                for player in self.players.values_mut() {
-                    player.toggle();
+                for player in self.players.values() {
+                    if player.is_playing() {
+                        player.pause();
+                    } else {
+                        player.play();
+                    }
                 }
             }
             Action::None => {}
@@ -1016,8 +1020,12 @@ impl Scrub {
                         code: 2,
                     });
                 }
-                for player in self.players.values_mut() {
-                    player.toggle();
+                for player in self.players.values() {
+                    if player.is_playing() {
+                        player.pause();
+                    } else {
+                        player.play();
+                    }
                 }
                 Some(crate::remote::Response {
                     message: String::new(),
@@ -1043,29 +1051,29 @@ impl Scrub {
                     code: 0,
                 })
             }
-            // Жест перемотки для прогона сценариев: seek-hold <x> (знак —
-            // направление), seek-release. Дублируют удержание кнопок.
-            "seek-hold" => {
+            // Шаттл для прогона сценариев: shuttle <velocity> (знак —
+            // направление), shuttle-release. Дублируют удержание кнопок.
+            "shuttle" => {
                 let speed: f64 = match command.get(1).and_then(|a| a.parse().ok()) {
                     Some(s) => s,
                     None => {
                         return Some(crate::remote::Response {
-                            message: "seek-hold takes a speed argument".to_owned(),
+                            message: "shuttle takes a velocity argument".to_owned(),
                             code: 2,
                         });
                     }
                 };
                 for player in self.players.values() {
-                    player.seek_hold(speed);
+                    player.shuttle(speed);
                 }
                 Some(crate::remote::Response {
                     message: String::new(),
                     code: 0,
                 })
             }
-            "seek-release" => {
+            "shuttle-release" => {
                 for player in self.players.values() {
-                    player.seek_release(SEEK_RELEASE_RAMP);
+                    player.shuttle_release(SEEK_RELEASE_RAMP);
                 }
                 Some(crate::remote::Response {
                     message: String::new(),

@@ -173,25 +173,35 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 - `read_frame_into` per frame (no streaming pipeline), **zune-jpeg** decode
   of a single frame; scrubbing = index lookup + one JPEG decode (~5 ms);
   every MJPEG frame is a keyframe, no GOP rewinds
-- Player (`driver/player/`): facade mirrors `Camera` — io and the playback
-  clock live in a worker thread (free function, like `capture_loop`), the
-  facade holds texture, frame slot, state atomics and a command channel.
-  Opening is async: `open()` returns immediately, index + first frame are
-  built in the thread (`PlayerState::Opening/Ready/Failed`); commands
-  sent before readiness wait in the channel queue. Container timestamps
-  are the clock, no resampling; frame-accurate `seek`; playback-tested at
-  30 fps FullHD
-- Speed model: discrete commands (`Play`/`Pause`/`Seek`/`SetSpeed`, wheel
-  x0.25–x2) take effect instantly and cancel any gesture; ramps exist
-  only in the REW/FF hold gesture (`SeekHold`/`SeekRelease`, ease-out,
-  landing commits seamlessly — the clock re-anchors at the landing
-  position). Release during play ramps back to the play speed; release
-  from pause is an instant stop on the current frame (no drift — precise
-  scrubbing). Timeline drag = discrete `Seek` per frame, sticks to the
-  cursor, no ramps. The clock itself is a pure `Clock` struct (position =
-  base + ∫speed) covered by unit tests
-- Remote: `toggle-play`, `set-play-speed <pct>`, `seek-hold <x>`,
-  `seek-release` (the latter two mirror the hold gesture for testing)
+- Player (`driver/player/`): facade mirrors `Camera` — io lives in a
+  worker thread (free function, like `capture_loop`), the facade holds
+  texture, frame slot, state atomics and a command channel. Opening is
+  async: `open()` returns immediately, index + first frame are built in
+  the thread (`PlayerState::Opening/Ready/Failed`); commands sent before
+  readiness wait in the channel queue. Container timestamps are the
+  clock, no resampling; frame-accurate `seek`; playback-tested at
+  30 fps FullHD. The player is a dumb frame supplier: which frame to
+  show and when is decided by the playhead, the time model lives
+  entirely in `driver/player/playhead.rs`
+- Playhead (`Playhead`): the single time-travel model — position =
+  base + ∫speed, a pure struct owned by the player's worker thread
+  (never the UI thread: UI frame quantization must not affect
+  playback), covered by unit tests. UI sends intents (`Play`/`Pause`/
+  `Seek`/`SetSpeed`, wheel x0.25–x2 — instant, cancel any gesture;
+  `Shuttle`/`ShuttleRelease` — the only source of speed ramps,
+  ease-out, landing commits seamlessly by re-anchoring at the landing
+  position; shuttle is the jog/shuttle term: скоростная прокрутка с
+  разгоном, не путать с дискретным seek);
+  the worker maps position → frame index via its pts map, paces
+  decodes by frame deadlines (`MIN_PRESENT_SPAN` gate at high speeds),
+  and publishes the shown frame's pts to trackers (timer, timeline)
+  through an atomic. Release during play ramps back to the play speed;
+  release from pause is an instant stop on the current frame (no drift
+  — precise scrubbing). Timeline drag = discrete `Seek` per frame,
+  sticks to the cursor, no ramps
+- Remote: `toggle-play`, `set-play-speed <pct>`, `shuttle <velocity>`,
+  `shuttle-release` (the latter two mirror the shuttle gesture for
+  testing)
 
 ## Configuration
 

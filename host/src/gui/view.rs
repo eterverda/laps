@@ -380,7 +380,7 @@ fn stripe(
 
 /// Отступ контура плашки-стрелки (arrow_plate) от краёв её rect:
 /// вершина носа — в inset от края, тело впадины — в inset.
-const ARROW_PLATE_INSET: f32 = super::grid::CELL_SIZE.x / 4.0;
+const PLATE_INSET: f32 = super::grid::CELL_SIZE.x / 8.0;
 
 /// Толщина обводки PlatePaint::Outlined.
 const PLATE_OUTLINE_WIDTH: f32 = super::grid::CELL_SIZE.x / 8.0;
@@ -392,6 +392,7 @@ const PLATE_OUTLINE_WIDTH: f32 = super::grid::CELL_SIZE.x / 8.0;
 pub enum PlateEdge {
     ChevronConvex,
     ChevronConcave,
+    Flat,
 }
 
 /// Как рисовать плашку-стрелку: заливка или только обводка.
@@ -414,18 +415,23 @@ pub fn arrow_plate(
     right: PlateEdge,
     paint: PlatePaint,
 ) {
-    let tip = super::grid::cell_x(2);
-    let inset = ARROW_PLATE_INSET;
+    const BUTT: f32 = super::grid::cell_x(1);
+    const TIP: f32 = super::grid::cell_x(2);
+    const INS: f32 = PLATE_INSET;
+    const A_INS: f32 = PLATE_INSET * std::f32::consts::SQRT_2;
+
     let mid = rect.center().y;
     // (тело, вершина) края: нос — вершина близко к rect (inset), тело
     // глубоко (tip); впадина — наоборот.
     let (left_body, left_apex) = match left {
-        PlateEdge::ChevronConvex => (rect.left() + tip, rect.left() + inset),
-        PlateEdge::ChevronConcave => (rect.left() + inset, rect.left() + tip),
+        PlateEdge::ChevronConvex => (rect.left() + A_INS + TIP, rect.left() + A_INS),
+        PlateEdge::ChevronConcave => (rect.left() + A_INS, rect.left() + A_INS + TIP),
+        PlateEdge::Flat => (rect.left() + INS + BUTT, rect.left() + INS + BUTT),
     };
     let (right_body, right_apex) = match right {
-        PlateEdge::ChevronConvex => (rect.right() - tip, rect.right() - inset),
-        PlateEdge::ChevronConcave => (rect.right() - inset, rect.right() - tip),
+        PlateEdge::ChevronConvex => (rect.right() - A_INS - TIP, rect.right() - A_INS),
+        PlateEdge::ChevronConcave => (rect.right() - A_INS, rect.right() - A_INS - TIP),
+        PlateEdge::Flat => (rect.right() - INS - BUTT, rect.right() - INS - BUTT),
     };
     let outline = vec![
         egui::pos2(left_apex, mid),

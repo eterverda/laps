@@ -410,8 +410,8 @@ impl Live {
                     view::NavState::Idle,
                     PLATE_EXIT,
                     PLATE_EXIT,
-                    leftward.0,
-                    leftward.1,
+                    view::PlateEdge::Flat,
+                    view::PlateEdge::Flat,
                 )
                 .show(ui, exit_rect, ui.make_persistent_id("status_exit"))
                 .is_some_and(|r| r.clicked())
@@ -433,8 +433,8 @@ impl Live {
                     },
                     PLATE_REC_IDLE,
                     PLATE_REC_IDLE,
-                    leftward.0,
-                    leftward.1,
+                    view::PlateEdge::Flat,
+                    view::PlateEdge::Flat,
                 )
                 .show(ui, dvr_rect, ui.make_persistent_id("status_dvr"))
                 .is_some_and(|r| r.clicked())
@@ -449,7 +449,7 @@ impl Live {
                     nav_state(self.session.live_available(), live_status),
                     PLATE_LIVE_IDLE,
                     PLATE_LIVE,
-                    live_edges.0,
+                    view::PlateEdge::Flat,
                     live_edges.1,
                 )
                 .show(ui, live_rect, ui.make_persistent_id("status_live"))

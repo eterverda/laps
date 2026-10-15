@@ -1,4 +1,18 @@
-use super::grid::CELL_SIZE;
+/// Размер клетки сетки (16×32 пт): все виджеты верстаются по ней, шрифт
+/// X2 — ровно две клетки высотой.
+pub const CELL_SIZE: egui::Vec2 = egui::vec2(16.0, 32.0);
+
+/// Ширина n клеток в пикселях.
+#[inline]
+pub const fn cell_x(col: isize) -> f32 {
+    col as f32 * CELL_SIZE.x
+}
+
+/// Высота n клеток в пикселях.
+#[inline]
+pub const fn cell_y(row: isize) -> f32 {
+    row as f32 * CELL_SIZE.y
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Ruler {
@@ -110,6 +124,31 @@ impl Ruler {
             bottom: self.bottom,
         }
     }
+
+    /// Углы как точки — для обмера линеек и отдачи концов линий.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn top_left(self) -> egui::Pos2 {
+        egui::pos2(self.left, self.top)
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn top_right(self) -> egui::Pos2 {
+        egui::pos2(self.right, self.top)
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn bottom_left(self) -> egui::Pos2 {
+        egui::pos2(self.left, self.bottom)
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn bottom_right(self) -> egui::Pos2 {
+        egui::pos2(self.right, self.bottom)
+    }
 }
 
 impl From<egui::Pos2> for Ruler {
@@ -196,39 +235,5 @@ impl IntoRuler for &egui::Rect {
             right: self.max.x,
             bottom: self.max.y,
         }
-    }
-}
-
-#[allow(dead_code)]
-pub trait CellsTall {
-    fn cells_tall(self) -> f32;
-}
-
-impl CellsTall for i32 {
-    fn cells_tall(self) -> f32 {
-        self as f32 * CELL_SIZE.y
-    }
-}
-
-impl CellsTall for f64 {
-    fn cells_tall(self) -> f32 {
-        self as f32 * CELL_SIZE.y
-    }
-}
-
-#[allow(dead_code)]
-pub trait CellsWide {
-    fn cells_wide(self) -> f32;
-}
-
-impl CellsWide for i32 {
-    fn cells_wide(self) -> f32 {
-        self as f32 * CELL_SIZE.x
-    }
-}
-
-impl CellsWide for f64 {
-    fn cells_wide(self) -> f32 {
-        self as f32 * CELL_SIZE.x
     }
 }

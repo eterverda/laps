@@ -1,4 +1,4 @@
-use super::grid::{self, IntoCell};
+use super::ruler::{IntoRuler, cell_x, cell_y};
 use super::style;
 use super::view::{self, Corner};
 use time::format_description::{Component, FormatItem};
@@ -37,7 +37,11 @@ impl Header {
     pub fn show(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         // Левый край: LAPS — полоса 12 клеток (2 обрезочка + 1 поле +
         // 8 текст + 1 поле), две клетки высотой, от левого края rect'а.
-        let title_rect = rect.left_top().into_cell().extrude(12, 2);
+        let title_rect: egui::Rect = rect
+            .left_top()
+            .into_ruler()
+            .extrude(cell_x(12), cell_y(2))
+            .into();
         view::StripeX2::new(TITLE_BG_LIGHT, Corner::TopLeft).show(ui, title_rect, |ui, rect| {
             ui.painter().text(
                 rect.left_top(),
@@ -51,10 +55,17 @@ impl Header {
         // Правый край: дата (ряд 0) и время с ms (ряд 1) у правого края
         // rect'а. Полные rect'ы полос: 1 обрезочка + 1 поле + текст +
         // 1 поле; текст рисуют часы в замыкании.
-        let right = rect.right_top().into_cell().col;
-        let row = rect.left_top().into_cell().row;
-        let date_rect = grid::cell(right - 16, row).extrude(16, 1);
-        let time_rect = grid::cell(right - 15, row + 1).extrude(15, 1);
+        let date_rect: egui::Rect = rect
+            .right_top()
+            .into_ruler()
+            .extrude(-cell_x(16), cell_y(1))
+            .into();
+        let time_rect: egui::Rect = rect
+            .right_top()
+            .into_ruler()
+            .translate(0.0, cell_y(1))
+            .extrude(-cell_x(15), cell_y(1))
+            .into();
         view::Stripe::new(TITLE_BG_LIGHT, Corner::TopRight).show(ui, date_rect, |ui, rect| {
             self.date_clock.show(ui, rect, egui::Color32::BLACK);
         });

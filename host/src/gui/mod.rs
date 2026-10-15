@@ -2,7 +2,6 @@ use crate::config::setup::Setup;
 use crate::model::pilot::Pilot;
 
 mod flight;
-mod grid;
 mod guidelines;
 mod header;
 mod menu;

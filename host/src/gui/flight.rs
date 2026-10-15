@@ -4,7 +4,7 @@
 //! транспорт и таймлайн. Вход — сразу в эфире (Idle нет), выход —
 //! только EXIT (в меню).
 
-use super::ruler::{CellsTall, IntoRuler};
+use super::ruler::{self, IntoRuler};
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
@@ -302,28 +302,31 @@ impl Flight {
                 (p.position(), p.duration(), p.open_state())
             });
 
-        view::Letterbox::new(grid::cell(GRID_WIDTH, 45))
-            .max_virtual_height(grid::cell_y(50))
+        view::Letterbox::new(egui::vec2(ruler::cell_x(GRID_WIDTH), ruler::cell_y(45)))
+            .max_virtual_height(ruler::cell_y(50))
             .outline(true)
             .show(ui, |ui| {
-                let bottom_right = grid::cell_at(ui.max_rect().max);
-                let header_rect = grid::cell(0, 0).extrude(bottom_right.col, TOP_BAR_ROWS);
+                let header_rect: egui::Rect = ui
+                    .max_rect()
+                    .into_ruler()
+                    .collapse_top()
+                    .extrude(0.0, ruler::cell_y(TOP_BAR_ROWS))
+                    .into();
                 self.header.show(ui, header_rect);
 
                 // Таймлайн (только DVR): рисуется раньше кнопок — под
                 // ними. Две клетки высотой, вся ширина, поля по 4
                 // колонки. Головка ходит центрами от края до края.
                 let dvr = matches!(self.phase, Phase::Dvr { .. });
-                let timeline_rect = egui::Rect::from_min_max(
-                    egui::pos2(
-                        grid::cell_x(LEFT_MARGIN),
-                        grid::cell_y(bottom_right.row - 4),
-                    ),
-                    egui::pos2(
-                        grid::cell_x(GRID_WIDTH - RIGHT_MARGIN),
-                        grid::cell_y(bottom_right.row - 2),
-                    ),
-                );
+                let timeline_rect: egui::Rect = ui
+                    .max_rect()
+                    .into_ruler()
+                    .collapse_bottom()
+                    .translate(0.0, -ruler::cell_y(4))
+                    .extrude(0.0, ruler::cell_y(2))
+                    .shrink(ruler::cell_x(LEFT_MARGIN), 0.0)
+                    .shrink(-ruler::cell_x(RIGHT_MARGIN), 0.0)
+                    .into();
                 if dvr && dvr_state == PlayerState::Ready {
                     let frac = if dvr_dur > 0 {
                         dvr_pos as f32 / dvr_dur as f32
@@ -388,10 +391,13 @@ impl Flight {
                 for (id, webcam) in self.webcams.iter_mut() {
                     let capture_state = webcam.capture_state();
                     webcam.update_frame();
-                    let state = if capture_state == CaptureState::Live {
-                        viewfinder::ViewfinderContents::Texture(webcam.texture())
-                    } else {
-                        viewfinder::ViewfinderContents::Pending
+                    let state = match capture_state {
+                        CaptureState::Live => {
+                            viewfinder::ViewfinderContents::Texture(webcam.texture())
+                        }
+                        // Мёртвый поток — ошибка камеры, не ожидание.
+                        CaptureState::Dead => viewfinder::ViewfinderContents::Error,
+                        CaptureState::Starting => viewfinder::ViewfinderContents::Pending,
                     };
                     contents.insert(id.clone(), state);
                 }
@@ -401,7 +407,8 @@ impl Flight {
                         PlayerState::Ready => {
                             viewfinder::ViewfinderContents::Texture(player.texture())
                         }
-                        _ => viewfinder::ViewfinderContents::Pending,
+                        PlayerState::Failed(_) => viewfinder::ViewfinderContents::Error,
+                        PlayerState::Opening => viewfinder::ViewfinderContents::Pending,
                     };
                     contents.insert(id.clone(), kind);
                 }
@@ -438,15 +445,72 @@ impl Flight {
                     .map(|i| (LEFT_MARGIN + segment * i, segment))
                     .collect();
 
+                // Гайдлайны: вертикальные между колонками — от границы под
+                // хедером (2 клетки от верха) до границы над футером
+                // (4 клетки от низа). Горизонтальные линии не рисуем.
+                if guidelines::ENABLED {
+                    let screen = ui.max_rect().into_ruler();
+                    let top = screen.collapse_top().translate(0.0, ruler::cell_y(2));
+                    let bottom = screen.collapse_bottom().translate(0.0, -ruler::cell_y(4));
+                    let stroke = egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x1e));
+                    for i in 1..columns {
+                        let x = ruler::cell_x(LEFT_MARGIN + segment * i);
+                        let line = egui::pos2(x, top.bottom_left().y)
+                            .into_ruler()
+                            .extrude(0.0, bottom.bottom_left().y - top.bottom_left().y);
+                        ui.painter().add(egui::epaint::Shape::dashed_line(
+                            &[line.top_left(), line.bottom_left()],
+                            stroke,
+                            8.0,
+                            4.0,
+                        ));
+                    }
+                    // Квадраты под вьюфайндерами (шириной во вьюфайндер):
+                    // первый — клетка ниже картинки (рамка рисуется
+                    // Outside — не в счёт), высота 4 клетки; второй —
+                    // клетка ниже первого, низ — на нижней границе.
+                    let vf_bottom = ruler::cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows + 2);
+                    let first_top = vf_bottom + ruler::cell_y(1);
+                    for &(zone_start, zone_width) in &column_geometry {
+                        // Ширина — как у вьюфайндера: центр той же зоны.
+                        let x = ruler::cell_x(zone_start + (zone_width - viewfinder_cols) / 2);
+                        let w = ruler::cell_x(viewfinder_cols);
+                        let first: egui::Rect = egui::pos2(x, first_top)
+                            .into_ruler()
+                            .extrude(w, ruler::cell_y(4))
+                            .into();
+                        let second: egui::Rect = egui::pos2(x, first.bottom() + ruler::cell_y(1))
+                            .into_ruler()
+                            .extrude(
+                                w,
+                                bottom.bottom_left().y - ruler::cell_y(1) - first.bottom(),
+                            )
+                            .into();
+                        guidelines::dashed_rect(ui, first);
+                        guidelines::dashed_rect(ui, second);
+                        // Плейсхолдеры в центрах: плюс двойного размера,
+                        // тёмно-серый.
+                        for rect in [first, second] {
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "\u{ead0}",
+                                style::FONT_REGULAR_X2,
+                                egui::Color32::from_rgb(0x30, 0x30, 0x30),
+                            );
+                        }
+                    }
+                }
+
                 if columns > 0 {
                     for (i, (pad_id, pad)) in pads.into_iter().enumerate() {
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - viewfinder_cols) / 2;
-                        let ruler = egui::pos2(grid::cell_x(col), grid::cell_y(TOP_BAR_ROWS + 1))
+                        let ruler = egui::pos2(ruler::cell_x(col), ruler::cell_y(TOP_BAR_ROWS + 1))
                             .into_ruler();
                         let viewfinder = ruler.extrude(
-                            grid::cell_x(viewfinder_cols),
-                            (viewfinder_rows as i32 + 2).cells_tall(),
+                            ruler::cell_x(viewfinder_cols),
+                            ruler::cell_y(viewfinder_rows + 2),
                         );
                         let frame_rect: egui::Rect = viewfinder.into();
                         let image_contents = contents
@@ -487,7 +551,7 @@ impl Flight {
                 // Нижний ряд: EXIT · REW · PLAY · FF · RPT · REC · RACE ·
                 // TIMER. Кнопки простым стилем транспорта, только иконки
                 // по центру; EXIT — плашка с иконкой.
-                let y = grid::cell_y(bottom_right.row);
+                let y = ui.max_rect().bottom();
 
                 let rec_on = self.phase.rec_on();
                 let race_on = self.phase.countdown() || matches!(self.phase, Phase::Race { .. });
@@ -503,13 +567,11 @@ impl Flight {
                 // EXIT 4 · 3 · REW 8 · 1 · PLAY 8 · 1 · FF 8 · 2 · RPT 6 ·
                 // 3 · REC 8 · 1 · RACE 8.
                 let exit_label = "\u{e6c0}\u{f0206}";
-                let btn_h = 2.cells_tall();
-                let mut ruler = egui::pos2(grid::cell_x(0), y)
-                    .into_ruler()
-                    .extrude(0.0, -btn_h);
+                let btn_h = ruler::cell_y(2);
+                let mut ruler = egui::pos2(0.0, y).into_ruler().extrude(0.0, -btn_h);
                 let mut btn = |w: isize, gap: isize| -> egui::Rect {
-                    let next = ruler.extrude(grid::cell_x(w), 0.0);
-                    ruler = next.collapse_right().translate(grid::cell_x(gap), 0.0);
+                    let next = ruler.extrude(ruler::cell_x(w), 0.0);
+                    ruler = next.collapse_right().translate(ruler::cell_x(gap), 0.0);
                     next.into()
                 };
                 let exit_rect = btn(6, 3);
@@ -709,7 +771,7 @@ impl Flight {
                 // (целевой, пока не пишем; error при провале), над RACE —
                 // длительность гонки Σ / остаток со знаком минус.
                 if !dvr && alt {
-                    let row = grid::CELL_SIZE.y;
+                    let row = ruler::CELL_SIZE.y;
                     let mut bubble = |rect: egui::Rect, lines: &[String]| {
                         if lines.is_empty() {
                             return;
@@ -758,7 +820,7 @@ impl Flight {
                 // Alt: значения шкал кнопок (вторые строки) — в бабблах
                 // над кнопками.
                 if dvr && ui.input(|i| i.modifiers.alt) {
-                    let row = grid::CELL_SIZE.y;
+                    let row = ruler::CELL_SIZE.y;
                     let labels = [
                         (
                             rew_rect,
@@ -818,7 +880,7 @@ impl Flight {
                 }
 
                 // TIMER: в live-фазах — счётчик гонки, в DVR — позиция.
-                let timer_pos = egui::pos2(egui::Rect::from(ruler).right() + grid::cell_x(2), y);
+                let timer_pos = egui::pos2(egui::Rect::from(ruler).right() + ruler::cell_x(2), y);
                 if dvr {
                     // Знаковое отступление от границ вылета. Знак
                     // занимает позицию десятков минут — все варианты
@@ -863,7 +925,7 @@ impl Flight {
                         TRANSPORT_ACTIVE,
                     );
                     ui.painter().text(
-                        egui::pos2(timer_pos.x + icon_w + grid::cell_x(1), timer_pos.y),
+                        egui::pos2(timer_pos.x + icon_w + ruler::cell_x(1), timer_pos.y),
                         egui::Align2::LEFT_BOTTOM,
                         &pos_text,
                         style::FONT_REGULAR_X2,
@@ -909,7 +971,7 @@ impl Flight {
                         timer_color,
                     );
                     ui.painter().text(
-                        egui::pos2(timer_pos.x + icon_w + grid::cell_x(1), timer_pos.y),
+                        egui::pos2(timer_pos.x + icon_w + ruler::cell_x(1), timer_pos.y),
                         egui::Align2::LEFT_BOTTOM,
                         race_timer,
                         style::FONT_REGULAR_X2,
@@ -1355,9 +1417,9 @@ impl Res {
     fn new(ctx: &egui::Context) -> Self {
         let symbol_size = measure_text(ctx, style::FONT_REGULAR, "M");
         assert!(
-            symbol_size == grid::CELL_SIZE,
-            "Font size mismatch: expected {:?}, got {:?}. Update grid::CELL_SIZE or check font assets.",
-            grid::CELL_SIZE,
+            symbol_size == ruler::CELL_SIZE,
+            "Font size mismatch: expected {:?}, got {:?}. Update ruler::CELL_SIZE or check font assets.",
+            ruler::CELL_SIZE,
             symbol_size,
         );
         Self

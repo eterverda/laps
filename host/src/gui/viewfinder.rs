@@ -1,4 +1,4 @@
-use super::grid::{self, IntoCell};
+use super::ruler::{IntoRuler, cell_x, cell_y};
 use std::sync::OnceLock;
 
 pub struct Viewfinder {
@@ -19,6 +19,16 @@ impl Viewfinder {
                 let id = testcard_texture_id(ui);
                 ui.painter().image(id, rect, FULL_UV, egui::Color32::WHITE);
             }
+            // Ошибка камеры: плейсхолдер-плюс по центру, красный.
+            ViewfinderContents::Error => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "\u{ead0}",
+                    super::style::FONT_REGULAR_X2,
+                    egui::Color32::from_rgb(0xEA, 0x31, 0x23),
+                );
+            }
             ViewfinderContents::Off => {}
         }
     }
@@ -28,6 +38,7 @@ impl Viewfinder {
 pub enum ViewfinderContents {
     Texture(egui::TextureId),
     Pending,
+    Error,
     Off,
 }
 
@@ -52,20 +63,21 @@ impl<'a> ViewfinderFrame<'a> {
         rect: egui::Rect,
         contents: impl FnOnce(&mut egui::Ui, egui::Rect),
     ) {
-        let viewfinder_rect = rect.with_min_y(rect.min.y + grid::cell_y(2));
+        let viewfinder_rect = rect.with_min_y(rect.min.y + cell_y(2));
         ui.painter().rect_stroke(
             viewfinder_rect,
             0.0,
-            egui::Stroke::new(grid::cell_x(1) / 2.0, self.color),
+            egui::Stroke::new(cell_x(1) / 2.0, self.color),
             egui::StrokeKind::Outside,
         );
 
-        let label_rect = viewfinder_rect
+        let label_rect: egui::Rect = viewfinder_rect
             .left_top()
-            .into_cell()
-            .extrude(self.label.len() as isize * 2, -2);
+            .into_ruler()
+            .extrude(cell_x(self.label.len() as isize * 2), cell_y(-2))
+            .into();
         ui.painter().rect_filled(
-            label_rect.expand2(egui::vec2(grid::cell_x(1) / 2.0, 0.0)),
+            label_rect.expand2(egui::vec2(cell_x(1) / 2.0, 0.0)),
             0.0,
             self.color,
         );
@@ -77,11 +89,12 @@ impl<'a> ViewfinderFrame<'a> {
             egui::Color32::WHITE,
         );
 
-        let name_rect = label_rect
+        let name_rect: egui::Rect = label_rect
             .right_top()
-            .into_cell()
-            .translate(2, 0)
-            .extrude(0, 1);
+            .into_ruler()
+            .translate(cell_x(2), 0.0)
+            .extrude(0.0, cell_y(1))
+            .into();
         ui.painter().text(
             name_rect.left_top(),
             egui::Align2::LEFT_TOP,

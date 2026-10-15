@@ -73,6 +73,14 @@ impl Letterbox {
             )
         };
 
+        // Виртуальный размер — всегда целое число клеток: виджеты внутри
+        // якорятся к краям rect'а, флоор к клеткам за пределами Letterbox
+        // не нужен. Границы (min/max) кратны клеткам, округление в них
+        // не вылезает.
+        let virtual_size = egui::vec2(
+            (virtual_size.x / super::ruler::CELL_SIZE.x).round() * super::ruler::CELL_SIZE.x,
+            (virtual_size.y / super::ruler::CELL_SIZE.y).round() * super::ruler::CELL_SIZE.y,
+        );
         let screen_offset = min_rect + offset;
         let rect = egui::Rect::from_min_size(screen_offset, virtual_size * scale);
 
@@ -81,35 +89,58 @@ impl Letterbox {
 
             if crate::gui::guidelines::ENABLED {
                 if rect.height() < window.height() {
-                    let top =
-                        egui::Rect::from_min_max(window.min, egui::pos2(rect.max.x, rect.min.y));
-                    let bottom =
-                        egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y), window.max);
+                    // Граница штриховки — 1px наружу от границы letterbox:
+                    // диагонали не касаются контента, как и solid-линии.
+                    let top = egui::Rect::from_min_max(
+                        window.min,
+                        egui::pos2(rect.max.x, rect.min.y - 1.0),
+                    );
+                    let bottom = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x, rect.max.y + 1.0),
+                        window.max,
+                    );
 
                     crate::gui::guidelines::hatch_rect(ui, top);
                     crate::gui::guidelines::hatch_rect(ui, bottom);
 
+                    // Обводка — снаружи границы (полштриха наружу), не на ней.
                     crate::gui::guidelines::solid_line(
                         ui,
                         egui::Direction::LeftToRight,
                         rect.min.y,
+                        -1.0,
                     );
                     crate::gui::guidelines::solid_line(
                         ui,
                         egui::Direction::LeftToRight,
                         rect.max.y,
+                        1.0,
                     );
                 } else if rect.width() < window.width() {
-                    let left =
-                        egui::Rect::from_min_max(window.min, egui::pos2(rect.min.x, rect.max.y));
-                    let right =
-                        egui::Rect::from_min_max(egui::pos2(rect.max.x, rect.min.y), window.max);
+                    let left = egui::Rect::from_min_max(
+                        window.min,
+                        egui::pos2(rect.min.x - 1.0, rect.max.y),
+                    );
+                    let right = egui::Rect::from_min_max(
+                        egui::pos2(rect.max.x + 1.0, rect.min.y),
+                        window.max,
+                    );
 
                     crate::gui::guidelines::hatch_rect(ui, left);
                     crate::gui::guidelines::hatch_rect(ui, right);
 
-                    crate::gui::guidelines::solid_line(ui, egui::Direction::TopDown, rect.min.x);
-                    crate::gui::guidelines::solid_line(ui, egui::Direction::TopDown, rect.max.x);
+                    crate::gui::guidelines::solid_line(
+                        ui,
+                        egui::Direction::TopDown,
+                        rect.min.x,
+                        -1.0,
+                    );
+                    crate::gui::guidelines::solid_line(
+                        ui,
+                        egui::Direction::TopDown,
+                        rect.max.x,
+                        1.0,
+                    );
                 }
             }
         }
@@ -257,7 +288,7 @@ pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
         })
         .sum();
     if words.len() > 1 {
-        width += super::grid::cell_x(1) * (words.len() - 1) as f32;
+        width += super::ruler::cell_x(1) * (words.len() - 1) as f32;
     }
     width
 }
@@ -341,19 +372,24 @@ fn stripe(
     corner: Corner,
     rows: isize,
 ) -> egui::Rect {
-    use super::grid::IntoCell;
+    use super::ruler::IntoRuler;
     // Обрезочка с внешней стороны: у левых полос справа, у правых слева.
     let (cut, plate) = match corner {
         Corner::TopLeft | Corner::BottomLeft => {
-            let cut = rect
+            let cut: egui::Rect = rect
                 .right_top()
-                .into_cell()
-                .translate(-rows, 0)
-                .extrude(rows, rows);
+                .into_ruler()
+                .translate(-super::ruler::cell_x(rows), 0.0)
+                .extrude(super::ruler::cell_x(rows), super::ruler::cell_y(rows))
+                .into();
             (cut, rect.with_max_x(cut.left()))
         }
         Corner::TopRight | Corner::BottomRight => {
-            let cut = rect.left_top().into_cell().extrude(rows, rows);
+            let cut: egui::Rect = rect
+                .left_top()
+                .into_ruler()
+                .extrude(super::ruler::cell_x(rows), super::ruler::cell_y(rows))
+                .into();
             (cut, rect.with_min_x(cut.right()))
         }
     };
@@ -382,8 +418,8 @@ fn stripe(
     // Контент: по клетке поля слева и справа от текста; по вертикали
     // отступов нет.
     plate
-        .with_min_x(plate.min.x + super::grid::cell_x(1))
-        .with_max_x(plate.max.x - super::grid::cell_x(1))
+        .with_min_x(plate.min.x + super::ruler::cell_x(1))
+        .with_max_x(plate.max.x - super::ruler::cell_x(1))
 }
 
 /// Состояние заливки транспортной кнопки: покой / активна (нажата).
@@ -454,7 +490,7 @@ impl<T: AsRef<str>> TransportButton<T> {
         let w = content_width(ui.ctx(), text);
         let mut pos = egui::pos2(rect.center().x - w / 2.0, rect.bottom());
         for word in text.split(' ').filter(|word| !word.is_empty()) {
-            pos.x += paint_word(ui, pos, word, icon_color) + super::grid::cell_x(1);
+            pos.x += paint_word(ui, pos, word, icon_color) + super::ruler::cell_x(1);
         }
     }
 }
@@ -466,13 +502,13 @@ pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]
     if lines.is_empty() {
         return;
     }
-    let row = super::grid::CELL_SIZE.y;
+    let row = super::ruler::CELL_SIZE.y;
     let width = lines
         .iter()
         .map(|line| super::measure_text(ui.ctx(), super::style::FONT_REGULAR, line).x)
         .fold(0.0f32, f32::max);
-    let right = anchor.right() - super::grid::cell_x(1);
-    let bottom = anchor.bottom() - super::grid::cell_y(1);
+    let right = anchor.right() - super::ruler::cell_x(1);
+    let bottom = anchor.bottom() - super::ruler::cell_y(1);
     let text = egui::Rect::from_min_max(
         egui::pos2(right - width, bottom - row),
         egui::pos2(right, bottom),
@@ -487,8 +523,8 @@ pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]
 /// вертикали тоже), обводка белая 1 пункт прямо по границам фона
 /// (снаружи), той же скруглённости.
 pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, lines: &[String]) {
-    let pad = super::grid::CELL_SIZE.x * 0.5;
-    let row = super::grid::CELL_SIZE.y;
+    let pad = super::ruler::CELL_SIZE.x * 0.5;
+    let row = super::ruler::CELL_SIZE.y;
     let bg = text.expand(pad);
     // Чёрная подложка на 1 px шире контура (во все стороны), поверх —
     // контурный скруглённый прямоугольник. Полупрозрачная заливка не

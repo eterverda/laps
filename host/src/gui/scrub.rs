@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::grid;
+use super::ruler;
 
 /// Микро-прототип: отрезки записи до старта гонки и после финиша, мс.
 pub const RACE_LEAD_MS: u64 = 15_000;
@@ -133,7 +133,7 @@ impl Timeline {
                 );
             }
         }
-        let knob_r = grid::CELL_SIZE.y * 0.24;
+        let knob_r = ruler::CELL_SIZE.y * 0.24;
         match circle {
             Some((lo, hi)) => {
                 // Круг: белая капсула между его границами (крупнее

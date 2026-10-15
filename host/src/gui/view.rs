@@ -393,6 +393,7 @@ pub enum PlateEdge {
     ChevronConvex,
     ChevronConcave,
     Flat,
+    Zero,
 }
 
 /// Как рисовать плашку-стрелку: заливка или только обводка.
@@ -427,11 +428,13 @@ pub fn arrow_plate(
         PlateEdge::ChevronConvex => (rect.left() + A_INS + TIP, rect.left() + A_INS),
         PlateEdge::ChevronConcave => (rect.left() + A_INS, rect.left() + A_INS + TIP),
         PlateEdge::Flat => (rect.left() + INS + BUTT, rect.left() + INS + BUTT),
+        PlateEdge::Zero => (0.0, 0.0),
     };
     let (right_body, right_apex) = match right {
         PlateEdge::ChevronConvex => (rect.right() - A_INS - TIP, rect.right() - A_INS),
         PlateEdge::ChevronConcave => (rect.right() - A_INS, rect.right() - A_INS - TIP),
         PlateEdge::Flat => (rect.right() - INS - BUTT, rect.right() - INS - BUTT),
+        PlateEdge::Zero => (rect.right(), rect.right()),
     };
     let outline = vec![
         egui::pos2(left_apex, mid),
@@ -551,8 +554,10 @@ impl<T: AsRef<str>, U: AsRef<str>> NavButton<T, U> {
                 NavState::Active => self.active,
                 _ => self.idle,
             };
+            // Доптекст — в строке над текстом: низ строки лежит на
+            // верхней кромке плашки (не залезает в неё).
             ui.painter().text(
-                egui::pos2(text_rect.left() + super::grid::cell_x(3), widget.bottom()),
+                egui::pos2(text_rect.left() + super::grid::cell_x(3), text_rect.top()),
                 egui::Align2::LEFT_BOTTOM,
                 sub,
                 super::style::FONT_REGULAR,
@@ -583,25 +588,17 @@ pub enum TransportState {
 /// Клик-бласть — rect целиком (уголков нет). interact и paint раздельны:
 /// между ними кладётся логика нажатия, чтобы кадр клика рисовался уже
 /// нажатым (иначе вспышка нажатия теряется между кадрами).
-pub struct TransportButton<T: AsRef<str>, U: AsRef<str>> {
+pub struct TransportButton<T: AsRef<str>> {
     text: T,
-    sub: U,
     state: TransportState,
     idle: egui::Color32,
     active: egui::Color32,
 }
 
-impl<T: AsRef<str>, U: AsRef<str>> TransportButton<T, U> {
-    pub fn new(
-        text: T,
-        sub: U,
-        state: TransportState,
-        idle: egui::Color32,
-        active: egui::Color32,
-    ) -> Self {
+impl<T: AsRef<str>> TransportButton<T> {
+    pub fn new(text: T, state: TransportState, idle: egui::Color32, active: egui::Color32) -> Self {
         Self {
             text,
-            sub,
             state,
             idle,
             active,
@@ -617,7 +614,6 @@ impl<T: AsRef<str>, U: AsRef<str>> TransportButton<T, U> {
     /// Покрасить кнопку.
     pub fn paint(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let text = self.text.as_ref();
-        let sub = self.sub.as_ref();
         ui.painter().rect_filled(
             rect,
             0.0,
@@ -628,25 +624,12 @@ impl<T: AsRef<str>, U: AsRef<str>> TransportButton<T, U> {
         );
         let icon_w = super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, text).x;
         ui.painter().text(
-            egui::pos2(
-                rect.center().x - icon_w / 2.0,
-                rect.top() + super::grid::cell_y(1),
-            ),
+            egui::pos2(rect.center().x - icon_w / 2.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             text,
             super::style::FONT_REGULAR_X2,
             egui::Color32::BLACK,
         );
-        if !sub.is_empty() {
-            let sub_rect = rect.shrink2(egui::vec2(super::grid::cell_x(1), 0.0));
-            ui.painter().text(
-                egui::pos2(sub_rect.center().x, rect.bottom()),
-                egui::Align2::CENTER_BOTTOM,
-                sub,
-                super::style::FONT_REGULAR,
-                egui::Color32::BLACK,
-            );
-        }
     }
 }
 
@@ -681,8 +664,11 @@ pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, line
     let pad = super::grid::CELL_SIZE.x * 0.5;
     let row = super::grid::CELL_SIZE.y;
     let bg = text.expand(pad);
+    // Чёрная подложка на 1 px шире контура (во все стороны), поверх —
+    // контурный скруглённый прямоугольник. Полупрозрачная заливка не
+    // используется.
     ui.painter()
-        .rect_filled(bg, pad, egui::Color32::from_rgb(0x1E, 0x1E, 0x2E));
+        .rect_filled(bg.expand(4.0), pad + 4.0, egui::Color32::BLACK);
     ui.painter().rect_stroke(
         bg,
         pad,

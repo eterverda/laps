@@ -410,7 +410,7 @@ impl Live {
                     view::NavState::Idle,
                     PLATE_EXIT,
                     PLATE_EXIT,
-                    view::PlateEdge::Flat,
+                    view::PlateEdge::Zero,
                     view::PlateEdge::Flat,
                 )
                 .show(ui, exit_rect, ui.make_persistent_id("status_exit"))
@@ -421,7 +421,7 @@ impl Live {
 
                 // DVR: недоступна до LiveAfter; с LiveAfter (запись
                 // закончена) — обычная залитая кнопка, клик ведёт в scrub.
-                // «Сколько записано» — нижним текстом (фиксируется в
+                // «Сколько записано» — над кнопкой (фиксируется в
                 // момент отжатия REC).
                 if view::NavButton::new(
                     "\u{f16df} DVR",
@@ -442,7 +442,7 @@ impl Live {
                     action = Action::GotoScrub;
                 }
 
-                // LIVE; время сессии — нижним текстом.
+                // LIVE; время сессии — над кнопкой.
                 if view::NavButton::new(
                     &live_label,
                     &live_timer,
@@ -458,7 +458,7 @@ impl Live {
                     action = Action::ToggleLive;
                 }
 
-                // REC; пока пишем — живой таймер нижним текстом.
+                // REC; пока пишем — живой таймер над кнопкой.
                 if view::NavButton::new(
                     &rec_label,
                     &rec_timer,
@@ -1194,7 +1194,7 @@ fn status_chain(ctx: &egui::Context, bottom_row: isize, labels: [&str; 5]) -> St
     let text_rect = |prev: Option<egui::Rect>, text: &str| {
         let cols = grid::whole_cols(view::content_width(ctx, text));
         match prev {
-            None => grid::cell(1, bottom_row).translate(1, -1).extrude(cols, -2),
+            None => grid::cell(1, bottom_row).translate(1, 0).extrude(cols, -2),
             Some(prev) => prev
                 .right_bottom()
                 .into_cell()

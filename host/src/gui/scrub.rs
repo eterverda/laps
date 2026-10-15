@@ -95,16 +95,6 @@ const SEEK_SPEEDS: [i32; 6] = [20, 15, 10, 7, 5, 3];
 const PLAY_SPEEDS: [i32; 7] = [25, 50, 75, 100, 125, 150, 200];
 const RPT_SIZES: [f32; 3] = [0.5, 1.0, 1.5];
 
-/// мм:сс.ммм — общий формат времени на экране scrub.
-fn mmssmmm(ms: u64) -> String {
-    format!(
-        "{:02}:{:02}.{:03}",
-        ms / 60_000,
-        (ms / 1_000) % 60,
-        ms % 1_000
-    )
-}
-
 /// Последний по имени файл записи камеры: `{anything}-{camera_id}-mjpeg`
 /// + любой из поддержанных контейнеров. Таймстамп-префикс сортируется
 /// лексикографически.
@@ -632,12 +622,14 @@ impl Scrub {
         bottom_right: grid::Cell,
     ) -> Option<TransportEvent> {
         let mut event = None;
+        // Две клетки высотой, верх на прежнем месте (нижняя строка
+        // убрана — значения шкал видны по Alt).
         let btn_rect = |col: isize, cols: isize| {
             let x = grid::cell_x(col);
-            let y = grid::cell_y(bottom_right.row - 1);
+            let y = grid::cell_y(bottom_right.row);
             egui::Rect::from_min_max(
                 egui::pos2(x, y - grid::cell_y(2)),
-                egui::pos2(x + grid::cell_x(cols), y + grid::CELL_SIZE.y),
+                egui::pos2(x + grid::cell_x(cols), y),
             )
         };
 
@@ -648,11 +640,13 @@ impl Scrub {
         let layout = [(8, 1), (8, 1), (8, 2), (6, 0)];
         // Таймер рисуется с иконкой и зазором в колонку перед текстом —
         // они входят в занимаемую ширину.
-        let timer_right = status_timer_x(ui.ctx(), bottom_right.row)
-            + super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, "\u{f43a}").x
-            + grid::cell_x(1)
-            + view::content_width(ui.ctx(), "00:00.000");
-        let mut col = grid::cell_at(egui::pos2(timer_right, 0.0)).col + 4;
+        // Параллельный перенос ряда влево от таймера: правый край
+        // правой кнопки — за 4 колонки до ЛЕВОГО края таймера.
+        // Раскладка строится слева направо от вычисленной стартовой
+        // колонки.
+        let timer_left = status_timer_x(ui.ctx(), bottom_right.row);
+        let row_cols: isize = layout.iter().map(|&(w, gap)| w + gap).sum();
+        let mut col = grid::cell_at(egui::pos2(timer_left, 0.0)).col - 6 - row_cols;
         let mut rects = layout.iter().map(|&(w, gap)| {
             let r = btn_rect(col, w);
             col += w + gap;
@@ -672,7 +666,6 @@ impl Scrub {
 
         let rew = view::TransportButton::new(
             "\u{25c0}\u{25c0}",
-            format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
             state(self.rew.lit()),
             TRANSPORT_IDLE,
             TRANSPORT_ACTIVE,
@@ -690,7 +683,6 @@ impl Scrub {
             .is_some_and(|p| p.is_playing() && !p.is_seeking());
         let play = view::TransportButton::new(
             "\u{25b6}",
-            format!("{}%", PLAY_SPEEDS[self.play_speed]),
             state(playing),
             TRANSPORT_IDLE,
             TRANSPORT_ACTIVE,
@@ -704,7 +696,6 @@ impl Scrub {
 
         let ff = view::TransportButton::new(
             "\u{25b6}\u{25b6}",
-            format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
             state(self.ff.lit()),
             TRANSPORT_IDLE,
             TRANSPORT_ACTIVE,
@@ -720,7 +711,6 @@ impl Scrub {
         let circled = self.primary().is_some_and(|p| p.is_circled());
         let rpt = view::TransportButton::new(
             "\u{F0456}",
-            format!("±{:.1}s", RPT_SIZES[self.rpt_size]),
             state(circled),
             TRANSPORT_IDLE,
             TRANSPORT_ACTIVE,
@@ -731,6 +721,30 @@ impl Scrub {
             event = Some(TransportEvent::ToggleLoop);
         }
         rpt.paint(ui, loop_rect);
+
+        // Alt: вторые строки кнопок (за пределами экрана) — в бабблах
+        // над кнопками, как подсказки навигации в live.
+        if ui.input(|i| i.modifiers.alt) {
+            let row = grid::CELL_SIZE.y;
+            let labels = [
+                (
+                    rew_rect,
+                    format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed]),
+                ),
+                (play_rect, format!("{}%", PLAY_SPEEDS[self.play_speed])),
+                (ff_rect, format!("\u{00d7}{}", SEEK_SPEEDS[self.seek_speed])),
+                (loop_rect, format!("±{:.1}s", RPT_SIZES[self.rpt_size])),
+            ];
+            for (rect, label) in labels {
+                let w = super::measure_text(ui.ctx(), style::FONT_REGULAR, &label).x;
+                let text = egui::Rect::from_min_max(
+                    egui::pos2(rect.center().x - w / 2.0, rect.top() - row * 2.0),
+                    egui::pos2(rect.center().x + w / 2.0, rect.top() - row),
+                )
+                .translate(egui::vec2(0.0, row * 0.5));
+                view::hint_badge(ui, text, egui::Align2::LEFT_BOTTOM, &[label]);
+            }
+        }
 
         // Скролл над контролом — шаг по его шкале. Вверх всегда
         // «больше» (натуральный скролл: знак дельты как есть).
@@ -813,13 +827,92 @@ impl Scrub {
                 let header_rect = grid::cell(0, 0).extrude(bottom_right.col, 2);
                 self.header.show(ui, header_rect);
 
+                // Время первичного плеера — до отрисовки кнопок:
+                // шкала рисуется первой (под ними), таймер — ниже.
+                let (pos, dur, state) = self.primary().map_or((0, 0, PlayerState::Opening), |p| {
+                    (p.position(), p.duration(), p.open_state())
+                });
+                let text_pos = egui::pos2(
+                    status_timer_x(ui.ctx(), bottom_right.row),
+                    grid::cell_y(bottom_right.row),
+                );
+                // Шкала — только у готового плеера: рисуется раньше
+                // кнопок (под ними): две клетки высотой, во всю ширину
+                // экрана, поля по 4 колонки с каждой стороны. Головка
+                // ходит центрами от края до края — на концах вылезает
+                // за трек (это нормально).
+                if state == PlayerState::Ready {
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(grid::cell_x(4), text_pos.y - grid::cell_y(4)),
+                        egui::pos2(grid::cell_x(156), text_pos.y - grid::cell_y(2)),
+                    );
+                    let frac = if dur > 0 {
+                        pos as f32 / dur as f32
+                    } else {
+                        0.0
+                    };
+                    // Фрагмент активного вылета — всё, кроме отрезков
+                    // по RACE_LEAD_MS по краям.
+                    let window = (dur > 2 * RACE_LEAD_MS).then(|| {
+                        (
+                            RACE_LEAD_MS as f32 / dur as f32,
+                            (dur - RACE_LEAD_MS) as f32 / dur as f32,
+                        )
+                    });
+                    // Круг зацикливания: доли (начало, конец) для
+                    // индикатора-капсулы.
+                    let circle = self.primary().and_then(|p| p.circle()).map(|c| {
+                        let lo = c.center.saturating_sub(c.radius) as f32 / dur.max(1) as f32;
+                        let hi = (c.center + c.radius).min(dur) as f32 / dur.max(1) as f32;
+                        (lo, hi)
+                    });
+                    let (response, events) =
+                        self.timeline.show(ui, rect, frac, dur, window, circle);
+                    for event in events {
+                        match event {
+                            TimelineEvent::SetDragHeld(held) => {
+                                for player in self.players.values() {
+                                    player.set_drag_held(held);
+                                }
+                            }
+                            TimelineEvent::Seek(t) => {
+                                for player in self.players.values() {
+                                    player.seek(t);
+                                }
+                            }
+                        }
+                    }
+                    // Горизонтальный скролл над полоской — относительный
+                    // скраб: без прыжка под курсор, дельта двигает позицию
+                    // от текущей, как при драге за кружок. Дельта берётся
+                    // только над полоской, а тишина и выход — всегда:
+                    // иначе увод курсора с полоски залипает навсегда.
+                    let dx = if response.hovered() {
+                        ui.input(|i| i.smooth_scroll_delta.x)
+                    } else {
+                        0.0
+                    };
+                    if let Some(ms) = self.hscroll.feed(dx, ui.ctx().pixels_per_point()) {
+                        self.seek_by(ms);
+                    }
+                    // Скролл-скраб = тот же hold: курсор — зажатая
+                    // ладонь на весь жест, а не только на кадры со сиком
+                    // (иначе Grab/Grabbing мигали каждый кадр). Пока
+                    // активен, крутим перерисовку: таймаут отпускания
+                    // честный даже во время паузы, без hover тоже.
+                    if self.hscroll.active() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                        ui.ctx().request_repaint();
+                    }
+                }
+
                 // EXIT — клик ведёт в меню (выход из scrub). NavButton:
                 // виджет 3 клетки (клик-бласть), плашка — верхние две.
                 // Текст — одиночное слово-иконка (нижней строки нет).
                 // Плашка из одной иконки (выход-налево) — раскладка EXIT'а
                 // в scrub своя. Таймер ниже — по live'овской цепочке
                 // (status_timer_x).
-                let exit_rect = grid::cell(1, bottom_right.row).translate(1, -1).extrude(
+                let exit_rect = grid::cell(1, bottom_right.row).translate(1, 0).extrude(
                     grid::whole_cols(view::content_width(ui.ctx(), "\u{e6c0}\u{f0206}")),
                     -2,
                 );
@@ -829,7 +922,7 @@ impl Scrub {
                     view::NavState::Idle,
                     PLATE_EXIT,
                     PLATE_EXIT,
-                    view::PlateEdge::ChevronConvex,
+                    view::PlateEdge::Zero,
                     view::PlateEdge::ChevronConcave,
                 )
                 .show(ui, exit_rect, ui.make_persistent_id("scrub_exit"))
@@ -925,168 +1018,61 @@ impl Scrub {
                 // и таймером. Позиция — как у счётчика RACE в live: тот же
                 // X (status_timer_x пересчитывает ту же цепочку кнопок), Y —
                 // базлайн на строку выше низа экрана.
-                if let Some(primary) = self.primary() {
-                    let (pos, dur, state) =
-                        (primary.position(), primary.duration(), primary.open_state());
-                    let text_pos = egui::pos2(
-                        status_timer_x(ui.ctx(), bottom_right.row),
-                        grid::cell_y(bottom_right.row - 1),
-                    );
-                    match &state {
-                        PlayerState::Failed(msg) => {
-                            ui.painter().text(
-                                text_pos,
-                                egui::Align2::LEFT_BOTTOM,
-                                format!("OPEN FAILED: {:.40}", msg),
-                                style::FONT_REGULAR_X2,
-                                egui::Color32::LIGHT_RED,
-                            );
-                        }
-                        _ => {
-                            // Микро-прототип: гонка внутри записи — отрезки
-                            // по RACE_LEAD_MS до и после. Основной таймер —
-                            // время гонки: 00:00.000 до 15-й секунды записи,
-                            // затем бежит, замирает за 15 с до конца.
-                            let race_pos = pos
-                                .saturating_sub(RACE_LEAD_MS)
-                                .min(dur.saturating_sub(2 * RACE_LEAD_MS));
-                            let pos_text = format!(
-                                "{:02}:{:02}.{:03}",
-                                race_pos / 60_000,
-                                (race_pos / 1_000) % 60,
-                                race_pos % 1_000
-                            );
-                            // Таймер: иконка + ровно колонка + текст
-                            // (font space шире ячейки — позиционируем
-                            // руками), одним цветом. За пределами гонки
-                            // допстрока ниже — 20% белого.
-                            let timer_icon = "\u{f43a}";
-                            let timer_icon_w =
-                                super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
-                            let timer_text_x = text_pos.x + timer_icon_w + grid::cell_x(1);
-                            ui.painter().text(
-                                text_pos,
-                                egui::Align2::LEFT_BOTTOM,
-                                timer_icon,
-                                style::FONT_REGULAR_X2,
-                                egui::Color32::WHITE,
-                            );
-                            ui.painter().text(
-                                egui::pos2(timer_text_x, text_pos.y),
-                                egui::Align2::LEFT_BOTTOM,
-                                &pos_text,
-                                style::FONT_REGULAR_X2,
-                                egui::Color32::WHITE,
-                            );
-                            // В отрезках до/после гонки — отступление от
-                            // старта/финиша, строкой ниже по центру,
-                            // одинарным шрифтом.
-                            if state == PlayerState::Ready {
-                                let offset = if pos < RACE_LEAD_MS {
-                                    Some(format!("-{}", mmssmmm(RACE_LEAD_MS - pos)))
-                                } else if dur >= 2 * RACE_LEAD_MS && pos > dur - RACE_LEAD_MS {
-                                    Some(format!("+{}", mmssmmm(pos - (dur - RACE_LEAD_MS))))
-                                } else {
-                                    None
-                                };
-                                if let Some(offset) = offset {
-                                    // Под основным таймером, по центру
-                                    // его строки: глифы основного висят
-                                    // выше базлайна, доп-таймер — в
-                                    // строке под ними.
-                                    let x = text_pos.x
-                                        + (timer_icon_w
-                                            + grid::cell_x(1)
-                                            + view::content_width(ui.ctx(), &pos_text))
-                                            / 2.0;
-                                    ui.painter().text(
-                                        egui::pos2(x, grid::cell_y(bottom_right.row - 1)),
-                                        egui::Align2::CENTER_TOP,
-                                        offset,
-                                        style::FONT_REGULAR,
-                                        egui::Color32::WHITE.gamma_multiply(0.4),
-                                    );
-                                }
-                            }
-                            // Шкала — только у готового плеера: между
-                            // EXIT-плашкой и таймером, по 3 колонки
-                            // воздуха с каждой стороны.
-                            if state == PlayerState::Ready {
-                                let rect = egui::Rect::from_min_max(
-                                    egui::pos2(
-                                        view::nav_plate_rect(exit_rect).right() + grid::cell_x(3),
-                                        text_pos.y - grid::cell_y(2),
-                                    ),
-                                    egui::pos2(text_pos.x - grid::cell_x(3), text_pos.y),
-                                );
-                                let frac = if dur > 0 {
-                                    pos as f32 / dur as f32
-                                } else {
-                                    0.0
-                                };
-                                // Фрагмент активного вылета — всё, кроме
-                                // отрезков по RACE_LEAD_MS по краям.
-                                let window = (dur > 2 * RACE_LEAD_MS).then(|| {
-                                    (
-                                        RACE_LEAD_MS as f32 / dur as f32,
-                                        (dur - RACE_LEAD_MS) as f32 / dur as f32,
-                                    )
-                                });
-                                // Команды ждут готовности в очереди
-                                // worker'а — прозрачно.
-                                // Круг зацикливания: доли (начало,
-                                // конец) для стрелки-индикатора.
-                                let circle = self.primary().and_then(|p| p.circle()).map(|c| {
-                                    let lo = c.center.saturating_sub(c.radius) as f32
-                                        / dur.max(1) as f32;
-                                    let hi =
-                                        (c.center + c.radius).min(dur) as f32 / dur.max(1) as f32;
-                                    (lo, hi)
-                                });
-                                let (response, events) =
-                                    self.timeline.show(ui, rect, frac, dur, window, circle);
-                                for event in events {
-                                    match event {
-                                        TimelineEvent::SetDragHeld(held) => {
-                                            for player in self.players.values() {
-                                                player.set_drag_held(held);
-                                            }
-                                        }
-                                        TimelineEvent::Seek(t) => {
-                                            for player in self.players.values() {
-                                                player.seek(t);
-                                            }
-                                        }
-                                    }
-                                }
-                                // Горизонтальный скролл над полоской —
-                                // относительный скраб: без прыжка под
-                                // курсор, дельта двигает позицию от
-                                // текущей, как при драге за кружок. Дельта
-                                // берётся только над полоской, а тишина и
-                                // выход — всегда: иначе увод курсора с
-                                // полоски залипает навсегда.
-                                let dx = if response.hovered() {
-                                    ui.input(|i| i.smooth_scroll_delta.x)
-                                } else {
-                                    0.0
-                                };
-                                if let Some(ms) = self.hscroll.feed(dx, ui.ctx().pixels_per_point())
-                                {
-                                    self.seek_by(ms);
-                                }
-                                // Скролл-скраб = тот же hold: курсор —
-                                // зажатая ладонь на весь жест, а не только
-                                // на кадры со сиком (иначе Grab/Grabbing
-                                // мигали каждый кадр). Пока активен, крутим
-                                // перерисовку: таймаут отпускания честный
-                                // даже во время паузы, без hover тоже.
-                                if self.hscroll.active() {
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-                                    ui.ctx().request_repaint();
-                                }
-                            }
-                        }
+                match &state {
+                    PlayerState::Failed(msg) => {
+                        ui.painter().text(
+                            text_pos,
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("OPEN FAILED: {:.40}", msg),
+                            style::FONT_REGULAR_X2,
+                            egui::Color32::LIGHT_RED,
+                        );
+                    }
+                    _ => {
+                        // Микро-прототип: гонка внутри записи — отрезки
+                        // по RACE_LEAD_MS до и после. Основной таймер —
+                        // время гонки; за пределами окна — отступление
+                        // со знаком на основном: минус первым символом
+                        // (-0:05.234 до старта), плюс — после финиша
+                        // (+0:03.100). Допстроки нет.
+                        let race_pos = pos
+                            .saturating_sub(RACE_LEAD_MS)
+                            .min(dur.saturating_sub(2 * RACE_LEAD_MS));
+                        let (sign, shown) = if pos < RACE_LEAD_MS {
+                            ("-", RACE_LEAD_MS - pos)
+                        } else if dur >= 2 * RACE_LEAD_MS && pos > dur - RACE_LEAD_MS {
+                            ("+", pos - (dur - RACE_LEAD_MS))
+                        } else {
+                            ("", race_pos)
+                        };
+                        let pos_text = format!(
+                            "{}{}:{:02}.{:03}",
+                            sign,
+                            shown / 60_000,
+                            (shown / 1_000) % 60,
+                            shown % 1_000
+                        );
+                        // Таймер: иконка + ровно колонка + текст
+                        // (font space шире ячейки — позиционируем
+                        // руками), одним цветом.
+                        let timer_icon = "\u{f43a}";
+                        let timer_icon_w =
+                            super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
+                        let timer_text_x = text_pos.x + timer_icon_w + grid::cell_x(1);
+                        ui.painter().text(
+                            text_pos,
+                            egui::Align2::LEFT_BOTTOM,
+                            timer_icon,
+                            style::FONT_REGULAR_X2,
+                            egui::Color32::WHITE,
+                        );
+                        ui.painter().text(
+                            egui::pos2(timer_text_x, text_pos.y),
+                            egui::Align2::LEFT_BOTTOM,
+                            &pos_text,
+                            style::FONT_REGULAR_X2,
+                            egui::Color32::WHITE,
+                        );
                     }
                 }
 

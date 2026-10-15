@@ -209,9 +209,9 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   rewind); on disable time continues from the cursor position. The
   worker detects wraps via position jumps (sticky catch-up) and draws
   the knob as a stadium spanning the circle
-- Remote: `toggle-play`, `set-play-speed <pct>`, `shuttle <velocity>`,
-  `shuttle-release` (the latter two mirror the shuttle gesture for
-  testing)
+- Remote: `rec`, `race`, `play`, `ff`, `rew` (button presses, same
+  code as the clicks), `seek <ms>` (absolute seek of all players),
+  `exit` (to menu) — see `Flight::handle_remote`
 
 ## Configuration
 
@@ -252,12 +252,12 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   answer would wait for the next frame) and waits on a oneshot channel.
   The accept thread serves clients one at a time. Commands are handled
   by inherent `handle_remote` methods: the current screen gets the
-  command first (`Live`), declined commands bubble up, `App` is the top
-  level (echo is answered there, everything else becomes "unknown
+  command first (`Flight`), declined commands bubble up, `App` is the
+  top level (echo is answered there, everything else becomes "unknown
   command"). Response = text + exit code: text to stdout on code 0, to
   stderr otherwise; the process exit code = the response code.
-  Precedent commands: `toggle-live` / `toggle-rec` (go to the GUI, call
-  the same `Live::toggle_*` as the buttons). A new stateful command =
+  Precedent commands: `rec` / `race` (go to the GUI, call the same
+  `Flight::toggle_*` as the buttons). A new stateful command =
   a branch in `handle_remote` of the right screen; the server needs no
   changes.
 

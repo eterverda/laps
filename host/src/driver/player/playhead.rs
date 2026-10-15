@@ -141,11 +141,6 @@ impl Playhead {
         self.set_circle_at(Instant::now(), circle);
     }
 
-    /// Радиус круга (скролл по кнопке LOOP): центр не трогаем.
-    pub fn set_circle_radius(&mut self, radius: u64) {
-        self.set_circle_radius_at(Instant::now(), radius);
-    }
-
     /// Параметры круга (для индикатора на таймлайне).
     pub fn circle(&self) -> Option<Circle> {
         self.circle
@@ -327,14 +322,6 @@ impl Playhead {
             center: self.position_at(now),
             radius: c.radius,
         });
-    }
-
-    /// Радиус круга: центр не трогаем.
-    fn set_circle_radius_at(&mut self, now: Instant, radius: u64) {
-        let _ = now;
-        if let Some(circle) = &mut self.circle {
-            circle.radius = radius;
-        }
     }
 
     /// Захват таймлайна: true — время заморожено (позицию двигают

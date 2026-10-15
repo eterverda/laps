@@ -142,9 +142,9 @@ impl Letterbox {
 /// ширины не даёт.
 pub const GLYPH_FLIP: char = '\u{e6c0}';
 
-/// Слово без маркера GLYPH_FLIP (измеряем и рисуем сам глиф).
-fn strip_flip_marker(word: &str) -> &str {
-    word.strip_prefix(GLYPH_FLIP).unwrap_or(word)
+/// Слово без маркеров GLYPH_FLIP (измеряем и рисуем сами глифы).
+fn strip_flip_markers(word: &str) -> String {
+    word.chars().filter(|&c| c != GLYPH_FLIP).collect()
 }
 
 /// Округление позиции к физическим пикселям (паритет с тесселятором
@@ -156,44 +156,59 @@ fn round_to_pixels(pos: egui::Pos2, pixels_per_point: f32) -> egui::Pos2 {
     )
 }
 
-/// Слово кнопки на позиции (левый нижний угол): обычное — painter.text,
-/// с маркером GLYPH_FLIP — первый глиф зеркально (paint_glyph_flipped),
-/// остаток слова следом. Возвращает ширину слова (как measure_text у
+/// Слово кнопки на позиции (левый нижний угол). Обычные глифы — прогонами
+/// через painter.text; глиф после маркера GLYPH_FLIP — зеркально
+/// (paint_glyph_flipped). Возвращает ширину слова (как measure_text у
 /// обычного слова).
 fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color32) -> f32 {
-    let Some(rest) = word.strip_prefix(GLYPH_FLIP) else {
+    let font = super::style::FONT_REGULAR_X2;
+    let mut x = pos.x;
+    // Прогон обычных глифов накапливается в run, маркер его сбрасывает
+    // (прогон рисуется) и переворачивает следующий глиф.
+    let mut run = String::new();
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        if c == GLYPH_FLIP {
+            if !run.is_empty() {
+                ui.painter().text(
+                    egui::pos2(x, pos.y),
+                    egui::Align2::LEFT_BOTTOM,
+                    &run,
+                    font.clone(),
+                    color,
+                );
+                x += super::measure_text(ui.ctx(), font.clone(), &run).x;
+                run.clear();
+            }
+            if let Some(g) = chars.next() {
+                x += paint_glyph_flipped(ui, egui::pos2(x, pos.y), g, color);
+            }
+        } else {
+            run.push(c);
+        }
+    }
+    if !run.is_empty() {
         ui.painter().text(
-            pos,
+            egui::pos2(x, pos.y),
             egui::Align2::LEFT_BOTTOM,
-            word,
-            super::style::FONT_REGULAR_X2,
+            &run,
+            font.clone(),
             color,
         );
-        return super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, word).x;
-    };
-    paint_glyph_flipped(ui, pos, rest, color)
+        x += super::measure_text(ui.ctx(), font, &run).x;
+    }
+    x - pos.x
 }
 
-/// Первый глиф текста зеркально по горизонтали, остаток (если есть) —
-/// обычным текстом со стандартным пробелом-ячейкой. Ширина — как у
-/// обычного текста: квад того же глифа из шрифтового атласа
-/// (TextureId::Managed(0)), u в uv отражена. Позиционирование повторяет
-/// painter.text с LEFT_BOTTOM (включая округление к физпикселям).
-fn paint_glyph_flipped(
-    ui: &mut egui::Ui,
-    pos: egui::Pos2,
-    text: &str,
-    color: egui::Color32,
-) -> f32 {
+/// Один глиф зеркально по горизонтали. Ширина — как у обычного текста:
+/// квад того же глифа из шрифтового атласа (TextureId::Managed(0)), u в
+/// uv отражена. Позиционирование повторяет painter.text с LEFT_BOTTOM
+/// (включая округление к физпикселям).
+fn paint_glyph_flipped(ui: &mut egui::Ui, pos: egui::Pos2, chr: char, color: egui::Color32) -> f32 {
     let font = super::style::FONT_REGULAR_X2;
-    let mut chars = text.chars();
-    let Some(chr) = chars.next() else {
-        return 0.0;
-    };
-    let rest: String = chars.collect();
     let galley = ui
         .ctx()
-        .fonts_mut(|fonts| fonts.layout_no_wrap(chr.to_string(), font.clone(), color));
+        .fonts_mut(|fonts| fonts.layout_no_wrap(chr.to_string(), font, color));
     let Some(row) = galley.rows.first() else {
         return 0.0;
     };
@@ -228,14 +243,7 @@ fn paint_glyph_flipped(
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(2, 1, 3);
     ui.painter().add(egui::Shape::mesh(mesh));
-
-    let advance = glyph.advance_width;
-    if !rest.is_empty() {
-        let rest_pos = egui::pos2(pos.x + advance + super::grid::cell_x(1), pos.y);
-        ui.painter()
-            .text(rest_pos, egui::Align2::LEFT_BOTTOM, rest, font, color);
-    }
-    advance
+    glyph.advance_width
 }
 
 /// Ширина текста кнопки в пикселях — чтобы вызывающий код мог
@@ -245,7 +253,7 @@ pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
     let mut width: f32 = words
         .iter()
         .map(|word| {
-            super::measure_text(ctx, super::style::FONT_REGULAR_X2, strip_flip_marker(word)).x
+            super::measure_text(ctx, super::style::FONT_REGULAR_X2, strip_flip_markers(word)).x
         })
         .sum();
     if words.len() > 1 {
@@ -378,207 +386,15 @@ fn stripe(
         .with_max_x(plate.max.x - super::grid::cell_x(1))
 }
 
-/// Отступ контура плашки-стрелки (arrow_plate) от краёв её rect:
-/// вершина носа — в inset от края, тело впадины — в inset.
-const PLATE_INSET: f32 = super::grid::CELL_SIZE.x / 8.0;
-
-/// Толщина обводки PlatePaint::Outlined.
-const PLATE_OUTLINE_WIDTH: f32 = super::grid::CELL_SIZE.x / 8.0;
-
-/// Край плашки-стрелки: геометрия шеврона относительно плашки.
-/// Convex — нос наружу, Concave — впадина внутрь; для любого края.
-/// Стык цепочки — Convex слева (нос) и Concave справа (впадина).
-#[derive(Clone, Copy)]
-pub enum PlateEdge {
-    ChevronConvex,
-    ChevronConcave,
-    Flat,
-    Zero,
-}
-
-/// Как рисовать плашку-стрелку: заливка или только обводка.
-pub enum PlatePaint {
-    Filled(egui::Color32),
-    Outlined(egui::Color32),
-}
-
-/// Фон-плашка-стрелка в стиле промпта PowerShell: высота две клетки,
-/// края — по PlateEdge, заливка или обводка — по PlatePaint. Контур
-/// невыпуклый: epaint заливает веером из первой вершины, поэтому обход
-/// всегда начинается с левой средней точки — из неё весь контур виден
-/// для любых краёв. Rect приходит целиком (вместе с наконечником
-/// и левой частью под соседнюю плашку). Только рисует: текст вызывающий
-/// код кладёт по своему rect'у сам.
-pub fn arrow_plate(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    left: PlateEdge,
-    right: PlateEdge,
-    paint: PlatePaint,
-) {
-    const BUTT: f32 = super::grid::cell_x(1);
-    const TIP: f32 = super::grid::cell_x(2);
-    const INS: f32 = PLATE_INSET;
-    const A_INS: f32 = PLATE_INSET * std::f32::consts::SQRT_2;
-
-    let mid = rect.center().y;
-    // (тело, вершина) края: нос — вершина близко к rect (inset), тело
-    // глубоко (tip); впадина — наоборот.
-    let (left_body, left_apex) = match left {
-        PlateEdge::ChevronConvex => (rect.left() + A_INS + TIP, rect.left() + A_INS),
-        PlateEdge::ChevronConcave => (rect.left() + A_INS, rect.left() + A_INS + TIP),
-        PlateEdge::Flat => (rect.left() + INS + BUTT, rect.left() + INS + BUTT),
-        PlateEdge::Zero => (0.0, 0.0),
-    };
-    let (right_body, right_apex) = match right {
-        PlateEdge::ChevronConvex => (rect.right() - A_INS - TIP, rect.right() - A_INS),
-        PlateEdge::ChevronConcave => (rect.right() - A_INS, rect.right() - A_INS - TIP),
-        PlateEdge::Flat => (rect.right() - INS - BUTT, rect.right() - INS - BUTT),
-        PlateEdge::Zero => (rect.right(), rect.right()),
-    };
-    let outline = vec![
-        egui::pos2(left_apex, mid),
-        egui::pos2(left_body, rect.top()),
-        egui::pos2(right_body, rect.top()),
-        egui::pos2(right_apex, mid),
-        egui::pos2(right_body, rect.bottom()),
-        egui::pos2(left_body, rect.bottom()),
-    ];
-    // Обводка (Outlined) — внутрь: внешний край disabled-плашки
-    // совпадает со залитой, контур не вылезает за геометрию цепочки.
-    let (fill, stroke) = match paint {
-        PlatePaint::Filled(color) => (color, egui::epaint::PathStroke::NONE),
-        PlatePaint::Outlined(color) => (
-            egui::Color32::TRANSPARENT,
-            egui::epaint::PathStroke::new(PLATE_OUTLINE_WIDTH, color).inside(),
-        ),
-    };
-    ui.painter()
-        .add(egui::Shape::convex_polygon(outline, fill, stroke));
-}
-
-/// Состояние кнопки навигации: покой (неактивные цвета), активная
-/// работа (насыщенный цвет), недоступна (контур и текст цветом
-/// неактивного фона, клика нет).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum NavState {
-    Idle,
-    Active,
-    Disabled,
-}
-
-/// Кнопка навигации статус-бара: плашка-стрелка (с уголками) + верхний
-/// текст + нижний текст. Верхний текст — слова через пробел-ячейку,
-/// первое слово — иконка (поддерживает GLYPH_FLIP-маркер).
-/// Нижний текст (доптаймер, "" = без) — по левому краю текста после
-/// иконки (+3 колонки), цветом подложки. Базовая высота виджета —
-/// 3 клетки: две верхнего текста, одна нижнего. Плашка накрывает
-/// только верхние две; нижняя строка (доптекст) — без фона. Размещение
-/// по границам текста ± 2 колонки (NAV_AIR); плашка шире ещё на 2 с
-/// каждой стороны под уголки (симметрично: nose = tail = 2 колонки).
-/// Клик-бласть — весь виджет (все три строки), уголки вне её.
-/// Направления уголков приходят снаружи: цепочка рисует кнопки в
-/// порядке следования.
-pub struct NavButton<T: AsRef<str>, U: AsRef<str>> {
-    text: T,
-    sub: U,
-    state: NavState,
-    idle: egui::Color32,
-    active: egui::Color32,
-    left: PlateEdge,
-    right: PlateEdge,
-}
-
-/// Rect виджета NavButton: текст ± 2 колонки, +1 клетка вниз (строка
-/// sub).
-pub fn nav_widget_rect(text: egui::Rect) -> egui::Rect {
-    text.expand2(egui::vec2(super::grid::cell_x(2), 0.0))
-        .with_max_y(text.bottom() + super::grid::CELL_SIZE.y)
-}
-
-/// Rect плашки NavButton: текст ± (2 воздух + 2 под уголки) по
-/// горизонтали; по вертикали — только две верхние клетки виджета
-/// (нижняя строка с доптекстом без плашки).
-pub fn nav_plate_rect(text: egui::Rect) -> egui::Rect {
-    text.expand2(egui::vec2(super::grid::cell_x(4), 0.0))
-}
-
-impl<T: AsRef<str>, U: AsRef<str>> NavButton<T, U> {
-    pub fn new(
-        text: T,
-        sub: U,
-        state: NavState,
-        idle: egui::Color32,
-        active: egui::Color32,
-        left: PlateEdge,
-        right: PlateEdge,
-    ) -> Self {
-        Self {
-            text,
-            sub,
-            state,
-            idle,
-            active,
-            left,
-            right,
-        }
-    }
-
-    /// Покрасить и, если кнопка не Disabled, принять клик. None —
-    /// недоступна (только покраска).
-    pub fn show(
-        &self,
-        ui: &mut egui::Ui,
-        text_rect: egui::Rect,
-        id: egui::Id,
-    ) -> Option<egui::Response> {
-        let text = self.text.as_ref();
-        let sub = self.sub.as_ref();
-        let widget = nav_widget_rect(text_rect);
-        let plate = nav_plate_rect(text_rect);
-        let (paint, text_color) = match self.state {
-            NavState::Idle => (PlatePaint::Filled(self.idle), egui::Color32::BLACK),
-            NavState::Active => (PlatePaint::Filled(self.active), egui::Color32::BLACK),
-            NavState::Disabled => (PlatePaint::Outlined(self.idle), self.idle),
-        };
-        arrow_plate(ui, plate, self.left, self.right, paint);
-        // Верхний текст — пословно (как считает content_width): иконка,
-        // затем ровно колонка пробела, затем слово. Одним painter.text
-        // нельзя: пробел шрифта шире ячейки и текст не ложится в rect.
-        let mut pos = text_rect.left_bottom();
-        for word in text.split(' ').filter(|word| !word.is_empty()) {
-            pos.x += paint_word(ui, pos, word, text_color) + super::grid::cell_x(1);
-        }
-        if !sub.is_empty() {
-            let sub_color = match self.state {
-                NavState::Active => self.active,
-                _ => self.idle,
-            };
-            // Доптекст — в строке над текстом: низ строки лежит на
-            // верхней кромке плашки (не залезает в неё).
-            ui.painter().text(
-                egui::pos2(text_rect.left() + super::grid::cell_x(3), text_rect.top()),
-                egui::Align2::LEFT_BOTTOM,
-                sub,
-                super::style::FONT_REGULAR,
-                sub_color,
-            );
-        }
-        if self.state == NavState::Disabled {
-            return None;
-        }
-        Some(
-            ui.interact(widget, id, egui::Sense::click())
-                .on_hover_cursor(egui::CursorIcon::PointingHand),
-        )
-    }
-}
-
 /// Состояние заливки транспортной кнопки: покой / активна (нажата).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TransportState {
+    /// Обычное состояние: заливка неярким цветом, текст чёрный.
     Idle,
+    /// Нажата (включая тап) или активирована: заливка ярким, текст чёрный.
     Active,
+    /// Некликабельна: чёрный фон, неяркая обводка, глиф неяркого цвета.
+    Disabled,
 }
 
 /// Кнопка транспорта (scrub): залитый прямоугольник 3 клетки высотой,
@@ -614,22 +430,32 @@ impl<T: AsRef<str>> TransportButton<T> {
     /// Покрасить кнопку.
     pub fn paint(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let text = self.text.as_ref();
-        ui.painter().rect_filled(
-            rect,
-            0.0,
-            match self.state {
-                TransportState::Idle => self.idle,
-                TransportState::Active => self.active,
-            },
-        );
-        let icon_w = super::measure_text(ui.ctx(), super::style::FONT_REGULAR_X2, text).x;
-        ui.painter().text(
-            egui::pos2(rect.center().x - icon_w / 2.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            super::style::FONT_REGULAR_X2,
-            egui::Color32::BLACK,
-        );
+        let disabled_color = self.idle.gamma_multiply(0.35);
+        let (fill, icon_color) = match self.state {
+            TransportState::Idle => (self.idle, egui::Color32::BLACK),
+            TransportState::Active => (self.active, egui::Color32::BLACK),
+            // Выключенная: чёрный фон, обводка и глиф вдвое бледнее
+            // (альфой, новый цвет не нужен).
+            TransportState::Disabled => (egui::Color32::BLACK, disabled_color),
+        };
+        ui.painter().rect_filled(rect, 0.0, fill);
+        if matches!(self.state, TransportState::Disabled) {
+            // Полная обводка поверх чёрного фона.
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(2.0, disabled_color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // Текст пословно (первое слово — иконка, GLYPH_FLIP поддержан):
+        // font space шире ячейки, центруем по content_width. Базлайн —
+        // на низе кнопки (глиф X2 — две клетки, встаёт точно).
+        let w = content_width(ui.ctx(), text);
+        let mut pos = egui::pos2(rect.center().x - w / 2.0, rect.bottom());
+        for word in text.split(' ').filter(|word| !word.is_empty()) {
+            pos.x += paint_word(ui, pos, word, icon_color) + super::grid::cell_x(1);
+        }
     }
 }
 

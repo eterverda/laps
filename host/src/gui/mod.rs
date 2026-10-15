@@ -1,11 +1,12 @@
 use crate::config::setup::Setup;
 use crate::model::pilot::Pilot;
 
+mod flight;
 mod grid;
 mod guidelines;
 mod header;
-mod live;
 mod menu;
+mod ruler;
 mod scrub;
 mod style;
 mod view;
@@ -13,8 +14,7 @@ mod viewfinder;
 
 enum State {
     Menu(menu::Menu),
-    Live(Box<live::Live>),
-    Scrub(Box<scrub::Scrub>),
+    Flight(Box<flight::Flight>),
 }
 
 #[derive(Default)]
@@ -25,15 +25,8 @@ impl Navigator {
         self.0 = Some(state.into());
     }
 }
-impl From<Box<scrub::Scrub>> for State {
-    fn from(scrub: Box<scrub::Scrub>) -> Self {
-        State::Scrub(scrub)
-    }
-}
 
 struct App {
-    /// Каталог записей для scrub-режима: экран строится с плеерами.
-    scrub: Option<std::path::PathBuf>,
     remote_rx: std::sync::mpsc::Receiver<(
         Vec<String>,
         std::sync::mpsc::Sender<crate::remote::Response>,
@@ -97,23 +90,26 @@ impl App {
         let assignments = hardcoded_assignments();
         Self {
             state: match &scrub {
-                Some(captures) => State::Scrub(Box::new(scrub::Scrub::new(
+                // CLI `laps scrub` — Flight, стартующий в режиме
+                // просмотра записи.
+                Some(captures) => State::Flight(Box::new(flight::Flight::dvr(
                     &cc.egui_ctx,
                     setup.clone(),
                     assignments.clone(),
                     captures.clone(),
                 ))),
-                None => State::Live(Box::new(live::Live::new(
+                None => State::Flight(Box::new(flight::Flight::live(
+                    &cc.egui_ctx,
                     setup.clone(),
                     assignments.clone(),
                     crate::model::race::RaceRules::default(),
+                    Some(std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR)),
                 ))),
             },
             setup,
             assignments,
             remote_rx,
             _server: server,
-            scrub,
         }
     }
 
@@ -126,8 +122,7 @@ impl App {
         command: &[String],
     ) -> crate::remote::Response {
         let response = match &mut self.state {
-            State::Live(live) => live.handle_remote(ctx, command),
-            State::Scrub(scrub) => scrub.handle_remote(command),
+            State::Flight(flight) => flight.handle_remote(ctx, command),
             State::Menu(_) => None,
         };
         response.unwrap_or_else(|| {
@@ -169,23 +164,16 @@ impl eframe::App for App {
 
                 match self.state {
                     State::Menu(ref mut menu) => match menu.update(ui) {
-                        menu::Action::Start => match &self.scrub {
-                            Some(captures) => navigator.goto(Box::new(scrub::Scrub::new(
-                                &ctx,
-                                self.setup.clone(),
-                                self.assignments.clone(),
-                                captures.clone(),
-                            ))),
-                            None => navigator.goto(Box::new(live::Live::new(
-                                self.setup.clone(),
-                                self.assignments.clone(),
-                                crate::model::race::RaceRules::default(),
-                            ))),
-                        },
+                        menu::Action::Start => navigator.goto(Box::new(flight::Flight::live(
+                            &ctx,
+                            self.setup.clone(),
+                            self.assignments.clone(),
+                            crate::model::race::RaceRules::default(),
+                            Some(std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR)),
+                        ))),
                         menu::Action::None => {}
                     },
-                    State::Live(ref mut live) => live.update(ui, &mut navigator),
-                    State::Scrub(ref mut scrub) => scrub.update(ui, &mut navigator),
+                    State::Flight(ref mut flight) => flight.update(ui, &mut navigator),
                 }
 
                 if let Some(state) = navigator.0 {

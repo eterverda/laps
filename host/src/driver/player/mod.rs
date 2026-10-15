@@ -71,8 +71,6 @@ enum Command {
     /// Зацикливание: Some(круг) включает (центр ставит головка),
     /// None выключает.
     SetCircle(Option<Circle>),
-    /// Радиус круга (скролл по кнопке LOOP), центр не трогаем.
-    SetCircleRadius(u64),
 }
 
 pub struct Player {
@@ -210,17 +208,6 @@ impl Player {
     pub fn set_circle(&self, circle: Option<Circle>) {
         if self.commands.try_send(Command::SetCircle(circle)).is_err() {
             log::warn!("player: set_circle ignored (worker gone)");
-        }
-    }
-
-    /// Радиус круга (скролл по кнопке LOOP), центр не трогаем.
-    pub fn set_circle_radius(&self, radius: u64) {
-        if self
-            .commands
-            .try_send(Command::SetCircleRadius(radius))
-            .is_err()
-        {
-            log::warn!("player: set_circle_radius ignored (worker gone)");
         }
     }
 
@@ -638,10 +625,6 @@ fn playback_loop(
                     self.head.set_circle(zone);
                     // Головка ставит центр текущей позицией: забираем
                     // фактические параметры для индикатора.
-                    self.circle.store(self.head.circle());
-                }
-                Command::SetCircleRadius(radius) => {
-                    self.head.set_circle_radius(radius);
                     self.circle.store(self.head.circle());
                 }
             }

@@ -32,7 +32,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 
 ## UI
 
-- **egui** + **eframe** 0.36 — immediate mode GUI
+- **egui** + **eframe** 0.37 — immediate mode GUI
 - Own grid layout: 160×45 cells of 16×32 pt (cell is twice the screen
   pixel size: text rasterizes at 2× resolution, on-screen look unchanged);
   all widgets snapped to the grid

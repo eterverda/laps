@@ -44,7 +44,10 @@ impl Sound {
         let mut i = 12;
         let mut data_size = None;
         while i + 8 <= bytes.len() {
-            if bytes[i] == b'd' && bytes[i + 1] == b'a' && bytes[i + 2] == b't' && bytes[i + 3] == b'a'
+            if bytes[i] == b'd'
+                && bytes[i + 1] == b'a'
+                && bytes[i + 2] == b't'
+                && bytes[i + 3] == b'a'
             {
                 data_size = Some(u32::from_le_bytes([
                     bytes[i + 4],
@@ -159,7 +162,7 @@ impl Schedule {
 /// Тело потока-плеера: открывает вывод один раз, дальше крутит
 /// расписание и команды.
 fn output_loop(commands: Receiver<Command>) {
-    let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+    let Ok(stream) = rodio::DeviceSinkBuilder::open_default_sink() else {
         log::warn!("audio: no output device, sounds disabled");
         // Канал держим открытым: отправители не должны видеть ошибку,
         // просто звуков нет.
@@ -168,22 +171,17 @@ fn output_loop(commands: Receiver<Command>) {
     };
 
     let mut schedule = Schedule::new();
-    // Играющий звук программы: держим sink, чтобы отмена могла его
+    // Играющий звук программы: держим player, чтобы отмена могла его
     // оборвать. `play()` вне программ играет самостоятельно (detach).
-    let mut current: Option<rodio::Sink> = None;
+    let mut current: Option<rodio::Player> = None;
 
-    let start = |handle: &rodio::OutputStreamHandle, sound: Sound| -> Option<rodio::Sink> {
+    let start = |stream: &rodio::MixerDeviceSink, sound: Sound| -> Option<rodio::Player> {
         match rodio::Decoder::new(Cursor::new(sound.bytes)) {
-            Ok(source) => match rodio::Sink::try_new(handle) {
-                Ok(sink) => {
-                    sink.append(source);
-                    Some(sink)
-                }
-                Err(e) => {
-                    log::warn!("audio: sink failed: {e}");
-                    None
-                }
-            },
+            Ok(source) => {
+                let player = rodio::Player::connect_new(stream.mixer());
+                player.append(source);
+                Some(player)
+            }
             Err(e) => {
                 log::warn!("audio: decode failed: {e}");
                 None
@@ -193,7 +191,7 @@ fn output_loop(commands: Receiver<Command>) {
 
     loop {
         // Отжали играющий звук программы — доиграл.
-        if current.as_ref().is_some_and(rodio::Sink::empty) {
+        if current.as_ref().is_some_and(rodio::Player::empty) {
             current = None;
         }
         let wait = schedule
@@ -201,25 +199,25 @@ fn output_loop(commands: Receiver<Command>) {
             .unwrap_or(Duration::from_millis(100));
         match commands.recv_timeout(wait) {
             Ok(Command::Play(sound)) => {
-                if let Some(sink) = start(&handle, sound) {
-                    sink.detach();
+                if let Some(player) = start(&stream, sound) {
+                    player.detach();
                 }
             }
             Ok(Command::Sequence(steps)) => {
-                if let Some(sink) = current.take() {
-                    sink.stop();
+                if let Some(player) = current.take() {
+                    player.stop();
                 }
                 schedule.set(steps);
             }
             Ok(Command::Cancel) => {
-                if let Some(sink) = current.take() {
-                    sink.stop();
+                if let Some(player) = current.take() {
+                    player.stop();
                 }
                 schedule.cancel();
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 for sound in schedule.pop_due() {
-                    current = start(&handle, sound).or(current);
+                    current = start(&stream, sound).or(current);
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -233,8 +231,7 @@ mod tests {
 
     // Расписанию содержимое не важно — два разных звука для сравнений.
     const A: Sound = Sound::from_bytes(crate::assets::STAGE_WAV);
-    const B: Sound = Sound::from_bytes(crate::assets::BUZZER_WAV
-);
+    const B: Sound = Sound::from_bytes(crate::assets::BUZZER_WAV);
 
     /// Заэмбеженные файлы декодируются (без звукового устройства);
     /// длительности из заголовков — против значений из спецификаций
@@ -247,8 +244,14 @@ mod tests {
             let decoder = rodio::Decoder::new(Cursor::new(sound.bytes)).unwrap();
             let decoded_ms = decoder.total_duration().unwrap().as_millis() as i64;
             let header_ms = sound.duration().as_millis() as i64;
-            assert!((header_ms - want_ms).abs() <= 2, "header {header_ms} ms, expected ~{want_ms}");
-            assert!((decoded_ms - want_ms).abs() <= 2, "decoded {decoded_ms} ms, expected ~{want_ms}");
+            assert!(
+                (header_ms - want_ms).abs() <= 2,
+                "header {header_ms} ms, expected ~{want_ms}"
+            );
+            assert!(
+                (decoded_ms - want_ms).abs() <= 2,
+                "decoded {decoded_ms} ms, expected ~{want_ms}"
+            );
         }
     }
 

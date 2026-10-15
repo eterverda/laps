@@ -145,7 +145,7 @@ impl Letterbox {
             }
         }
 
-        let area_id = ui.id().with("letterbox_area");
+        let area_id = ui.scope_id().with("letterbox_area");
         let area = egui::Area::new(area_id)
             .movable(false)
             .interactable(true)

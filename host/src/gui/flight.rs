@@ -1260,7 +1260,6 @@ impl Flight {
         self.screen = Screen::DvrOpening;
     }
 
-
     /// Cold-вход: последний журнал из `captures/` парсится и
     /// реконструируется в память → warm. false — журнала нет.
     fn open_dvr_cold(&mut self, ctx: &egui::Context) -> bool {
@@ -1414,14 +1413,14 @@ impl Flight {
 }
 
 /// Наборы цветов кнопок (см. colors-table.html): два цвета на кнопку —
-/// яркий (активный фон) и неяркий (покой; выключенный = неяркий × 0.5
+/// яркий (активный фон) и неяркий (покой; выключенный = неяркий × 0.35
 /// альфой). EXIT — холодный серый, транспорт — тёплый пластик, REC —
 /// алый, RACE — кислотный.
 const EXIT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xAE, 0xBE, 0xC8);
 const EXIT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x5A, 0x63);
 const TRANSPORT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xE2, 0xCE);
 const TRANSPORT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6A, 0x66, 0x56);
-const REC_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xAD, 0x2A, 0x2F);
+const REC_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xEA, 0x31, 0x23);
 const REC_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x42, 0x3C);
 const RACE_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xC8, 0xF5, 0x00);
 const RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x75, 0x77, 0x48);

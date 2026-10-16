@@ -416,6 +416,15 @@ impl Flight {
                     };
                     contents.insert(id.clone(), kind);
                 }
+                // Камеры без файла в DVR (запись не состоялась): плеера
+                // нет — красный плюс по центру, как у мёртвой камеры.
+                if matches!(self.screen, Screen::Dvr) {
+                    for id in self.active_cameras.keys() {
+                        if !contents.contains_key(id) {
+                            contents.insert(id.clone(), viewfinder::ViewfinderContents::Error);
+                        }
+                    }
+                }
 
                 // Alt: разрешения для значков вьюфайндеров (мёртвый
                 // поток/нет плеера → error).
@@ -1029,30 +1038,26 @@ impl Flight {
         }
     }
 
-    /// Часы DVR в журнальном домене: (старт первой камеры, позиция,
-    /// финиш последней). Без рамки журнала — файловый домен
-    /// (0, позиция, длительность).
+    /// Часы DVR в журнальном домене: (старт, позиция, конец). Полоска
+    /// — окно записи (REC on → REC off); файлы лежат на ней по первым
+    /// кадрам. Без журнала — файловый домен (0, позиция, длительность);
+    /// журнал без окна записи (старые форматы) — экстент (0, 0, end).
     fn dvr_clock(&self, clip: &Option<RaceClip>) -> (u64, u64, u64) {
         match clip {
-            Some(clip) if !clip.recordings.is_empty() => {
-                let mut start = u64::MAX;
-                let mut pos = 0u64;
-                let mut end = 0u64;
+            Some(clip) => {
+                let (lo, hi) = clip.recording.unwrap_or_else(|| {
+                    let lo = clip.files.values().map(|(_, ms)| *ms).min().unwrap_or(0);
+                    (lo, clip.end_ms().unwrap_or(lo))
+                });
+                let mut pos = lo;
                 for (id, p) in &self.players {
-                    let Some((_, rec_ms)) = clip.recordings.get(id) else {
-                        continue;
-                    };
-                    start = start.min(*rec_ms);
-                    end = end.max(rec_ms + p.duration());
-                    pos = pos.max(rec_ms + p.position());
+                    if let Some((_, file_ms)) = clip.files.get(id) {
+                        pos = pos.max(file_ms + p.position());
+                    }
                 }
-                if start == u64::MAX {
-                    (0, 0, 0)
-                } else {
-                    (start, pos.clamp(start, end.max(start)), end)
-                }
+                (lo, pos.clamp(lo, hi.max(lo)), hi)
             }
-            _ => {
+            None => {
                 let pos = self
                     .players
                     .values()
@@ -1081,9 +1086,9 @@ impl Flight {
     /// journal-ms первого кадра камеры (ноль её файла).
     fn clip_rec_ms(clip: &Option<RaceClip>, camera_id: &str) -> Option<u64> {
         clip.as_ref()?
-            .recordings
+            .files
             .get(camera_id)
-            .map(|(_, rec_ms)| *rec_ms)
+            .map(|(_, file_ms)| *file_ms)
     }
 
     /// В этой точке таймлайна у камеры нет записи: файл ещё не начался
@@ -1095,9 +1100,9 @@ impl Flight {
         journal_pos: u64,
     ) -> bool {
         match clip {
-            Some(clip) => match (clip.recordings.get(camera_id), players.get(camera_id)) {
-                (Some((_, rec_ms)), Some(p)) => {
-                    journal_pos < *rec_ms || journal_pos >= rec_ms + p.duration()
+            Some(clip) => match (clip.files.get(camera_id), players.get(camera_id)) {
+                (Some((_, file_ms)), Some(p)) => {
+                    journal_pos < *file_ms || journal_pos >= file_ms + p.duration()
                 }
                 _ => false,
             },
@@ -1263,19 +1268,20 @@ impl Flight {
     /// Cold-вход: последний журнал из `captures/` парсится и
     /// реконструируется в память → warm. false — журнала нет.
     fn open_dvr_cold(&mut self, ctx: &egui::Context) -> bool {
-        let Some(journal) =
+        let Some((header, events)) =
             scrub::latest_journal(std::path::Path::new(crate::driver::dvr::CAPTURES_DIR))
                 .and_then(|path| std::fs::read_to_string(&path).ok())
                 .map(|yaml| Journal::parse_stream(&yaml))
-                .and_then(|events| {
-                    // Якорь — now минус последняя метка: события лежат на
-                    // своих относительных позициях.
-                    let last_ms = events.iter().map(|(ms, _)| *ms).max().unwrap_or(0);
-                    Journal::from_ms_events(Instant::now() - Duration::from_millis(last_ms), events)
-                })
         else {
             return false;
         };
+        let Some(header) = header else {
+            return false;
+        };
+        let mut journal = Journal::new(header.date_time, header.pads, header.assignments);
+        for (ms, event) in events {
+            journal.push(ms, event);
+        }
         self.open_dvr_warm(ctx, journal);
         true
     }
@@ -1285,7 +1291,7 @@ impl Flight {
     fn open_dvr_players(&mut self, ctx: &egui::Context, clip: &crate::model::flight::RaceClip) {
         let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
         let mut opened = 0;
-        for (camera_id, (filename, _)) in &clip.recordings {
+        for (camera_id, (filename, _)) in &clip.files {
             let path = dir.join(filename);
             if path.exists() {
                 self.players
@@ -1295,7 +1301,9 @@ impl Flight {
                 log::warn!("flight: recording of {camera_id} missing: {path:?}");
             }
         }
-        if opened > 0 {
+        if opened > 0 || !clip.files.is_empty() {
+            // Рамка есть: открываем ровно её файлы. Камеры без файла —
+            // без плеера (GUI рисует Error).
             return;
         }
         if let Some(captures) = &self.captures {

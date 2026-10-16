@@ -88,6 +88,13 @@ impl DvrSink {
             Ok(recorder) => self.recorder = Some(recorder),
             Err(e) => {
                 log::error!("dvr: recording unavailable: {}", e);
+                // Явный сброс: стейт прошлой сессии (fps, first_frame_at)
+                // не должен оседать в RecordState мёртвой записи.
+                self.state.store(crate::driver::dvr::RecordState {
+                    ok: false,
+                    fps: 0.0,
+                    first_frame_at: None,
+                });
                 self.recorder = None;
             }
         }

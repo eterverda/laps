@@ -1,8 +1,13 @@
-use std::time::Duration;
+//! Правила гонки: чистые данные и вычисления старта/длительности.
+//! Ничего про течение гонки (состояния, запись, журнал) — это сервис
+//! `service::race`.
+
+use std::time::{Duration, Instant};
 
 /// Сигнал старта: случайная пауза в [min, max) между последним бипом
 /// отсчёта и гудком. Единственный вариант — рандом (как в laps-bar/
 /// laps-trainer): точный момент старта заранее неизвестен.
+#[derive(Clone, Copy)]
 pub struct StartSignalDelay {
     min: Duration,
     max: Duration,
@@ -29,18 +34,32 @@ impl Default for StartSignalDelay {
     }
 }
 
+#[derive(Clone, Copy, Default)]
 pub struct RaceRules {
     pub start_signal_delay: StartSignalDelay,
-    pub duration: Duration,
+    /// Лимит длительности гонки. None — без лимита: гонка идёт, пока
+    /// её не завершат (RACE/REC/EXIT).
+    pub duration: Option<Duration>,
 }
 
-impl Default for RaceRules {
-    fn default() -> Self {
-        RaceRules {
-            duration: Duration::from_secs(15),
-            start_signal_delay: Default::default(),
-        }
+/// Число бипов отсчёта перед стартовой паузой.
+pub const PRE_BEEP_SECS: u64 = 3;
+
+/// Пауза для конкретного старта: равномерный выбор в [min_delay,
+/// max_delay); вырожденный случай (min == max) — само значение.
+pub(crate) fn sample_start_delay(signal: &StartSignalDelay) -> Duration {
+    let min = signal.min();
+    let span = signal.max().saturating_sub(min).as_millis() as u64;
+    if span == 0 {
+        return min;
     }
+    min + Duration::from_millis(rand::random_range(0..span))
+}
+
+/// Момент фактического старта гонки: конец отсчёта + длина гудка
+/// (счётчик стартует, когда гудок доиграл).
+pub(crate) fn race_time_start(start: Instant, delay: Duration, buzzer_len: Duration) -> Instant {
+    start + delay + buzzer_len
 }
 
 #[cfg(test)]

@@ -87,6 +87,7 @@ pub fn open_reader(path: &std::path::Path) -> io::Result<Box<dyn VideoReader>> {
 pub const CAPTURES_DIR: &str = "captures";
 
 /// Параметры записи одной камеры.
+#[derive(Debug, Clone)]
 pub struct RecordParams {
     pub dir: PathBuf,
     /// Стем имени файла целиком (журнал полёта + camera_id + порядковый

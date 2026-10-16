@@ -22,6 +22,10 @@ pub const SEEK_CLICK_MAX: std::time::Duration = std::time::Duration::from_millis
 pub const SEEK_RELEASE_RAMP: Duration = Duration::from_millis(500);
 /// Накопленный скролл, дающий один шаг по шкале скорости.
 pub const SCROLL_STEP: f32 = 50.0;
+/// Минимальная ширина сосиски повтора, физические пиксели. Уже —
+/// растягиваем: внутри растянутой сосиски голова (и drag) идут по
+/// локальному скейлу круга, а не записи.
+pub const CIRCLE_MIN_WIDTH_PX: f32 = 24.0;
 /// Непрерывная тишина скролла, после которой следующий жест снова
 /// даёт шаг по шкале. 300 мс — по аналогии с double-tap time
 /// (Android ViewConfiguration / Windows).
@@ -34,11 +38,12 @@ const HSCROLL_RELEASE: std::time::Duration = std::time::Duration::from_millis(20
 /// пальца. Осознанно фиксирован: не зависит от длины записи (бар при
 /// этом перестаёт отображать файл 1:1 — палец и кружок расходятся).
 const HSCROLL_MS_PER_PX: f32 = 100.0;
-/// Шкалы скоростей (скролл над контролом ходит по ним: вверх — к
-/// началу списка, вниз — к концу). Начальные: 10x, 100%, ±1.0s.
-pub const SEEK_SPEEDS: [i32; 6] = [20, 15, 10, 7, 5, 3];
+/// Шкалы скоростей (скролл над контролом: вверх — быстрее/больше,
+/// вниз — медленнее/меньше; списки по возрастанию, сдвиг единый).
+/// Начальные: 10x, 100%, ±1.0s.
+pub const SEEK_SPEEDS: [i32; 6] = [3, 5, 7, 10, 15, 20];
 pub const PLAY_SPEEDS: [i32; 7] = [25, 50, 75, 100, 125, 150, 200];
-pub const RPT_SIZES: [f32; 3] = [0.5, 1.0, 1.5];
+pub const RPT_SIZES: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
 
 /// Последний по имени файл записи камеры: `{anything}-{camera_id}-mjpeg`
 /// + любой из поддержанных контейнеров. Таймстамп-префикс сортируется
@@ -113,7 +118,12 @@ impl Timeline {
         frac: f32,
         dur_ms: u64,
         window: Option<(f32, f32)>,
+        // circle: доли (начало, конец) капсулы круга как нарисовано
+        // (после растяжения до минимума — см. CIRCLE_MIN_WIDTH_PX).
         circle: Option<(f32, f32)>,
+        // circle_real: доли (начало, конец) реального круга до растяжения
+        // — для обратного маппинга seek'а внутри растянутой капсулы.
+        circle_real: Option<(f32, f32)>,
         // Акцентный цвет: каретка и активный фрагмент трека. Белый у
         // scrub, слоновая кость (активный транспортный) у flight.
         knob: egui::Color32,
@@ -150,11 +160,12 @@ impl Timeline {
                 // таскает всю конструкцию: seek ставит позицию под
                 // курсор, центр круга встаёт на позицию.
                 let cap_r = knob_r * 1.4;
-                // Стадион: центры полуовалов — в точках круга lo/hi
-                // (расстояние центров = диаметр круга), овалы выпирают
-                // за них на радиус. Вырождение lo==hi — ровно кружок,
-                // отдельный минимум не нужен. Сначала — чёрное «эхо»
-                // чуть большего диаметра: выделяет каретку на треке.
+                // Стадион: центры полуовалов — в точках круга lo/hi,
+                // овалы выпирают за них на радиус. Хозяин растягивает
+                // капсулу до CIRCLE_MIN_WIDTH_PX, так что lo==hi здесь
+                // бывает лишь если таймлайн уже минимума — вырождение
+                // в кружок. Сначала — чёрное «эхо» чуть большего
+                // диаметра: выделяет каретку на треке.
                 let echo = knob_r * 0.4;
                 let x0 = x(lo);
                 let x1 = x(hi);
@@ -245,8 +256,16 @@ impl Timeline {
                 .last_seek
                 .is_none_or(|last| (pointer - last).length() > 1.0 / ui.ctx().pixels_per_point());
             if moved || !down {
-                let t = (((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * dur_ms as f32)
-                    as u64;
+                let p = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                let mut t = (p * dur_ms as f32) as u64;
+                // Растянутая сосиска: внутри неё seek идёт по скейлу
+                // круга (обратный маппинг), а не записи.
+                if let (Some((nlo, nhi)), Some((rlo, rhi))) = (circle, circle_real) {
+                    if p >= nlo && p <= nhi && (nhi - nlo) > f32::EPSILON {
+                        let inner = ((p - nlo) / (nhi - nlo)).clamp(0.0, 1.0);
+                        t = ((rlo + inner * (rhi - rlo)).clamp(0.0, 1.0) * dur_ms as f32) as u64;
+                    }
+                }
                 events.push(TimelineEvent::Seek(t));
                 ui.ctx().request_repaint();
                 self.last_seek = Some(pointer);

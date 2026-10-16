@@ -115,16 +115,27 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   `jpeg-encoder`/`memchr` = 3, `yuv`/`epaint` = 2) instead of optimizing
   our own crate in dev
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) signaled
-  UI-ward via `crossbeam_utils::AtomicCell`. Кнопки LIVE/REC/RACE в
-  live-экране живут в общей машине состояний экрана Flight
-  (`gui/flight.rs`): LiveBefore → RecordHead → RaceCountdown →
-  Race → RecordTail → DvrOpening → Dvr; до старта гонки отжатия шагают
-  назад, после — только вперёд
+  UI-ward via `crossbeam_utils::AtomicCell`
+- **Гоночное ядро** (сервис `service::race`; чистое ядро `RaceCore`,
+  тесты на FakeClock по образцу `Playhead`): фазы эфира LiveBefore →
+  RecordHead → RaceCountdown → Race → RecordTail → Finished; часы гонки
+  (отсчёт, авто-финиш по лимиту), политика записи (старт/стоп/abort),
+  журнал (события + файл). Намерения (`Intent`: RecPressed/RacePressed/Exit)
+  → решения; решения возвращаются эффектами (`Effect`) — ядро без IO.
+  Поток-обёртка (`service::race::spawn`) исполняет эффекты (команды рекордерам
+  через `Camera::recorder()` — отделённый хэндл, звук), поллит
+  `first_frame_at` и шлёт GUI `Notice::State` (при изменении) /
+  `EnterDvr`. Правила гонки (сигнал старта, отсчёт, длительность) —
+  `model::rules` (`RaceRules.duration: Option`, None — без авто-финиша).
+  GUI (`gui/flight.rs`) — только намерения и рендер снапшота `AirState`,
+  гоночного стейта не имеет; до старта гонки отжатия шагают назад,
+  после — только вперёд
 - Инварианты переходов: `race-started` в журнале всегда с парным
   `race-finished` (лимит, RACE-кнопка, REC-стоп в Race, EXIT из Race);
   записи вне гонки удаляются (abort) на любом пути — REC-off до старта,
-  отмена отсчёта, EXIT из RecordHead/RaceCountdown (`Flight::teardown`
-  доводит машину до целостности при выходе)
+  отмена отсчёта, EXIT из RecordHead/RaceCountdown (`RaceCore::exit`
+  доводит машину до целостности). Порядок «журнал раньше уведомления
+  GUI» — контракт обёртки: экран не врёт файлу
 
 ## Video Recording (DVR)
 
@@ -149,8 +160,8 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
     `ContainerConfig` in `Recorder::start` (mkv → MkvWriter, mov/mp4 →
     IsobmffWriter::create_mov/create_mp4)
 - One file per recording start; **no segment rotation** (documented gap)
-- Стем имён файлов — `date_time` первого события `FlightJournal` (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
-- Журнал полёта (`model/flight.rs`): yaml-стрим `captures/<stem>.yaml` — документ на эвент (`{t_ms, <variant>: …}`), разделители `---`; пишется инкрементально по мере эвентов (`Flight::journal_push`), файл создаётся только при старте гонки (первым документом JournalStarted, до старта — события в памяти, без гонки файла нет) и закрывается при входе в DVR; метки — мс от старта журнала; `RecordingStarted` — по новому значению `RecordState.first_frame_at` (момент из `Frame::timestamp`, ставится в `DvrSink::on_frame`), имя файла сессии привязывается FIFO-очередью стартов (`rec_pending`), по камере журналируются все сессии; события RecordingStarted до старта гонки откладываются (`rec_deferred`) и пишутся с исходными таймстампами в момент старта гонки, при отмене записи без гонки / входе в DVR выбрасываются; `RaceFinished.prematurely`: true — кнопкой, false — лимитом длительности
+- Стем имён файлов — `date_time` первого события журнала (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
+- Журнал полёта (`model::flight::Journal`, единый тип: события + буфер стрима + путь): yaml-стрим `captures/<stem>.yaml` — документ на эвент (`{ms, <variant>: …}`), разделители `---`; владение — фазовое: в эфире журнал внутри RaceCore (он единственный писатель), файл открывается `open_file` только при старте гонки (до старта — события в памяти, без гонки файла нет), при закрытии гонки ядро шлёт `Notice::EnterDvr { journal }` и владение переходит в GUI (`Flight.journal: Option<Journal>`): правки DVR (`retain` — добавление/удаление событий) — там же, файл переписывается атомарно (`<stem>.yaml~` + rename). Метки — мс от старта журнала; `RecordingStarted` — по новому значению `RecordState.first_frame_at` (момент из `Frame::timestamp`, ставится в `DvrSink::on_frame`, поллит поток-обёртка), имя файла сессии привязывается FIFO-очередью стартов (`rec_pending` в ядре); события RecordingStarted до старта гонки откладываются и пишутся с исходными таймстампами в момент старта гонки, при отмене записи без гонки выбрасываются; `RaceFinished.prematurely`: true — кнопкой/выходом, false — лимитом длительности/REC-стопом
 - Writer thread + bounded channel (64): overflow = dropped frame + warn
 - Abort записи: `Recorder::abort()` (команда `Camera::abort_recording`, sink `DvrSink::abort()`) ставит флаг; writer после finalize **удаляет файл** (`RecordParams.stem` — полный стем с camera_id и номером сессии). Flight: `stop_recording_all(commit)`, commit = `race_started()` — записи вне гонки удаляются, гоночные остаются
   (capture outranks recording); periodic sync every 5 s; `Drop` detaches
@@ -166,13 +177,14 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 ## Video Playback
 
 - **Scrub mode** (`laps scrub`): playback of the last **race** from
-  `captures/` — источник истины журнал, не файлы. Прямой переход
-  (REC стоп после гонки → DVR): рамка гонки `RaceClip` собирается из
-  журнала **в памяти** (`race_clip(journal.iter_ms())`), плееры
-  открывают видео из `recording-started` (файл переиндексируется
-  плеером как раньше). Холодный вход (`Mode::Dvr` из меню): парсится
-  последний yaml-стрим (`scrub::latest_journal` →
-  `FlightJournal::parse_stream` → `race_clip`); журнала нет —
+  `captures/` — источник истины журнал, не файлы. Три режима входа:
+  **cold** — журнал парсится из файла и реконструируется в память
+  (`open_dvr_cold` → `Journal::from_ms_events`); **warm** — готовый
+  журнал в памяти, плееры строят видеоиндексы при открытии (воронка
+  `open_dvr_warm`: прямой переход REC-стоп после гонки — рамка
+  `RaceClip` из `race_clip(journal.iter_ms())`, плееры открывают видео
+  из `recording-started`); **hot** (будущее) — журнал и индексы уже
+  в памяти, открытие файлов не нужно. Холодный вход без журнала —
   деградация на прежние `latest_capture`. Таймлайн — в журнальном
   домене: от старта первой камеры (`recording-started`) до финиша
   последней (`rec_ms + duration`); seek'и — в журнальных мс с переводом

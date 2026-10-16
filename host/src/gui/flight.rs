@@ -1,19 +1,19 @@
-//! Экран Flight: совмещает live (трансляция/запись/гонка) и scrub
-//! (просмотр записи). Финал — режим DVR: запись остановлена, захват
-//! погашен, вьюфайндеры показывают только что записанное, работают
-//! транспорт и таймлайн. Вход — сразу в эфире (Idle нет), выход —
-//! только EXIT (в меню).
+//! Экран Flight: совмещает эфир (трансляция/запись/гонка) и DVR
+//! (просмотр записи: транспорт, таймлайн, круг повтора). Режим входа —
+//! Live (сразу эфир) или Dvr (сразу просмотр, CLI `laps scrub`). Выход —
+//! EXIT в меню. Гоночное состояние живёт в потоке ядра
+//! (model::rules + service::race), экран — намерения и рендер снапшотов.
 
 use super::ruler::{self, IntoRuler};
 use super::*;
-use crate::config::camera::{CameraConfig, ContainerConfig};
+use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
-use crate::driver::audio;
 use crate::driver::camera::CaptureState;
 use crate::driver::player::{Player, PlayerState};
-use crate::model::flight::{FlightEvent, FlightJournal, file_stem};
+use crate::model::flight::{Journal, RaceClip, race_clip};
 use crate::model::pilot::Pilot;
-use crate::model::race::{RaceRules, StartSignalDelay};
+use crate::model::rules::RaceRules;
+use crate::service::race::{self, AirPhase, AirState, Intent, Notice, Race};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -38,127 +38,14 @@ pub fn viewfinder_cols(count: usize) -> isize {
     viewfinder_rows(count) * 8 / 3
 }
 
-/// Фазы экрана. rec_since RecordTail и live_since Dvr — задел под
-/// таймеры DVR-режима, пока не читаются.
-#[allow(dead_code)]
-/// Живая часть — как Session у live (без Idle и LiveAfter):
-/// отжатие записи ведёт в DVR, отмены до старта гонки шагают назад.
-/// DVR — транзит загрузки плееров и режим просмотра (стейты плеера
-/// внутри worker'ов, тут только факт открытия).
-#[derive(Clone, Copy, Debug)]
-enum Phase {
-    /// Эфир без записи (стартовая фаза — экран входит сразу сюда).
-    LiveBefore { live_since: Instant },
-    RecordHead {
-        live_since: Instant,
-        rec_since: Instant,
-    },
-    RaceCountdown {
-        live_since: Instant,
-        rec_since: Instant,
-        start: Instant,
-        delay: Duration,
-    },
-    Race {
-        live_since: Instant,
-        rec_since: Instant,
-        start: Instant,
-    },
-    /// Гонка кончилась, запись хвоста продолжается; race — замороженное
-    /// время гонки для счётчика.
-    RecordTail {
-        live_since: Instant,
-        rec_since: Instant,
-        race: Duration,
-    },
-    /// Транзит: захват погашен, плееры открывают запись.
-    DvrOpening { live_since: Instant },
-    /// Просмотр записи: транспорт, таймлайн, счётчик позиции.
-    Dvr { live_since: Instant },
-}
-
-impl Phase {
-    fn rec_on(&self) -> bool {
-        matches!(
-            self,
-            Phase::RecordHead { .. }
-                | Phase::RaceCountdown { .. }
-                | Phase::Race { .. }
-                | Phase::RecordTail { .. }
-        )
-    }
-
-    /// Отсчёт идёт (мигающий счётчик).
-    fn countdown(&self) -> bool {
-        matches!(self, Phase::RaceCountdown { .. })
-    }
-
-    /// REC кликабельна: с эфира до конца хвоста.
-    fn rec_available(&self) -> bool {
-        matches!(
-            self,
-            Phase::LiveBefore { .. }
-                | Phase::RecordHead { .. }
-                | Phase::RaceCountdown { .. }
-                | Phase::Race { .. }
-                | Phase::RecordTail { .. }
-        )
-    }
-
-    /// RACE кликабельна: нажатие до старта, отжатие в Countdown/Race.
-    fn race_available(&self) -> bool {
-        matches!(
-            self,
-            Phase::LiveBefore { .. }
-                | Phase::RecordHead { .. }
-                | Phase::RaceCountdown { .. }
-                | Phase::Race { .. }
-        )
-    }
-
-    /// Гонка началась (или дальше по фазам): записи относятся к ней.
-    fn race_started(&self) -> bool {
-        matches!(
-            self,
-            Phase::Race { .. }
-                | Phase::RecordTail { .. }
-                | Phase::DvrOpening { .. }
-                | Phase::Dvr { .. }
-        )
-    }
-
-    /// Просмотр записи (транзит открытия плееров не считается).
-    fn is_dvr(&self) -> bool {
-        matches!(self, Phase::Dvr { .. })
-    }
-
-    /// Время гонки для счётчика: бежит в Race, заморожено после.
-    fn race_elapsed(&self, now: Instant) -> Duration {
-        match *self {
-            Phase::Race { start, .. } => now.saturating_duration_since(start),
-            Phase::RecordTail { race, .. } => race,
-            Phase::DvrOpening { .. } | Phase::Dvr { .. } => {
-                // В Dvr счётчик — позиция плеера; гоночное время не нужно.
-                Duration::ZERO
-            }
-            _ => Duration::ZERO,
-        }
-    }
-}
-
-/// Звуки гонки: бинари — в `assets`.
-const STAGE: audio::Sound = audio::Sound::from_bytes(crate::assets::STAGE_WAV);
-const BUZZER: audio::Sound = audio::Sound::from_bytes(crate::assets::BUZZER_WAV);
-
-/// Фиксированная фаза бипов отсчёта: PRE_BEEP_SECS бипов с периодом
-/// 1 с, затем случайный интервал из StartSignalDelay, затем гудок.
-const PRE_BEEP_SECS: u64 = 3;
-
-/// Момент начала времени гонки: конец отсчёта + длина гудка. До него
-/// счётчик мигает, на нём — гаснет последняя фаза ПОГАС и дальше ГОРИТ
-/// И ТИКАЕТ.
-fn race_time_start(start: Instant, delay: Duration) -> Instant {
-    start + delay + BUZZER.duration()
+/// Экранный режим: эфир (зеркало состояния гоночного ядра) или DVR
+/// (транзит открытия плееров и просмотр). Гоночные фазы живут в ядре
+/// (service::race), здесь — только отображение.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Air,
+    DvrOpening,
+    Dvr,
 }
 
 /// Режим входа: Live — сразу в эфире (главный экран), Dvr — сразу
@@ -170,11 +57,16 @@ pub enum Mode {
 }
 
 pub struct Flight {
-    phase: Phase,
+    /// Экранный режим (эфир/DVR). Гоночные фазы — в ядре, здесь только
+    /// последний снапшот для рендера.
+    screen: Screen,
+    air: AirState,
+    /// Гоночный поток: намерения туда, уведомления оттуда. None —
+    /// холодный режим DVR (гонки не было).
+    race: Option<Race>,
     webcams: HashMap<String, crate::driver::camera::Camera>,
     awake: Option<keepawake::KeepAwake>,
     rules: RaceRules,
-    audio: crate::driver::audio::Audio,
     /// Каталог записей (None — без CLI-аргумента scrub): для DVR-режима.
     captures: Option<PathBuf>,
     /// camera_id → плеер записи (DVR-режим).
@@ -190,35 +82,17 @@ pub struct Flight {
     vscroll: scrub::ScrollGate,
     hscroll: scrub::HScroll,
     res: Option<Res>,
-    /// Удалённая команда exit — нажатие EXIT между кадрами: update
-    /// переводит её в Action::Exit.
+    /// Запрошен выход (remote/кнопка/⌘W): ядру Intent::Exit уходит
+    /// сразу, флаг — для навигации в меню из update (нужен Navigator).
     exit_requested: bool,
     header: header::Header,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
     active_cameras: HashMap<String, CameraConfig>,
-    /// Журнал полёта: события эфира; yaml-стрим (документ на эвент)
-    /// пишется инкрементально, файл закрывается при входе в DVR.
-    journal: FlightJournal,
-    /// Файл стрима журнала: None — писать некуда, эвенты живут в памяти.
-    journal_file: Option<crate::model::flight::JournalFile>,
-    /// Последнее известное first_frame_at по камерам: новое значение
-    /// (новый Instant после старта записи) — событие RecordingStarted.
-    rec_seen: HashMap<String, Option<Instant>>,
-    /// Порядковый номер сессии записи по камерам: имена файлов повторных
-    /// записей в одном полёте получают суффикс -r2, -r3, …
-    rec_count: HashMap<String, u32>,
-    /// Имена файлов открытых сессий записи по камерам (FIFO): сессия
-    /// привязывается к первому кадру по порядку стартов.
-    rec_pending: HashMap<String, std::collections::VecDeque<String>>,
-    /// Отложенные RecordingStarted (запись головы до старта гонки):
-    /// сбрасываются в журнал в момент старта гонки (с исходными
-    /// таймстампами), при отмене записи до гонки — выбрасываются.
-    rec_deferred: Vec<(Instant, FlightEvent)>,
-    /// Рамка гонки в DVR (из журнала): какие файлы открыты и границы
-    /// вылета. None — журнала нет (холодный вход без yaml): скраббинг
-    /// без белой полоски и знаков +/- на TIMER.
-    dvr_clip: Option<crate::model::flight::RaceClip>,
+    /// Журнал полёта — владение в GUI: приходит с EnterDvr от ядра
+    /// (прямой путь) или парсится из файла (холодный вход). Правки DVR
+    /// (добавление/удаление событий) — здесь.
+    journal: Option<Journal>,
 }
 
 impl From<Box<Flight>> for State {
@@ -278,20 +152,21 @@ impl Flight {
             .take(MAX_PADS)
             .collect();
         let mut this = Self {
-            phase: if mode == Mode::Dvr {
-                Phase::DvrOpening {
-                    live_since: Instant::now(),
-                }
+            screen: if mode == Mode::Dvr {
+                Screen::DvrOpening
             } else {
-                Phase::LiveBefore {
-                    live_since: Instant::now(),
-                }
+                Screen::Air
             },
-            journal: Self::new_journal(&setup, &assignments),
+            air: AirState {
+                phase: AirPhase::LiveBefore,
+                countdown_end: None,
+                race: None,
+                race_done: None,
+            },
+            race: None,
             webcams: HashMap::new(),
             awake: None,
             rules,
-            audio: crate::driver::audio::Audio::spawn(),
             captures,
             players: HashMap::new(),
             timeline: scrub::Timeline::new(),
@@ -308,100 +183,36 @@ impl Flight {
             setup,
             assignments,
             active_cameras,
-            rec_seen: HashMap::new(),
-            rec_count: HashMap::new(),
-            rec_pending: HashMap::new(),
-            rec_deferred: Vec::new(),
-            journal_file: None,
-            dvr_clip: None,
+            journal: None,
         };
         if mode == Mode::Live {
             this.start_captures(ctx);
             this.screen_awake();
+            // Гоночный поток: ядро (часы, политика записи, журнал) плюс
+            // исполнение эффектов (команды рекордерам, звук).
+            let recorders: HashMap<_, _> = this
+                .webcams
+                .iter()
+                .map(|(id, camera)| (id.clone(), camera.recorder()))
+                .collect();
+            this.race = Some(race::spawn(
+                this.rules,
+                std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR),
+                this.setup.pads.clone(),
+                this.assignments.clone(),
+                this.active_cameras.clone(),
+                recorders,
+            ));
         } else {
             // Холодный вход в скраббинг: рамка гонки — из последнего
-            // журнала (парсим файл); журнала нет — пустая рамка,
-            // open_dvr_players деградирует на последние записи камер.
-            let clip =
-                scrub::latest_journal(std::path::Path::new(crate::driver::dvr::CAPTURES_DIR))
-                    .and_then(|path| std::fs::read_to_string(&path).ok())
-                    .map(|yaml| {
-                        let events = crate::model::flight::FlightJournal::parse_stream(&yaml);
-                        crate::model::flight::race_clip(events.iter().map(|(ms, e)| (*ms, e)))
-                    })
-                    .unwrap_or_default();
-            this.enter_dvr_with(ctx, Instant::now(), clip);
+            // Cold-вход: журнал парсится из файла, дальше — как warm.
+            // Журнала нет: деградация на последние записи камер.
+            if !this.open_dvr_cold(ctx) {
+                this.open_dvr_players(ctx, &RaceClip::default());
+                this.screen = Screen::DvrOpening;
+            }
         }
         this
-    }
-
-    /// Журнал полёта: первый эвент — JournalStarted с date_time; он же
-    /// источник стема имён файлов записи.
-    fn new_journal(setup: &Setup, assignments: &HashMap<String, Pilot>) -> FlightJournal {
-        let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
-            log::warn!("flight: local time unavailable, journal falls back to UTC");
-            time::OffsetDateTime::now_utc()
-        });
-        FlightJournal::new(
-            Instant::now(),
-            date_time,
-            setup.pads.clone(),
-            assignments.clone(),
-        )
-    }
-
-    /// Стем файлов записи: date_time первого события журнала.
-    fn stem(&self) -> String {
-        file_stem(self.journal.date_time())
-    }
-
-    /// Эвент в журнал: память + документ в стрим.
-    fn journal_push(&mut self, at: Instant, event: FlightEvent) {
-        if let Some(file) = &mut self.journal_file {
-            file.append(&self.journal, at, &event);
-        }
-        self.journal.push(at, event);
-    }
-
-    /// События записи: новое значение first_frame_at (первый кадр
-    /// очередной сессии) — RecordingStarted с именем её файла (FIFO
-    /// сессий по камере). До старта гонки событие откладывается
-    /// (rec_deferred), после — пишется сразу.
-    fn journal_tick(&mut self) {
-        // Сначала сбор (заимствование &self.webcams), пуши — после цикла.
-        let mut ready: Vec<(Instant, String, String)> = Vec::new();
-        for (id, webcam) in &self.webcams {
-            let cur = webcam.record_state().first_frame_at;
-            let seen = self.rec_seen.get(id).copied().flatten();
-            if let Some(at) = cur {
-                if seen != Some(at) {
-                    match self.rec_pending.get_mut(id).and_then(|q| q.pop_front()) {
-                        Some(filename) => ready.push((at, id.clone(), filename)),
-                        None => log::warn!("flight: first frame of {id} without pending filename"),
-                    }
-                }
-            }
-            self.rec_seen.insert(id.clone(), cur);
-        }
-        for (at, camera_id, filename) in ready {
-            let event = FlightEvent::RecordingStarted {
-                camera_id,
-                filename,
-            };
-            if self.phase.race_started() {
-                self.journal_push(at, event);
-            } else {
-                self.rec_deferred.push((at, event));
-            }
-        }
-    }
-
-    /// Отложенные RecordingStarted — в журнал (вызывается при старте
-    /// гонки, таймстампы исходные, порядок хронологический).
-    fn flush_rec_deferred(&mut self) {
-        for (at, event) in std::mem::take(&mut self.rec_deferred) {
-            self.journal_push(at, event);
-        }
     }
 
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
@@ -413,8 +224,21 @@ impl Flight {
         if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::W)) {
             action = Action::Exit;
         }
-        self.phase_tick();
-        self.journal_tick();
+        // Уведомления гоночного ядра: снапшоты состояния и закрытие
+        // гонки (журнал переходит нам для DVR).
+        let mut pending = Vec::new();
+        if let Some(race) = &self.race {
+            while let Ok(notice) = race.notices.try_recv() {
+                pending.push(notice);
+            }
+        }
+        for notice in pending {
+            match notice {
+                Notice::State(air) => self.air = air,
+                Notice::EnterDvr { journal } => self.open_dvr_warm(ui.ctx(), journal),
+            }
+        }
+        self.dvr_tick();
         self.arm_race_repaint(ui.ctx());
         self.rew.flash = false;
         self.ff.flash = false;
@@ -422,10 +246,16 @@ impl Flight {
         let ctx = ui.ctx();
         self.res.get_or_insert_with(|| Res::new(ctx));
 
+        // Рамка гонки — производное от журнала (без отдельного кэша:
+        // правки журнала видны скраббингу немедленно).
+        let clip = self
+            .journal
+            .as_ref()
+            .map(|journal| race_clip(journal.iter_ms()));
         // Время DVR — до отрисовки: шкала под кнопками. Журнальный
         // домен: таймлайн — от старта первой камеры до финиша
         // последней; без рамки журнала — файловый домен (старт 0).
-        let (dvr_start, dvr_pos, dvr_end) = self.dvr_clock();
+        let (dvr_start, dvr_pos, dvr_end) = self.dvr_clock(&clip);
         let dvr_span = dvr_end.saturating_sub(dvr_start).max(1);
         let dvr_ready = self.dvr_ready();
 
@@ -444,7 +274,7 @@ impl Flight {
                 // Таймлайн (только DVR): рисуется раньше кнопок — под
                 // ними. Две клетки высотой, вся ширина, поля по 4
                 // колонки. Головка ходит центрами от края до края.
-                let dvr = self.phase.is_dvr();
+                let dvr = matches!(self.screen, Screen::Dvr);
                 let timeline_rect: egui::Rect = ui
                     .max_rect()
                     .into_ruler()
@@ -457,14 +287,12 @@ impl Flight {
                 if dvr && dvr_ready {
                     let frac = dvr_pos.saturating_sub(dvr_start) as f32 / dvr_span as f32;
                     // Круг зацикливания: доли (начало, конец) — для
-                    // индикатора-капсулы на головке.
-                    // Круг зацикливания: доли (начало, конец) — для
                     // индикатора-капсулы на головке. Геометрия круга —
                     // в файловых позициях плеера: в журнальный домен
                     // через rec_ms той же камеры.
                     let circle = self.players.iter().find_map(|(id, p)| {
                         let c = p.circle()?;
-                        let rec = self.clip_rec_ms(id).unwrap_or(0);
+                        let rec = Self::clip_rec_ms(&clip, id).unwrap_or(0);
                         let lo =
                             (rec + c.center.saturating_sub(c.radius)).saturating_sub(dvr_start);
                         let hi = (rec + c.center + c.radius)
@@ -472,10 +300,29 @@ impl Flight {
                             .saturating_sub(dvr_start);
                         Some((lo as f32 / dvr_span as f32, hi as f32 / dvr_span as f32))
                     });
+                    // Растяжение сосиски до минимума: реальный круг уже
+                    // минимума — капсула и голова идут по общему скейлу;
+                    // иначе капсула растягивается до CIRCLE_MIN_WIDTH_PX,
+                    // а внутри неё голова (и drag) течёт по локальному
+                    // скейлу круга.
+                    let min_w = (scrub::CIRCLE_MIN_WIDTH_PX
+                        / ui.ctx().pixels_per_point()
+                        / timeline_rect.width())
+                    .min(1.0);
+                    let (circle, circle_real, knob) = match circle {
+                        Some((lo, hi)) if hi - lo < min_w => {
+                            let center = ((lo + hi) / 2.0).clamp(min_w / 2.0, 1.0 - min_w / 2.0);
+                            let nlo = center - min_w / 2.0;
+                            let nhi = center + min_w / 2.0;
+                            let inner = ((frac - lo) / (hi - lo).max(f32::EPSILON)).clamp(0.0, 1.0);
+                            (Some((nlo, nhi)), Some((lo, hi)), nlo + inner * (nhi - nlo))
+                        }
+                        other => (other, None, frac),
+                    };
                     // Активный фрагмент (вылет) — границы гонки из
                     // журнала: белым, края трека 40%. Без рамки вся
                     // линия серая.
-                    let window = self.race_bounds().map(|(lo, hi)| {
+                    let window = Self::race_bounds(&clip).map(|(lo, hi)| {
                         (
                             lo.saturating_sub(dvr_start) as f32 / dvr_span as f32,
                             hi.min(dvr_end).saturating_sub(dvr_start) as f32 / dvr_span as f32,
@@ -485,10 +332,11 @@ impl Flight {
                     let (response, events) = self.timeline.show(
                         ui,
                         timeline_rect,
-                        frac,
+                        knob,
                         dvr_span,
                         window,
                         circle,
+                        circle_real,
                         TRANSPORT_ACTIVE,
                     );
                     for event in events {
@@ -504,8 +352,7 @@ impl Flight {
                                 // (ноль файла = первый кадр).
                                 let target = dvr_start + t;
                                 for (id, player) in self.players.iter() {
-                                    let file = self
-                                        .clip_rec_ms(id)
+                                    let file = Self::clip_rec_ms(&clip, id)
                                         .map_or(target, |rec| target.saturating_sub(rec));
                                     player.seek(file.min(player.duration()));
                                 }
@@ -518,7 +365,7 @@ impl Flight {
                         0.0
                     };
                     if let Some(ms) = self.hscroll.feed(dx, ui.ctx().pixels_per_point()) {
-                        self.seek_by(ms);
+                        self.seek_by(&clip, ms);
                     }
                     if self.hscroll.active() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -547,7 +394,12 @@ impl Flight {
                 let gaps: HashMap<String, bool> = self
                     .players
                     .keys()
-                    .map(|id| (id.clone(), self.clip_gap(id, dvr_pos)))
+                    .map(|id| {
+                        (
+                            id.clone(),
+                            Self::clip_gap(&clip, &self.players, id, dvr_pos),
+                        )
+                    })
                     .collect();
                 for (id, player) in self.players.iter_mut() {
                     player.update_frame();
@@ -705,8 +557,8 @@ impl Flight {
                 // по центру; EXIT — плашка с иконкой.
                 let y = ui.max_rect().bottom();
 
-                let rec_on = self.phase.rec_on();
-                let race_on = self.phase.countdown() || matches!(self.phase, Phase::Race { .. });
+                let rec_on = self.air.rec_on();
+                let race_on = self.air.countdown_active() || self.air.race.is_some();
                 // Иконки не меняются между стейтами — состояние видно
                 // цветом кнопки.
                 let rec_icon = "\u{f044a}";
@@ -775,7 +627,7 @@ impl Flight {
                     None
                 };
                 if let Some(r) = &rew_response {
-                    self.seek_tick(ui, r, true);
+                    self.seek_tick(ui, r, true, &clip);
                 }
                 let rew_lit = self.rew.lit() || rew_response.as_ref().is_some_and(|r| r.clicked());
                 view::TransportButton::new(
@@ -820,7 +672,7 @@ impl Flight {
                     None
                 };
                 if let Some(r) = &ff_response {
-                    self.seek_tick(ui, r, false);
+                    self.seek_tick(ui, r, false, &clip);
                 }
                 let ff_lit = self.ff.lit() || ff_response.as_ref().is_some_and(|r| r.clicked());
                 view::TransportButton::new(
@@ -852,8 +704,9 @@ impl Flight {
                 )
                 .paint(ui, rpt_rect);
 
-                // REC: цвета записи; жива с эфира до конца хвоста.
-                let rec_ok = self.phase.rec_available();
+                // REC: цвета записи; жива с эфира до конца хвоста. В
+                // холодном DVR нет гоночного потока — мертва.
+                let rec_ok = self.race.is_some() && self.air.rec_available();
                 let rec_response = if rec_ok {
                     Some(idle_btn(rec_icon).interact(
                         ui,
@@ -874,11 +727,14 @@ impl Flight {
                 )
                 .paint(ui, rec_rect);
                 if rec_response.as_ref().is_some_and(|r| r.clicked()) {
-                    self.toggle_rec(ui.ctx());
+                    if let Some(race) = &self.race {
+                        race.intent(Intent::RecPressed);
+                    }
                 }
 
-                // RACE: кислотная когда отсчёт/гонка.
-                let race_ok = self.phase.race_available();
+                // RACE: кислотная когда отсчёт/гонка. В холодном DVR
+                // нет гоночного потока — мертва.
+                let race_ok = self.race.is_some() && self.air.race_available();
                 let race_response = if race_ok {
                     Some(idle_btn(race_icon).interact(
                         ui,
@@ -899,7 +755,9 @@ impl Flight {
                 )
                 .paint(ui, race_rect);
                 if race_response.as_ref().is_some_and(|r| r.clicked()) {
-                    self.toggle_race(ui.ctx());
+                    if let Some(race) = &self.race {
+                        race.intent(Intent::RacePressed);
+                    }
                 }
                 if play_response.as_ref().is_some_and(|r| r.clicked()) {
                     for player in self.players.values() {
@@ -960,14 +818,19 @@ impl Flight {
                         })
                         .collect();
                     bubble(rec_rect, &rec_lines);
-                    let race_hint = match self.phase {
-                        Phase::Race { start, .. } => {
-                            let left = self.rules.duration.saturating_sub(start.elapsed());
-                            format!("-{}", mmss(left))
+                    // Без лимита длительности баббл не нужен: нечего
+                    // показывать ни до, ни после старта.
+                    let race_hint = match (self.air.race, self.rules.duration) {
+                        (Some(start), Some(duration)) => {
+                            let left = duration.saturating_sub(start.elapsed());
+                            Some(format!("-{}", mmss(left)))
                         }
-                        _ => format!("Σ{}", mmss(self.rules.duration)),
+                        (None, Some(duration)) => Some(format!("Σ{}", mmss(duration))),
+                        _ => None,
                     };
-                    bubble(race_rect, &[race_hint]);
+                    if let Some(hint) = race_hint {
+                        bubble(race_rect, &[hint]);
+                    }
                 }
 
                 // Alt: значения шкал кнопок (вторые строки) — в бабблах
@@ -1010,17 +873,45 @@ impl Flight {
                         self.vscroll
                             .step(scroll_delta, scrub::SCROLL_STEP, scrub::SCROLL_REARM)
                     {
+                        let dir = if up { -1 } else { 1 };
                         let shift = |cur: &mut usize, len: usize, dir: i64| {
                             *cur = (*cur as i64 + dir).clamp(0, len as i64 - 1) as usize;
                         };
+                        // Скролл вверх — к большей скорости (шкалы
+                        // по возрастанию, сдвиг единый со всеми).
+                        if let Some(r) = &rew_response {
+                            if r.hovered() {
+                                shift(&mut self.seek_speed, scrub::SEEK_SPEEDS.len(), dir);
+                            }
+                        }
+                        if let Some(r) = &ff_response {
+                            if r.hovered() {
+                                shift(&mut self.seek_speed, scrub::SEEK_SPEEDS.len(), dir);
+                            }
+                        }
+                        if let Some(r) = &loop_response {
+                            if r.hovered() {
+                                let before = self.rpt_size;
+                                shift(&mut self.rpt_size, scrub::RPT_SIZES.len(), dir);
+                                // Круг включён — переприменить радиус
+                                // (центр головка переставит сама).
+                                if self.rpt_size != before
+                                    && self.players.values().any(|p| p.is_circled())
+                                {
+                                    let radius = (scrub::RPT_SIZES[self.rpt_size] * 1000.0) as u64;
+                                    for player in self.players.values() {
+                                        player.set_circle(Some(crate::driver::player::Circle {
+                                            center: 0,
+                                            radius,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
                         if let Some(r) = play_response {
                             if r.hovered() {
                                 let before = self.play_speed;
-                                shift(
-                                    &mut self.play_speed,
-                                    scrub::PLAY_SPEEDS.len(),
-                                    if up { -1 } else { 1 },
-                                );
+                                shift(&mut self.play_speed, scrub::PLAY_SPEEDS.len(), dir);
                                 if self.play_speed != before {
                                     let speed = scrub::PLAY_SPEEDS[self.play_speed] as f32 / 100.0;
                                     for player in self.players.values() {
@@ -1040,7 +931,7 @@ impl Flight {
                     // Рамки нет — чистая позиция без знака. Знак занимает
                     // позицию десятков минут — все варианты одной ширины:
                     // -0:05.234 / 00:00.000 / +0:03.100.
-                    let (sign, shown) = match self.race_bounds() {
+                    let (sign, shown) = match Self::race_bounds(&clip) {
                         Some((lo, _)) if dvr_pos < lo => (Some('-'), lo - dvr_pos),
                         Some((_, hi)) if dvr_pos > hi => (Some('+'), dvr_pos - hi),
                         Some((lo, _)) => (None, dvr_pos.saturating_sub(lo)),
@@ -1080,17 +971,11 @@ impl Flight {
                     );
                 } else {
                     let now = Instant::now();
-                    let blink_off = matches!(
-                        self.phase,
-                        Phase::RaceCountdown { start, delay, .. }
-                            if race_time_start(start, delay)
-                                .saturating_duration_since(now)
-                                .as_millis() as u64
-                                % 1000
-                                >= 500
-                    );
+                    let blink_off = self.air.countdown_end.is_some_and(|end| {
+                        end.saturating_duration_since(now).as_millis() as u64 % 1000 >= 500
+                    });
                     let race_timer = {
-                        let total = self.phase.race_elapsed(now).as_millis() as u64;
+                        let total = self.air.race_elapsed(now).as_millis() as u64;
                         format!(
                             "{:02}:{:02}.{:03}",
                             total / 60_000,
@@ -1099,7 +984,7 @@ impl Flight {
                         )
                     };
                     let zeros_dim =
-                        self.phase.race_elapsed(now).is_zero() && !self.phase.countdown();
+                        self.air.race_elapsed(now).is_zero() && !self.air.countdown_active();
                     // Бегущий счётчик — слоновой костью (цвет активного
                     // транспорта); мигание и нули — 20% её.
                     let timer_color = if blink_off || zeros_dim {
@@ -1133,48 +1018,22 @@ impl Flight {
         }
         match action {
             Action::Exit => {
-                self.teardown();
+                // Ядро доводит гонку до целостности (финиш/abort),
+                // экран закрываем не дожидаясь.
+                if let Some(race) = &self.race {
+                    race.intent(Intent::Exit);
+                }
                 navigator.goto(menu::Menu)
             }
             Action::None => {}
         }
     }
 
-    /// Выход с экрана: стейт-машина доводится до целостности. Инвариант:
-    /// в журнале не бывает `race-started` без пары `race-finished`, а
-    /// записи вне гонки не остаются на диске.
-    fn teardown(&mut self) {
-        match self.phase {
-            Phase::Race { .. } => {
-                // Гонка завершается выходом штатно: финишный гудок и
-                // фиксация в журнале (пользовательский финиш —
-                // prematurely: true), запись гоночная — коммит.
-                self.audio.play(BUZZER);
-                self.journal_push(
-                    Instant::now(),
-                    FlightEvent::RaceFinished { prematurely: true },
-                );
-                self.stop_recording_all(true);
-            }
-            Phase::RecordTail { .. } => {
-                // Финиш в журнале уже есть; запись гоночная — коммит.
-                self.stop_recording_all(true);
-            }
-            Phase::RecordHead { .. } | Phase::RaceCountdown { .. } => {
-                self.audio.cancel();
-                // Записи без гонки — удаляются (правило abort).
-                self.stop_recording_all(false);
-                self.rec_deferred.clear();
-            }
-            Phase::LiveBefore { .. } | Phase::DvrOpening { .. } | Phase::Dvr { .. } => {}
-        }
-    }
-
     /// Часы DVR в журнальном домене: (старт первой камеры, позиция,
     /// финиш последней). Без рамки журнала — файловый домен
     /// (0, позиция, длительность).
-    fn dvr_clock(&self) -> (u64, u64, u64) {
-        match &self.dvr_clip {
+    fn dvr_clock(&self, clip: &Option<RaceClip>) -> (u64, u64, u64) {
+        match clip {
             Some(clip) if !clip.recordings.is_empty() => {
                 let mut start = u64::MAX;
                 let mut pos = 0u64;
@@ -1220,9 +1079,8 @@ impl Flight {
     }
 
     /// journal-ms первого кадра камеры (ноль её файла).
-    fn clip_rec_ms(&self, camera_id: &str) -> Option<u64> {
-        self.dvr_clip
-            .as_ref()?
+    fn clip_rec_ms(clip: &Option<RaceClip>, camera_id: &str) -> Option<u64> {
+        clip.as_ref()?
             .recordings
             .get(camera_id)
             .map(|(_, rec_ms)| *rec_ms)
@@ -1230,9 +1088,14 @@ impl Flight {
 
     /// В этой точке таймлайна у камеры нет записи: файл ещё не начался
     /// или уже закончился (журнальный домен).
-    fn clip_gap(&self, camera_id: &str, journal_pos: u64) -> bool {
-        match &self.dvr_clip {
-            Some(clip) => match (clip.recordings.get(camera_id), self.players.get(camera_id)) {
+    fn clip_gap(
+        clip: &Option<RaceClip>,
+        players: &HashMap<String, Player>,
+        camera_id: &str,
+        journal_pos: u64,
+    ) -> bool {
+        match clip {
+            Some(clip) => match (clip.recordings.get(camera_id), players.get(camera_id)) {
                 (Some((_, rec_ms)), Some(p)) => {
                     journal_pos < *rec_ms || journal_pos >= rec_ms + p.duration()
                 }
@@ -1243,30 +1106,34 @@ impl Flight {
     }
 
     /// Границы гонки в журнальном домене (None — рамки нет).
-    fn race_bounds(&self) -> Option<(u64, u64)> {
-        let clip = self.dvr_clip.as_ref()?;
+    fn race_bounds(clip: &Option<RaceClip>) -> Option<(u64, u64)> {
+        let clip = clip.as_ref()?;
         Some((clip.race_started_ms?, clip.race_finished_ms?))
     }
 
     /// Перемотка всех плееров на delta мс в журнальном домене: база —
     /// конверт таймлайна, каждый плеер получает свой файловый сдвиг.
-    fn seek_by(&self, delta: i64) {
+    fn seek_by(&self, clip: &Option<RaceClip>, delta: i64) {
         if self.players.is_empty() {
             return;
         }
-        let (start, pos, end) = self.dvr_clock();
+        let (start, pos, end) = self.dvr_clock(clip);
         let target = (pos as i64 + delta).clamp(start as i64, end as i64) as u64;
         for (id, player) in &self.players {
-            let file = self
-                .clip_rec_ms(id)
-                .map_or(target, |rec| target.saturating_sub(rec));
+            let file = Self::clip_rec_ms(clip, id).map_or(target, |rec| target.saturating_sub(rec));
             player.seek(file.min(player.duration()));
         }
     }
 
     /// Один кадр кнопки перемотки: press ждёт SEEK_HOLD_DELAY, отпускание
     /// до SEEK_CLICK_MAX — фиксированный шаг с вспышкой, иначе release.
-    fn seek_tick(&mut self, ui: &egui::Ui, response: &egui::Response, back: bool) {
+    fn seek_tick(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        back: bool,
+        clip: &Option<RaceClip>,
+    ) {
         enum Event {
             Release,
             Tap,
@@ -1311,7 +1178,7 @@ impl Flight {
                     let state = if back { &mut self.rew } else { &mut self.ff };
                     state.flash = true;
                     let step = scrub::SEEK_SPEEDS[self.seek_speed] as i64 * scrub::SEEK_TAP as i64;
-                    self.seek_by(if back { -step } else { step });
+                    self.seek_by(clip, if back { -step } else { step });
                 } else {
                     for player in self.players.values() {
                         player.shuttle_release(scrub::SEEK_RELEASE_RAMP);
@@ -1322,7 +1189,7 @@ impl Flight {
                 let state = if back { &mut self.rew } else { &mut self.ff };
                 state.flash = true;
                 let step = scrub::SEEK_SPEEDS[self.seek_speed] as i64 * scrub::SEEK_TAP as i64;
-                self.seek_by(if back { -step } else { step });
+                self.seek_by(clip, if back { -step } else { step });
             }
             Event::None => {}
         }
@@ -1343,184 +1210,10 @@ impl Flight {
         }
     }
 
-    // --- Живая часть (REC/RACE) -----------------------------------------
-
-    fn toggle_rec(&mut self, ctx: &egui::Context) {
-        match self.phase {
-            Phase::LiveBefore { live_since } => {
-                self.start_recording_all();
-                self.phase = Phase::RecordHead {
-                    live_since,
-                    rec_since: Instant::now(),
-                };
-            }
-            Phase::RecordHead { live_since, .. } => {
-                self.stop_recording_all(false);
-                // Запись без гонки — её отложенные события не нужны.
-                self.rec_deferred.clear();
-                self.phase = Phase::LiveBefore { live_since };
-            }
-            Phase::RaceCountdown { live_since, .. } => {
-                self.audio.cancel();
-                self.stop_recording_all(false);
-                // Отмена до старта гонки — записи не относятся к гонке.
-                self.rec_deferred.clear();
-                self.phase = Phase::LiveBefore { live_since };
-            }
-            Phase::Race { live_since, .. } => {
-                // REC гасит запись посреди гонки — гонка финиширует
-                // здесь: гудок и честный финиш в журнале.
-                self.audio.play(BUZZER);
-                self.journal_push(
-                    Instant::now(),
-                    FlightEvent::RaceFinished { prematurely: false },
-                );
-                self.stop_recording_all(true);
-                self.enter_dvr(ctx, live_since);
-            }
-            Phase::RecordTail { live_since, .. } => {
-                // Гонка уже финишировала (событие в журнале); REC гасит
-                // запись — сразу в DVR.
-                self.stop_recording_all(true);
-                self.enter_dvr(ctx, live_since);
-            }
-            _ => {}
-        }
-    }
-
-    fn toggle_race(&mut self, ctx: &egui::Context) {
-        match self.phase {
-            Phase::LiveBefore { live_since } => {
-                self.start_recording_all();
-                self.start_countdown(live_since, Instant::now());
-            }
-            Phase::RecordHead {
-                live_since,
-                rec_since,
-            } => self.start_countdown(live_since, rec_since),
-            Phase::RaceCountdown {
-                live_since,
-                rec_since,
-                ..
-            } => {
-                self.audio.cancel();
-                self.phase = Phase::RecordHead {
-                    live_since,
-                    rec_since,
-                };
-            }
-            Phase::Race { .. } => {
-                // Финиш кнопкой — гудок, запись хвоста продолжается.
-                self.audio.play(BUZZER);
-                let race = match self.phase {
-                    Phase::Race { start, .. } => start.elapsed(),
-                    _ => Duration::ZERO,
-                };
-                if let Phase::Race {
-                    live_since,
-                    rec_since,
-                    ..
-                } = self.phase
-                {
-                    self.journal_push(
-                        Instant::now(),
-                        FlightEvent::RaceFinished { prematurely: true },
-                    );
-                    self.phase = Phase::RecordTail {
-                        live_since,
-                        rec_since,
-                        race,
-                    };
-                }
-                let _ = ctx;
-            }
-            _ => {}
-        }
-    }
-
-    /// Старт отсчёта: звуковая программа и состояние RaceCountdown.
-    fn start_countdown(&mut self, live_since: Instant, rec_since: Instant) {
-        let interval = sample_start_delay(&self.rules.start_signal_delay);
-        let (steps, delay) = if interval.is_zero() {
-            (vec![(Duration::ZERO, BUZZER)], Duration::ZERO)
-        } else {
-            let mut steps: Vec<(Duration, audio::Sound)> = (0..PRE_BEEP_SECS)
-                .map(Duration::from_secs)
-                .map(|t| (t, STAGE))
-                .collect();
-            let delay = Duration::from_secs(PRE_BEEP_SECS) + interval;
-            steps.push((delay, BUZZER));
-            (steps, delay)
-        };
-        self.audio.sequence(steps);
-        self.phase = Phase::RaceCountdown {
-            live_since,
-            rec_since,
-            start: Instant::now(),
-            delay,
-        };
-    }
-
-    /// Перевод часов: конец отсчёта — в Race, лимит — в RecordTail,
-    /// готовность плееров — из DvrOpening в Dvr.
-    fn phase_tick(&mut self) {
-        let now = Instant::now();
-        match self.phase {
-            Phase::RaceCountdown {
-                live_since,
-                rec_since,
-                start,
-                delay,
-            } if now >= race_time_start(start, delay) => {
-                // Журнал появляется только если гонка состоялась:
-                // файл открывается JournalStarted, голова — перед стартом.
-                self.journal_file = crate::model::flight::JournalFile::create(
-                    std::path::Path::new(crate::driver::dvr::CAPTURES_DIR),
-                    &self.journal,
-                );
-                self.flush_rec_deferred();
-                self.journal_push(race_time_start(start, delay), FlightEvent::RaceStarted {});
-                self.phase = Phase::Race {
-                    live_since,
-                    rec_since,
-                    start: race_time_start(start, delay),
-                };
-            }
-            Phase::Race {
-                live_since,
-                rec_since,
-                start,
-            } => {
-                let elapsed = now.saturating_duration_since(start);
-                if elapsed >= self.rules.duration {
-                    self.audio.play(BUZZER);
-                    self.journal_push(now, FlightEvent::RaceFinished { prematurely: false });
-                    self.phase = Phase::RecordTail {
-                        live_since,
-                        rec_since,
-                        race: elapsed,
-                    };
-                }
-            }
-            Phase::DvrOpening { live_since } => {
-                // Готово = все плееры дошли до Ready/Failed (и пустой
-                // набор считается готовым — иначе транзит вечный).
-                let ready = self
-                    .players
-                    .values()
-                    .all(|p| matches!(p.open_state(), PlayerState::Ready | PlayerState::Failed(_)));
-                if ready {
-                    self.phase = Phase::Dvr { live_since };
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Самовзвод перерисовок счётчика гонки — только в живых фазах без
     /// кадров (в DVR кадры гонят перерисовки сами).
     fn arm_race_repaint(&self, ctx: &egui::Context) {
-        if !self.phase.countdown() && !matches!(self.phase, Phase::Race { .. }) {
+        if !self.air.countdown_active() && self.air.race.is_none() {
             return;
         }
         let streaming = self
@@ -1532,33 +1225,64 @@ impl Flight {
         }
     }
 
-    /// Запись остановлена: журнал закрыт, гасим эфир, открываем плееры
-    /// записей гонки. Источник рамки — журнал в памяти (гонка была —
-    /// иначе сюда не доходим).
-    fn enter_dvr(&mut self, ctx: &egui::Context, live_since: Instant) {
-        let clip = crate::model::flight::race_clip(self.journal.iter_ms());
-        self.enter_dvr_with(ctx, live_since, clip);
+    /// Транзит DvrOpening→Dvr: готовность плееров (все Ready/Failed;
+    /// пустой набор — готовым: иначе транзит вечный). Гоночные тики
+    /// живут в ядре, здесь — только экранный транзит.
+    fn dvr_tick(&mut self) {
+        if !matches!(self.screen, Screen::DvrOpening) {
+            return;
+        }
+        let ready = self
+            .players
+            .values()
+            .all(|p| matches!(p.open_state(), PlayerState::Ready | PlayerState::Failed(_)));
+        if ready {
+            self.screen = Screen::Dvr;
+        }
     }
 
-    /// Общая часть входа в DVR: clip — рамка гонки (пустая = деградация
-    /// на последние записи камер).
-    fn enter_dvr_with(
-        &mut self,
-        ctx: &egui::Context,
-        live_since: Instant,
-        clip: crate::model::flight::RaceClip,
-    ) {
-        // Без старта гонки отложенные записи — мусор, не журналируем.
-        self.rec_deferred.clear();
-        self.journal_file = None;
+    /// Режимы входа в DVR:
+    /// - cold: журнал парсится из файла (`open_dvr_cold`) → warm;
+    /// - warm: готовый журнал в памяти, видеоиндексы плееры строят
+    ///   при открытии (этот путь — воронка для обоих);
+    /// - hot (будущее): журнал и индексы уже в памяти, открытие
+    ///   файлов не нужно.
+    ///
+    /// Warm: журнал от ядра (гонка закрыта) или реконструированный
+    /// cold-входом. Рамка — из журнала, эфир гасим, плееры открываем.
+    /// Журнал остаётся в GUI: правки DVR (добавление/удаление событий)
+    /// — здесь, ядро к этому моменту отдало владение и завершилось.
+    fn open_dvr_warm(&mut self, ctx: &egui::Context, journal: Journal) {
+        let clip = race_clip(journal.iter_ms());
         self.stop_all();
         self.open_dvr_players(ctx, &clip);
-        self.dvr_clip = (!clip.is_empty()).then_some(clip);
-        self.phase = Phase::DvrOpening { live_since };
+        self.journal = Some(journal);
+        self.screen = Screen::DvrOpening;
+    }
+
+
+    /// Cold-вход: последний журнал из `captures/` парсится и
+    /// реконструируется в память → warm. false — журнала нет.
+    fn open_dvr_cold(&mut self, ctx: &egui::Context) -> bool {
+        let Some(journal) =
+            scrub::latest_journal(std::path::Path::new(crate::driver::dvr::CAPTURES_DIR))
+                .and_then(|path| std::fs::read_to_string(&path).ok())
+                .map(|yaml| Journal::parse_stream(&yaml))
+                .and_then(|events| {
+                    // Якорь — now минус последняя метка: события лежат на
+                    // своих относительных позициях.
+                    let last_ms = events.iter().map(|(ms, _)| *ms).max().unwrap_or(0);
+                    Journal::from_ms_events(Instant::now() - Duration::from_millis(last_ms), events)
+                })
+        else {
+            return false;
+        };
+        self.open_dvr_warm(ctx, journal);
+        true
     }
 
     /// Плееры записей гонки из рамки; пустая рамка — деградация на
-    /// последние файлы камер (поведение до журналов).
+    /// последние файлы камер (fallback без журнала).
     fn open_dvr_players(&mut self, ctx: &egui::Context, clip: &crate::model::flight::RaceClip) {
         let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
         let mut opened = 0;
@@ -1595,56 +1319,6 @@ impl Flight {
         log::info!("flight: webcams starting: {}", self.webcams.len());
     }
 
-    /// Старт записи всех камер: каждая сессия — уникальное имя файла
-    /// (`-r2`, `-r3`, … у повторных), имя — в очередь ожидания для
-    /// журнала.
-    fn start_recording_all(&mut self) {
-        let flight_stem = self.stem();
-        for (id, camera) in &self.active_cameras {
-            if let Some(webcam) = self.webcams.get(id) {
-                let n = self.rec_count.get(id).copied().unwrap_or(0) + 1;
-                self.rec_count.insert(id.clone(), n);
-                let stem = if n == 1 {
-                    format!("{flight_stem}-{id}")
-                } else {
-                    format!("{flight_stem}-{id}-r{n}")
-                };
-                let ext = match camera.dvr.container {
-                    ContainerConfig::Mkv => "mkv",
-                    ContainerConfig::Mov => "mov",
-                    ContainerConfig::Mp4 => "mp4",
-                };
-                let filename = format!("{stem}-mjpeg.{ext}");
-                let pending = self.rec_pending.entry(id.clone()).or_default();
-                if !pending.is_empty() {
-                    log::warn!(
-                        "flight: previous recording of {id} reported no first frame; \
-                         journal entry dropped"
-                    );
-                    pending.clear();
-                }
-                pending.push_back(filename);
-                webcam.start_recording(crate::driver::dvr::RecordParams {
-                    dir: crate::driver::dvr::CAPTURES_DIR.into(),
-                    stem,
-                    camera: camera.clone(),
-                });
-            }
-        }
-    }
-
-    /// Остановить запись всех камер. commit=false — записи вне гонки:
-    /// файлы финализируются и удаляются.
-    fn stop_recording_all(&mut self, commit: bool) {
-        for webcam in self.webcams.values() {
-            if commit {
-                webcam.stop_recording();
-            } else {
-                webcam.abort_recording();
-            }
-        }
-    }
-
     /// Выключить эфир целиком: захват, подавление сна.
     fn stop_all(&mut self) {
         self.webcams.clear();
@@ -1675,17 +1349,25 @@ impl Flight {
         command: &[String],
     ) -> Option<crate::remote::Response> {
         let head = command.first()?.as_str();
+        let clip = self
+            .journal
+            .as_ref()
+            .map(|journal| race_clip(journal.iter_ms()));
         let ok = |message: String| Some(crate::remote::Response { message, code: 0 });
         match head {
             "rec" => {
-                if self.phase.rec_available() {
-                    self.toggle_rec(ctx);
+                if self.race.is_some() && self.air.rec_available() {
+                    if let Some(race) = &self.race {
+                        race.intent(Intent::RecPressed);
+                    }
                 }
                 ok(String::new())
             }
             "race" => {
-                if self.phase.race_available() {
-                    self.toggle_race(ctx);
+                if self.race.is_some() && self.air.race_available() {
+                    if let Some(race) = &self.race {
+                        race.intent(Intent::RacePressed);
+                    }
                 }
                 ok(String::new())
             }
@@ -1701,12 +1383,12 @@ impl Flight {
             }
             "ff" => {
                 let step = scrub::SEEK_SPEEDS[self.seek_speed] as i64 * scrub::SEEK_TAP as i64;
-                self.seek_by(step);
+                self.seek_by(&clip, step);
                 ok(String::new())
             }
             "rew" => {
                 let step = scrub::SEEK_SPEEDS[self.seek_speed] as i64 * scrub::SEEK_TAP as i64;
-                self.seek_by(-step);
+                self.seek_by(&clip, -step);
                 ok(String::new())
             }
             "seek" => {
@@ -1717,6 +1399,11 @@ impl Flight {
                 ok(String::new())
             }
             "exit" => {
+                // Ядру — немедленно (инварианты целостности), флаг —
+                // только для навигации (нужен Navigator из update).
+                if let Some(race) = &self.race {
+                    race.intent(Intent::Exit);
+                }
                 self.exit_requested = true;
                 ctx.request_repaint();
                 ok(String::new())
@@ -1753,17 +1440,6 @@ fn tstate(enabled: bool, active: bool) -> view::TransportState {
         (true, false) => view::TransportState::Idle,
         (false, _) => view::TransportState::Disabled,
     }
-}
-
-/// Пауза для конкретного старта: равномерный выбор в
-/// [min_delay, max_delay); вырожденный случай (min == max) — само значение.
-fn sample_start_delay(signal: &StartSignalDelay) -> Duration {
-    let min = signal.min();
-    let span = signal.max().saturating_sub(min).as_millis() as u64;
-    if span == 0 {
-        return min;
-    }
-    min + Duration::from_millis(rand::random_range(0..span))
 }
 
 struct Res;

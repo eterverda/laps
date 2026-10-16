@@ -136,6 +136,52 @@ pub fn list_cameras() -> std::result::Result<Vec<CameraConfig>, Error> {
     Ok(descriptions)
 }
 
+/// Хэндл команд записи, отделяемый от фасада: гоночный поток шлёт
+/// команды рекордеру и читает RecordState, не трогая UI-часть Camera
+/// (текстуры, кадры). Клонируем.
+#[derive(Clone)]
+pub struct Recorder {
+    record_state: SharedRecordState,
+    commands: crossbeam_channel::Sender<RecordCommand>,
+}
+
+impl Recorder {
+    pub fn start_recording(&self, params: RecordParams) {
+        if self
+            .commands
+            .try_send(RecordCommand::StartRecording(params))
+            .is_err()
+        {
+            log::warn!("dvr: start_recording ignored (capture thread gone)");
+        }
+    }
+
+    pub fn stop_recording(&self) {
+        if self
+            .commands
+            .try_send(RecordCommand::StopRecording)
+            .is_err()
+        {
+            log::warn!("dvr: stop_recording ignored (capture thread gone)");
+        }
+    }
+
+    /// Прервать запись вне гонки: файл финализируется и удаляется.
+    pub fn abort_recording(&self) {
+        if self
+            .commands
+            .try_send(RecordCommand::AbortRecording)
+            .is_err()
+        {
+            log::warn!("dvr: abort_recording ignored (capture thread gone)");
+        }
+    }
+
+    pub fn record_state(&self) -> RecordState {
+        self.record_state.load()
+    }
+}
+
 pub struct Camera {
     /// Кадр из capture-потока → UI-поток (latest-wins).
     slot: ImageSlot,
@@ -241,38 +287,12 @@ impl Camera {
         self.record_state.load()
     }
 
-    /// Запустить запись. Команда применится перед следующим кадром;
-    /// ошибка создания файла уйдёт в лог, RecordState останется false.
-    pub fn start_recording(&self, params: RecordParams) {
-        if self
-            .commands
-            .try_send(RecordCommand::StartRecording(params))
-            .is_err()
-        {
-            log::warn!("dvr: start_recording ignored (capture thread gone)");
-        }
-    }
-
-    /// Остановить запись; файл финализируется в фоне. Команда
-    /// применится между кадрами, затем — drop recorder'а.
-    pub fn stop_recording(&self) {
-        if self
-            .commands
-            .try_send(RecordCommand::StopRecording)
-            .is_err()
-        {
-            log::warn!("dvr: stop_recording ignored (capture thread gone)");
-        }
-    }
-
-    /// Прервать запись вне гонки: файл финализируется и удаляется.
-    pub fn abort_recording(&self) {
-        if self
-            .commands
-            .try_send(RecordCommand::AbortRecording)
-            .is_err()
-        {
-            log::warn!("dvr: abort_recording ignored (capture thread gone)");
+    /// Отделить хэндл записи (для гоночного потока): команды +
+    /// RecordState без UI-части фасада.
+    pub fn recorder(&self) -> Recorder {
+        Recorder {
+            record_state: Arc::clone(&self.record_state),
+            commands: self.commands.clone(),
         }
     }
 

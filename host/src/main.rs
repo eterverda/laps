@@ -3,6 +3,7 @@ mod config;
 mod driver;
 mod gui;
 mod model;
+mod service;
 mod remote;
 
 #[derive(clap::Parser)]

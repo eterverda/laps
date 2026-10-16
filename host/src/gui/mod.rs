@@ -101,7 +101,7 @@ impl App {
                     &cc.egui_ctx,
                     setup.clone(),
                     assignments.clone(),
-                    crate::model::race::RaceRules::default(),
+                    crate::model::rules::RaceRules::default(),
                     Some(std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR)),
                 ))),
             },
@@ -167,7 +167,7 @@ impl eframe::App for App {
                             &ctx,
                             self.setup.clone(),
                             self.assignments.clone(),
-                            crate::model::race::RaceRules::default(),
+                            crate::model::rules::RaceRules::default(),
                             Some(std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR)),
                         ))),
                         menu::Action::None => {}

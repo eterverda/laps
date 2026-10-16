@@ -7,14 +7,14 @@ pub struct Setup {
     pub pads: BTreeMap<String, PadConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct PadConfig {
     pub label: String,
     pub color: ColorConfig,
     pub fpv: FpvConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct FpvConfig {
     #[serde(rename = "camera-id")]
     pub camera_id: String,
@@ -22,7 +22,7 @@ pub struct FpvConfig {
     pub viewport: super::camera::ViewportConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorConfig {
     Red,

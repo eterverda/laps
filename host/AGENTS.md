@@ -116,11 +116,15 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   our own crate in dev
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) signaled
   UI-ward via `crossbeam_utils::AtomicCell`. Кнопки LIVE/REC/RACE в
-  live-экране живут в общей машине состояний `Session`
-  (`gui/live.rs`): Idle → LiveBefore → RecordHead → RaceCountdown →
-  Race → RecordTail → LiveAfter → Done; до старта гонки отжатия шагают
-  назад, после — только вперёд, Done терминальное. Доступность кнопок
-  по фазам — в юнит-тесте `session_flags_and_availability`
+  live-экране живут в общей машине состояний экрана Flight
+  (`gui/flight.rs`): LiveBefore → RecordHead → RaceCountdown →
+  Race → RecordTail → DvrOpening → Dvr; до старта гонки отжатия шагают
+  назад, после — только вперёд
+- Инварианты переходов: `race-started` в журнале всегда с парным
+  `race-finished` (лимит, RACE-кнопка, REC-стоп в Race, EXIT из Race);
+  записи вне гонки удаляются (abort) на любом пути — REC-off до старта,
+  отмена отсчёта, EXIT из RecordHead/RaceCountdown (`Flight::teardown`
+  доводит машину до целостности при выходе)
 
 ## Video Recording (DVR)
 
@@ -145,7 +149,10 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
     `ContainerConfig` in `Recorder::start` (mkv → MkvWriter, mov/mp4 →
     IsobmffWriter::create_mov/create_mp4)
 - One file per recording start; **no segment rotation** (documented gap)
+- Стем имён файлов — `date_time` первого события `FlightJournal` (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
+- Журнал полёта (`model/flight.rs`): yaml-стрим `captures/<stem>.yaml` — документ на эвент (`{t_ms, <variant>: …}`), разделители `---`; пишется инкрементально по мере эвентов (`Flight::journal_push`), файл создаётся только при старте гонки (первым документом JournalStarted, до старта — события в памяти, без гонки файла нет) и закрывается при входе в DVR; метки — мс от старта журнала; `RecordingStarted` — по новому значению `RecordState.first_frame_at` (момент из `Frame::timestamp`, ставится в `DvrSink::on_frame`), имя файла сессии привязывается FIFO-очередью стартов (`rec_pending`), по камере журналируются все сессии; события RecordingStarted до старта гонки откладываются (`rec_deferred`) и пишутся с исходными таймстампами в момент старта гонки, при отмене записи без гонки / входе в DVR выбрасываются; `RaceFinished.prematurely`: true — кнопкой, false — лимитом длительности
 - Writer thread + bounded channel (64): overflow = dropped frame + warn
+- Abort записи: `Recorder::abort()` (команда `Camera::abort_recording`, sink `DvrSink::abort()`) ставит флаг; writer после finalize **удаляет файл** (`RecordParams.stem` — полный стем с camera_id и номером сессии). Flight: `stop_recording_all(commit)`, commit = `race_started()` — записи вне гонки удаляются, гоночные остаются
   (capture outranks recording); periodic sync every 5 s; `Drop` detaches
   the thread intentionally (finalize+sync_all in background, no join —
   don't "fix" without reading the comment in `Recorder::drop`)
@@ -158,13 +165,29 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 ## Video Playback
 
-- **Scrub mode** (`laps scrub`): playback of the latest per-camera recording
-  from `captures/`; same header/viewfinder layout as live. Bottom row:
+- **Scrub mode** (`laps scrub`): playback of the last **race** from
+  `captures/` — источник истины журнал, не файлы. Прямой переход
+  (REC стоп после гонки → DVR): рамка гонки `RaceClip` собирается из
+  журнала **в памяти** (`race_clip(journal.iter_ms())`), плееры
+  открывают видео из `recording-started` (файл переиндексируется
+  плеером как раньше). Холодный вход (`Mode::Dvr` из меню): парсится
+  последний yaml-стрим (`scrub::latest_journal` →
+  `FlightJournal::parse_stream` → `race_clip`); журнала нет —
+  деградация на прежние `latest_capture`. Таймлайн — в журнальном
+  домене: от старта первой камеры (`recording-started`) до финиша
+  последней (`rec_ms + duration`); seek'и — в журнальных мс с переводом
+  в файловые позиции плееров (`clip_rec_ms`, ноль файла — первый кадр).
+  Вылет (белая полоска) и знаки +/− TIMER — границы
+  `race-started`/`race-finished` напрямую; рамки нет — линия серая, TIMER
+  без знака. Точка таймлайна вне записи камеры (файл не начался или
+  закончился) — серый глиф (`ViewfinderContents::Gap`)
   EXIT plate (icon-only, passive), timeline with hold-to-scrub (hold ≠
   pause) between EXIT and the clock, big clock at the same x as live's
   RACE counter, transport (REW/PLAY/FF/RPT) right of the clock. Screen
   layouts are per-screen private (copy-paste); only view-level geometry
-  (`plate_rect`, grid cells) is shared
+  (`plate_rect`, grid cells) is shared. Часы DVR — агрегаты по всем
+  плеерам (`dvr_clock`: max позиция/длительность, `dvr_ready`,
+  `seek_by` от max), «первичной камеры» нет
 - Own readers (mirror writers): **MKV** (Cues / cluster scan, `mkv.rs`) and
   **MOV/MP4** (ISOBMFF: stts/stsz/stco|co64 parsed once into memory,
   `mp4.rs` `IsobmffReader` — one reader for both). Readers cover

@@ -7,8 +7,6 @@ use std::time::Duration;
 
 use super::ruler;
 
-/// Микро-прототип: отрезки записи до старта гонки и после финиша, мс.
-pub const RACE_LEAD_MS: u64 = 15_000;
 /// База позиционного шага по тапу (клик): тап мотает на
 /// speed × SEEK_TAP файла (10x → 1 с).
 pub const SEEK_TAP: u64 = 100;
@@ -58,6 +56,16 @@ pub fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
                 exts.iter().any(|ext| n.ends_with(&format!("{stem}{ext}")))
             })
         })
+        .max()
+}
+
+/// Последний журнал полёта в каталоге: стемы сортируются лексикографически.
+pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
         .max()
 }
 

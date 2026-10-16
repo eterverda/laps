@@ -253,17 +253,73 @@ impl ViewportConfig {
     }
 }
 
+impl serde::Serialize for ViewportConfig {
+    /// Имена пресетов — зеркало Deserialize. Не-пресетное значение
+    /// (только programmatic) пишем явной картой координат — журнал
+    /// write-only, обратно читать не обещаем.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let name = if self == &VIEWPORT_2X2_R1C1_NARROW {
+            Some("2x2-r1c1-narrow")
+        } else if self == &VIEWPORT_2X2_R1C2_NARROW {
+            Some("2x2-r1c2-narrow")
+        } else if self == &VIEWPORT_2X2_R2C1_NARROW {
+            Some("2x2-r2c1-narrow")
+        } else if self == &VIEWPORT_2X2_R2C2_NARROW {
+            Some("2x2-r2c2-narrow")
+        } else {
+            None
+        };
+        match name {
+            Some(name) => s.serialize_str(name),
+            None => {
+                use serde::ser::SerializeStruct;
+                let mut st = s.serialize_struct("ViewportConfig", 4)?;
+                st.serialize_field("left", &self.left)?;
+                st.serialize_field("top", &self.top)?;
+                st.serialize_field("right", &self.right)?;
+                st.serialize_field("bottom", &self.bottom)?;
+                st.end()
+            }
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for ViewportConfig {
+    /// Две формы: имя пресета (setup-файлы) или явная карта координат
+    /// (журнал может писать не-пресетные значения).
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let name = String::deserialize(d)?;
-        match name.as_str() {
-            "2x2-r1c1-narrow" => Ok(VIEWPORT_2X2_R1C1_NARROW),
-            "2x2-r1c2-narrow" => Ok(VIEWPORT_2X2_R1C2_NARROW),
-            "2x2-r2c1-narrow" => Ok(VIEWPORT_2X2_R2C1_NARROW),
-            "2x2-r2c2-narrow" => Ok(VIEWPORT_2X2_R2C2_NARROW),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown viewport preset: {other}"
-            ))),
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Name(String),
+            Coords {
+                left: f32,
+                top: f32,
+                right: f32,
+                bottom: f32,
+            },
+        }
+        match Repr::deserialize(d)? {
+            Repr::Name(name) => match name.as_str() {
+                "2x2-r1c1-narrow" => Ok(VIEWPORT_2X2_R1C1_NARROW),
+                "2x2-r1c2-narrow" => Ok(VIEWPORT_2X2_R1C2_NARROW),
+                "2x2-r2c1-narrow" => Ok(VIEWPORT_2X2_R2C1_NARROW),
+                "2x2-r2c2-narrow" => Ok(VIEWPORT_2X2_R2C2_NARROW),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown viewport preset: {other}"
+                ))),
+            },
+            Repr::Coords {
+                left,
+                top,
+                right,
+                bottom,
+            } => Ok(ViewportConfig {
+                left,
+                top,
+                right,
+                bottom,
+            }),
         }
     }
 }

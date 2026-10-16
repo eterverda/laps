@@ -15,6 +15,8 @@ impl Viewfinder {
             ViewfinderContents::Texture(id) => {
                 ui.painter().image(id, rect, self.uv, egui::Color32::WHITE);
             }
+            // Нет картинки (камера заводится, плеер открывается, разрыв
+            // записи на таймлайне): тесткард-заглушка.
             ViewfinderContents::Pending => {
                 let id = testcard_texture_id(ui);
                 ui.painter().image(id, rect, FULL_UV, egui::Color32::WHITE);
@@ -37,6 +39,7 @@ impl Viewfinder {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ViewfinderContents {
     Texture(egui::TextureId),
+    /// Нет картинки: заводится/открывается/разрыв таймлайна — серый глиф.
     Pending,
     Error,
     Off,

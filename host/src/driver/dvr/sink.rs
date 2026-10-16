@@ -98,6 +98,14 @@ impl DvrSink {
         self.recorder = None;
     }
 
+    /// Прервать запись вне гонки: файл финализируется и удаляется.
+    pub fn abort(&mut self) {
+        if let Some(recorder) = &self.recorder {
+            recorder.abort();
+        }
+        self.recorder = None;
+    }
+
     fn epoch_millis(&self, t: Instant) -> u64 {
         self.anchor.1 + t.saturating_duration_since(self.anchor.0).as_millis() as u64
     }
@@ -112,6 +120,13 @@ impl FrameSink for DvrSink {
             return;
         }
         let ts = self.epoch_millis(frame.timestamp);
+        // Первый записываемый кадр — метка старта записи для журнала и
+        // UI. Время кадра (Frame::timestamp), не момент push'а.
+        if self.state.load().first_frame_at.is_none() {
+            let mut st = self.state.load();
+            st.first_frame_at = Some(frame.timestamp);
+            self.state.store(st);
+        }
         match &frame.data {
             // Известные к записи варианты; буфер не копируется (P4).
             FrameData::Jpeg { .. } | FrameData::Rgba { .. } => recorder.push(frame, ts),

@@ -92,7 +92,10 @@ type ImageSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 /// Команды записи из UI-потока в capture-поток.
 enum RecordCommand {
     StartRecording(RecordParams),
+    /// Финализировать и оставить файл.
     StopRecording,
+    /// Финализировать и удалить файл (запись вне гонки).
+    AbortRecording,
 }
 
 /// Latest-wins sink (P3a): хранит ровно последний кадр, потребитель
@@ -173,6 +176,7 @@ impl Camera {
         let record_state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
             ok: false,
             fps: 0.0,
+            first_frame_at: None,
         }));
         let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
         let ui_latency = Arc::new(Mutex::new(fps::FrameStats::default()));
@@ -258,6 +262,17 @@ impl Camera {
             .is_err()
         {
             log::warn!("dvr: stop_recording ignored (capture thread gone)");
+        }
+    }
+
+    /// Прервать запись вне гонки: файл финализируется и удаляется.
+    pub fn abort_recording(&self) {
+        if self
+            .commands
+            .try_send(RecordCommand::AbortRecording)
+            .is_err()
+        {
+            log::warn!("dvr: abort_recording ignored (capture thread gone)");
         }
     }
 
@@ -350,6 +365,7 @@ fn capture_loop(
             match cmd {
                 RecordCommand::StartRecording(params) => dvr_sink.start(&params),
                 RecordCommand::StopRecording => dvr_sink.stop(),
+                RecordCommand::AbortRecording => dvr_sink.abort(),
             }
         }
 
@@ -607,6 +623,7 @@ mod tests {
         let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
             ok: false,
             fps: 0.0,
+            first_frame_at: None,
         }));
         let dir = std::env::temp_dir().join(format!("laps-pipe-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -621,7 +638,7 @@ mod tests {
         let mut dvr = DvrSink::new(FrameRateConfig(60), negotiated, Arc::clone(&state));
         dvr.start(&RecordParams {
             dir: dir.clone(),
-            camera_id: "camera-1".to_owned(),
+            stem: "test-stem".to_owned(),
             camera: CameraConfig::new("Test", 8, 8, 60, PixelConfig::Yuyv),
         });
         assert!(state.load().ok, "recorder must be live");

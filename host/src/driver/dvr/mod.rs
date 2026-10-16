@@ -29,6 +29,9 @@ pub struct RecordState {
     pub ok: bool,
     /// Скользящий fps фактически пишущихся кадров (окно ~0.5 с).
     pub fps: f32,
+    /// Время первого кадра записи (из `Frame::timestamp`, момент
+    /// добавления в очередь записи). None — кадров ещё не было.
+    pub first_frame_at: Option<Instant>,
 }
 
 /// Общий для потока и UI хэндл состояния записи.
@@ -86,7 +89,9 @@ pub const CAPTURES_DIR: &str = "captures";
 /// Параметры записи одной камеры.
 pub struct RecordParams {
     pub dir: PathBuf,
-    pub camera_id: String,
+    /// Стем имени файла целиком (журнал полёта + camera_id + порядковый
+    /// номер сессии записи) — Recorder добавляет только `-mjpeg.<ext>`.
+    pub stem: String,
     /// Справочно: для логов и отчёта. Размеры для записи авторитетны
     /// из согласованного формата, см. Recorder::start.
     pub camera: crate::config::camera::CameraConfig,
@@ -110,6 +115,9 @@ pub struct Recorder {
     /// Дропы в канале (try_send failed), считает push, читает
     /// writer-поток для отчёта.
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Флаг «запись вне гонки»: writer после finalize удаляет файл.
+    /// Ставится abort() до drop — поток видит флаг при финализации.
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Recorder {
@@ -120,7 +128,8 @@ impl Recorder {
     ) -> io::Result<Self> {
         use crate::driver::camera::capture::FrameData;
         std::fs::create_dir_all(&params.dir)?;
-        let stem = format!("{}-{}-mjpeg", timestamp_prefix(), params.camera_id);
+        // Стем полный (с camera_id и номером сессии) — см. RecordParams.
+        let stem = format!("{}-mjpeg", params.stem);
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
         // нет прав) уезжает вызывающему вместо молчаливой мёртвой записи.
         let resolution = negotiated.resolution;
@@ -135,7 +144,11 @@ impl Recorder {
             ContainerConfig::Mov => Box::new(IsobmffWriter::create_mov(&path, resolution)?),
             ContainerConfig::Mp4 => Box::new(IsobmffWriter::create_mp4(&path, resolution)?),
         };
-        state.store(RecordState { ok: true, fps: 0.0 });
+        state.store(RecordState {
+            ok: true,
+            fps: 0.0,
+            first_frame_at: None,
+        });
         let writer_path = path.clone();
         let (sender, receiver) = crossbeam_channel::bounded::<(
             std::sync::Arc<crate::driver::camera::capture::Frame>,
@@ -143,6 +156,8 @@ impl Recorder {
         )>(CHANNEL_CAP);
         let state_clone = state.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abort_clone = std::sync::Arc::clone(&abort);
         // В поток уходят owned-копии: ссылки на параметры не 'static.
         let thread = std::thread::spawn(move || {
             let mut last_sync = Instant::now();
@@ -181,6 +196,8 @@ impl Recorder {
                                 state_clone.store(RecordState {
                                     ok: false,
                                     fps: 0.0,
+                                    // Старт записи (если был) не затираем.
+                                    first_frame_at: state_clone.load().first_frame_at,
                                 });
                                 return;
                             }
@@ -202,6 +219,8 @@ impl Recorder {
                     state_clone.store(RecordState {
                         ok: false,
                         fps: 0.0,
+                        // Старт записи (если был) не затираем.
+                        first_frame_at: state_clone.load().first_frame_at,
                     });
                     return;
                 }
@@ -215,6 +234,8 @@ impl Recorder {
                     state_clone.store(RecordState {
                         ok: true,
                         fps: fps as f32,
+                        // Метку первого кадра ставит sink, тут не трогаем.
+                        first_frame_at: state_clone.load().first_frame_at,
                     });
                 }
                 if last_sync.elapsed() >= SYNC_INTERVAL {
@@ -229,10 +250,20 @@ impl Recorder {
             state_clone.store(RecordState {
                 ok: false,
                 fps: 0.0,
+                // Метка первого кадра остаётся — запись была, файлы есть.
+                first_frame_at: state_clone.load().first_frame_at,
             });
             match writer.finalize() {
                 Ok(()) => log::info!("dvr: finalized {:?}", writer_path),
                 Err(e) => log::error!("dvr: finalize failed for {:?}: {}", writer_path, e),
+            }
+            // Прерванная (вне гонки) запись: файл корректно закрыт
+            // выше — теперь удаляем.
+            if abort_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                match std::fs::remove_file(&writer_path) {
+                    Ok(()) => log::info!("dvr: aborted recording deleted {:?}", writer_path),
+                    Err(e) => log::error!("dvr: abort delete failed for {:?}: {}", writer_path, e),
+                }
             }
             // Один лог на запись: латентность «захват → кадр на диске»
             // и длительность перекодирования.
@@ -249,7 +280,14 @@ impl Recorder {
             sender: Some(sender),
             thread: Some(thread),
             dropped,
+            abort,
         })
+    }
+
+    /// Прервать запись: файл будет финализирован и удалён (запись вне
+    /// гонки). Вызывается до drop.
+    pub fn abort(&self) {
+        self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Из pipeline. `ts` — момент захвата кадра, мс с Unix-эпохи
@@ -288,32 +326,8 @@ pub fn epoch_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Префикс имён файлов записи: `YYYY-mm-dd-HH-MM-SS.SSS` (локальное время).
-pub fn timestamp_prefix() -> String {
-    use time::macros::format_description;
-    const FMT: &[time::format_description::FormatItem<'static>] =
-        format_description!("[year]-[month]-[day]-[hour]-[minute]-[second].[subsecond digits:3]");
-    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
-        log::warn!("dvr: local time unavailable, falling back to UTC");
-        time::OffsetDateTime::now_utc()
-    });
-    now.format(&FMT).unwrap_or_else(|e| {
-        log::error!("dvr: timestamp format failed: {}", e);
-        epoch_millis().to_string()
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn timestamp_prefix_format() {
-        let prefix = super::timestamp_prefix();
-        assert!(
-            lazy_regex::regex_is_match!(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.\d{3}$", &prefix),
-            "bad timestamp prefix: {prefix}"
-        );
-    }
-
     /// YUYV: RGBA перекодируется в JPEG и пишется в контейнер по
     /// умолчанию (MKV); REC гаснет по выходу writer-потока.
     #[test]
@@ -328,10 +342,11 @@ mod tests {
         let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
             ok: false,
             fps: 0.0,
+            first_frame_at: None,
         }));
         let params = super::RecordParams {
             dir: dir.clone(),
-            camera_id: "camera-1".to_owned(),
+            stem: "test-stem".to_owned(),
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Yuyv),
         };
         let negotiated = crate::driver::camera::capture::CaptureFormat {
@@ -406,12 +421,13 @@ mod tests {
             let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
                 ok: false,
                 fps: 0.0,
+                first_frame_at: None,
             }));
             let mut camera = CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg);
             camera.dvr.container = container;
             let params = super::RecordParams {
                 dir: dir.clone(),
-                camera_id: "camera-1".to_owned(),
+                stem: "test-stem".to_owned(),
                 camera,
             };
             let negotiated = crate::driver::camera::capture::CaptureFormat {
@@ -479,5 +495,74 @@ mod tests {
 
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// Abort: файл финализируется и удаляется (запись вне гонки).
+    #[test]
+    fn abort_recording_deletes_file() {
+        use super::{RecordState, SharedRecordState};
+        use crate::config::camera::{CameraConfig, PixelConfig};
+        use crossbeam_utils::atomic::AtomicCell;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("laps-dvr-abort-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
+            ok: false,
+            fps: 0.0,
+            first_frame_at: None,
+        }));
+        let params = super::RecordParams {
+            dir: dir.clone(),
+            stem: "abort-stem".to_owned(),
+            camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg),
+        };
+        let negotiated = crate::driver::camera::capture::CaptureFormat {
+            resolution: crate::config::camera::ResolutionConfig {
+                width: 64,
+                height: 48,
+            },
+            frame_rate: crate::config::camera::FrameRateConfig(30),
+            format: PixelConfig::Mjpeg,
+        };
+        // Стем полный (camera_id уже в нём — см. RecordParams).
+        let path = dir.join("abort-stem-mjpeg.mkv");
+        {
+            let recorder = super::Recorder::start(&params, &negotiated, &state).unwrap();
+            let rgba: Vec<u8> =
+                egui::ColorImage::new([64, 48], vec![egui::Color32::BLACK; 64 * 48])
+                    .pixels
+                    .iter()
+                    .flat_map(|c| c.to_array())
+                    .collect();
+            let jpeg = super::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
+            recorder.push(
+                Arc::new(crate::driver::camera::capture::Frame {
+                    timestamp: std::time::Instant::now(),
+                    data: crate::driver::camera::capture::FrameData::Jpeg {
+                        buf: jpeg.clone(),
+                        len: Some(jpeg.len()),
+                    },
+                }),
+                1_000,
+            );
+            recorder.abort();
+        } // drop: writer finalize'ит и удаляет файл в фоне
+
+        // Writer detached — поллим исчезновение файла.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !path.exists(),
+            "aborted recording must be deleted: {path:?}"
+        );
+        assert!(
+            std::fs::read_dir(&dir).unwrap().flatten().next().is_none(),
+            "aborted recording leaves no files in {dir:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

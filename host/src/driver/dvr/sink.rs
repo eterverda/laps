@@ -43,8 +43,7 @@ fn should_record_frame(
 
 /// Держит Recorder, троттлит избыточный поток (HARD HACK выше),
 /// конвертирует Instant→epoch millis якорем. Recorder живёт независимо от
-/// жизни pipeline: drop sink'а (как и раньше drop recorder'а в потоке)
-/// отпускает writer в фоновую финализацию.
+/// жизни pipeline: drop sink'а отпускает writer в фоновую финализацию.
 pub struct DvrSink {
     recorder: Option<Recorder>,
     /// Эффективный fps записи (dvr.frame-rate, иначе camera.frame-rate).
@@ -80,7 +79,7 @@ impl DvrSink {
     }
 
     /// Файл создаётся здесь, а не в writer-потоке: ошибка (диск полон,
-    /// нет прав) логируется, RecordState остаётся false — как раньше.
+    /// нет прав) логируется, RecordState — Failed.
     pub fn start(&mut self, params: &RecordParams) {
         self.set_fps(FrameRateConfig(params.camera.dvr_frame_rate().0));
         self.next_eligible = Instant::now(); // первый кадр записи проходит всегда
@@ -88,13 +87,7 @@ impl DvrSink {
             Ok(recorder) => self.recorder = Some(recorder),
             Err(e) => {
                 log::error!("dvr: recording unavailable: {}", e);
-                // Явный сброс: стейт прошлой сессии (fps, first_frame_at)
-                // не должен оседать в RecordState мёртвой записи.
-                self.state.store(crate::driver::dvr::RecordState {
-                    ok: false,
-                    fps: 0.0,
-                    first_frame_at: None,
-                });
+                self.state.store(crate::driver::dvr::RecordState::Failed);
                 self.recorder = None;
             }
         }
@@ -127,13 +120,6 @@ impl FrameSink for DvrSink {
             return;
         }
         let ts = self.epoch_millis(frame.timestamp);
-        // Первый записываемый кадр — метка старта записи для журнала и
-        // UI. Время кадра (Frame::timestamp), не момент push'а.
-        if self.state.load().first_frame_at.is_none() {
-            let mut st = self.state.load();
-            st.first_frame_at = Some(frame.timestamp);
-            self.state.store(st);
-        }
         match &frame.data {
             // Известные к записи варианты; буфер не копируется (P4).
             FrameData::Jpeg { .. } | FrameData::Rgba { .. } => recorder.push(frame, ts),

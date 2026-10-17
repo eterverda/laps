@@ -513,7 +513,7 @@ mod tests {
     /// Длительность гонки для сценариев.
     const DURATION: Duration = Duration::from_secs(60);
 
-    /// Фиктивные часы: старт + ручной шаг (по образцу тестов Playhead).
+    /// Фиктивные часы: старт + ручной шаг (по образцу тестов Transport).
     struct FakeClock {
         now: Instant,
     }
@@ -696,7 +696,7 @@ mod tests {
         core.race_pressed(clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
-        // Камера пишет — иначе коммит зафиксирует RecordingFailed.
+        // Камера пишет — иначе файла не будет (сессия снимется молча).
         core.note_frame("camera-1", Some(clock.advance(1)));
         let t_rec = clock.advance(20_000);
         assert!(matches!(
@@ -737,7 +737,7 @@ mod tests {
         core.race_pressed(clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
-        // Камера пишет — иначе коммит зафиксирует RecordingFailed.
+        // Камера пишет — иначе файла не будет (сессия снимется молча).
         core.note_frame("camera-1", Some(clock.advance(1)));
         let t = clock.advance(5_000);
         assert!(matches!(
@@ -998,7 +998,13 @@ pub fn spawn(
 
             // Поллинг first_frame_at: edge-детект — в ядре.
             for (id, recorder) in &recorders {
-                active.note_frame(id, recorder.record_state().first_frame_at);
+                let first_frame_at = match recorder.record_state() {
+                    crate::driver::dvr::RecordState::Writing { first_frame_at, .. } => {
+                        Some(first_frame_at)
+                    }
+                    _ => None,
+                };
+                active.note_frame(id, first_frame_at);
             }
             sync_journal(active, &mut journal_path, &mut journal_written);
 
@@ -1010,6 +1016,12 @@ pub fn spawn(
                 let _ = notice_tx.try_send(Notice::State(air));
             }
             if air.finished() {
+                // Тёплый DVR открывает файлы сразу по EnterDvr — ждём
+                // финализации writer'ов (Cues, патчи, sync), чтобы не
+                // читать дописываемый файл.
+                for recorder in recorders.values() {
+                    recorder.wait_finalized(Duration::from_secs(5));
+                }
                 let journal = core.take().unwrap().into_journal();
                 let _ = notice_tx.try_send(Notice::EnterDvr { journal });
                 break;

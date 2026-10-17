@@ -23,15 +23,36 @@ use mp4::IsobmffWriter;
 
 use crate::config::camera::ContainerConfig;
 
-/// Состояние записи: writer жив и пишет на диск.
+/// Состояние записи: жизненный цикл writer-потока.
+/// Idle → Preparing (файл создан) → Writing (первый кадр был — метка
+/// внутри варианта, не Option) → Finalizing (стоп, финализация в фоне)
+/// → Done (guard по ВСЕМ выходам потока). Из Preparing/Writing → Failed
+/// (encode/write-ошибка). Тёплый DVR ждёт Done перед открытием файлов —
+/// иначе open попадает в дописываемый файл.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RecordState {
-    pub ok: bool,
-    /// Скользящий fps фактически пишущихся кадров (окно ~0.5 с).
-    pub fps: f32,
-    /// Время первого кадра записи (из `Frame::timestamp`, момент
-    /// добавления в очередь записи). None — кадров ещё не было.
-    pub first_frame_at: Option<Instant>,
+pub enum RecordState {
+    /// Письма нет: начальное, между сессиями.
+    Idle,
+    /// Файл создан, первого кадра ещё не было.
+    Preparing,
+    /// Пишет: первый кадр был.
+    Writing { first_frame_at: Instant, fps: f32 },
+    /// Умер по ошибке (encode/write fail) — запись оборвана.
+    Failed,
+    /// Стоп: финализируется в фоне (Cues, патчи, sync).
+    Finalizing,
+    /// Финализация завершена — файл можно открывать.
+    Done,
+}
+
+/// Guard: поток writer'а завершился (по ЛЮБОМУ выходу, включая ранние
+/// return по ошибкам) — ждущие тёплый DVR отпускает.
+struct SetDone(SharedRecordState);
+
+impl Drop for SetDone {
+    fn drop(&mut self) {
+        self.0.store(RecordState::Done);
+    }
 }
 
 /// Общий для потока и UI хэндл состояния записи.
@@ -145,11 +166,7 @@ impl Recorder {
             ContainerConfig::Mov => Box::new(IsobmffWriter::create_mov(&path, resolution)?),
             ContainerConfig::Mp4 => Box::new(IsobmffWriter::create_mp4(&path, resolution)?),
         };
-        state.store(RecordState {
-            ok: true,
-            fps: 0.0,
-            first_frame_at: None,
-        });
+        state.store(RecordState::Preparing);
         let writer_path = path.clone();
         let (sender, receiver) = crossbeam_channel::bounded::<(
             std::sync::Arc<crate::driver::camera::capture::Frame>,
@@ -161,6 +178,9 @@ impl Recorder {
         let abort_clone = std::sync::Arc::clone(&abort);
         // В поток уходят owned-копии: ссылки на параметры не 'static.
         let thread = std::thread::spawn(move || {
+            // Финализация (включая ранние return по ошибкам) завершена —
+            // будим ждущих тёплый DVR.
+            let _done = SetDone(state_clone.clone());
             let mut last_sync = Instant::now();
             // Замер пишущихся кадров для UI: второй, независимый от
             // capture-потока счётчик — отражает потери в канале.
@@ -172,6 +192,14 @@ impl Recorder {
             let mut encode = crate::driver::camera::fps::FrameStats::default();
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((frame, ts)) = receiver.recv() {
+                // Первый принятый кадр — запись началась: метка старта
+                // для журнала и UI (таймстемп кадра, не момент приёма).
+                if matches!(state_clone.load(), RecordState::Preparing) {
+                    state_clone.store(RecordState::Writing {
+                        first_frame_at: frame.timestamp,
+                        fps: 0.0,
+                    });
+                }
                 // Перекодированный jpeg текущего кадра: живёт до конца
                 // итерации, освобождается после write_frame.
                 let encoded: Option<Vec<u8>>;
@@ -194,12 +222,7 @@ impl Recorder {
                             Ok(jpeg) => jpeg,
                             Err(e) => {
                                 log::error!("dvr: jpeg encode failed, recording aborted: {}", e);
-                                state_clone.store(RecordState {
-                                    ok: false,
-                                    fps: 0.0,
-                                    // Старт записи (если был) не затираем.
-                                    first_frame_at: state_clone.load().first_frame_at,
-                                });
+                                state_clone.store(RecordState::Failed);
                                 return;
                             }
                         };
@@ -217,12 +240,7 @@ impl Recorder {
                 };
                 if let Err(e) = writer.write_frame(data, ts) {
                     log::error!("dvr: write failed, recording aborted: {}", e);
-                    state_clone.store(RecordState {
-                        ok: false,
-                        fps: 0.0,
-                        // Старт записи (если был) не затираем.
-                        first_frame_at: state_clone.load().first_frame_at,
-                    });
+                    state_clone.store(RecordState::Failed);
                     return;
                 }
                 // Кадр (Arc) ещё жив: замер от его таймстемпа до конца
@@ -232,11 +250,13 @@ impl Recorder {
                 // Пауза кадров не затирает последнее известное значение:
                 // записываем только свежий замер.
                 if let Some(fps) = fps_counter.fps() {
-                    state_clone.store(RecordState {
-                        ok: true,
+                    let first_frame_at = match state_clone.load() {
+                        RecordState::Writing { first_frame_at, .. } => first_frame_at,
+                        other => panic!("dvr: fps update in {other:?}"),
+                    };
+                    state_clone.store(RecordState::Writing {
+                        first_frame_at,
                         fps: fps as f32,
-                        // Метку первого кадра ставит sink, тут не трогаем.
-                        first_frame_at: state_clone.load().first_frame_at,
                     });
                 }
                 if last_sync.elapsed() >= SYNC_INTERVAL {
@@ -248,12 +268,7 @@ impl Recorder {
             }
             // Канал закрыт. REC гасим до (медленного) fsync, чтобы
             // индикатор не висел.
-            state_clone.store(RecordState {
-                ok: false,
-                fps: 0.0,
-                // Метка первого кадра остаётся — запись была, файлы есть.
-                first_frame_at: state_clone.load().first_frame_at,
-            });
+            state_clone.store(RecordState::Finalizing);
             match writer.finalize() {
                 Ok(()) => log::info!("dvr: finalized {:?}", writer_path),
                 Err(e) => log::error!("dvr: finalize failed for {:?}: {}", writer_path, e),
@@ -297,7 +312,10 @@ impl Recorder {
     /// показал). Переполнение канала = дроп кадра + warn (захват важнее
     /// записи).
     pub fn push(&self, frame: std::sync::Arc<crate::driver::camera::capture::Frame>, ts: u64) {
-        if !self.state.load().ok {
+        if !matches!(
+            self.state.load(),
+            RecordState::Preparing | RecordState::Writing { .. }
+        ) {
             return;
         }
         if let Some(sender) = &self.sender {
@@ -340,11 +358,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("laps-dvr-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
-            ok: false,
-            fps: 0.0,
-            first_frame_at: None,
-        }));
+        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
         let params = super::RecordParams {
             dir: dir.clone(),
             stem: "test-stem".to_owned(),
@@ -377,10 +391,10 @@ mod tests {
         // Джойна нет по дизайну — ждём гашение REC (writer гасит его по
         // закрытию канала, до finalize/fsync).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while state.load().ok && std::time::Instant::now() < deadline {
+        while !matches!(state.load(), RecordState::Done) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(!state.load().ok);
+        assert_eq!(state.load(), RecordState::Done);
 
         // Видеофайл есть (контейнер по умолчанию — MKV), других файлов нет.
         let entries: Vec<_> = std::fs::read_dir(&dir)
@@ -419,11 +433,7 @@ mod tests {
                 std::process::id()
             ));
             std::fs::create_dir_all(&dir).unwrap();
-            let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
-                ok: false,
-                fps: 0.0,
-                first_frame_at: None,
-            }));
+            let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
             let mut camera = CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg);
             camera.dvr.container = container;
             let params = super::RecordParams {
@@ -469,9 +479,12 @@ mod tests {
             } // drop: writer финализирует в фоне
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while state.load().ok && std::time::Instant::now() < deadline {
+            while !matches!(state.load(), RecordState::Done)
+                && std::time::Instant::now() < deadline
+            {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            assert_eq!(state.load(), RecordState::Done);
 
             let ext = match container {
                 ContainerConfig::Mkv => "mkv",
@@ -508,11 +521,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("laps-dvr-abort-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
-            ok: false,
-            fps: 0.0,
-            first_frame_at: None,
-        }));
+        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
         let params = super::RecordParams {
             dir: dir.clone(),
             stem: "abort-stem".to_owned(),

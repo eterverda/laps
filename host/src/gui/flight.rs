@@ -841,13 +841,24 @@ impl Flight {
                                 Some(w) if w.capture_state() == CaptureState::Dead => {
                                     "\u{f03d} error".to_owned()
                                 }
-                                Some(w) if rec_on && !w.record_state().ok => {
+                                Some(w)
+                                    if rec_on
+                                        && matches!(
+                                            w.record_state(),
+                                            crate::driver::dvr::RecordState::Failed
+                                        ) =>
+                                {
                                     "\u{f16df} error".to_owned()
                                 }
-                                Some(w) if w.record_state().ok && w.record_state().fps > 0.0 => {
-                                    format!("\u{f16df} {:.0}fps", w.record_state().fps)
-                                }
-                                _ => format!("\u{f16df} {target}"),
+                                Some(w) => match w.record_state() {
+                                    crate::driver::dvr::RecordState::Writing { fps, .. }
+                                        if fps > 0.0 =>
+                                    {
+                                        format!("\u{f16df} {:.0}fps", fps)
+                                    }
+                                    _ => format!("\u{f16df} {target}"),
+                                },
+                                None => format!("\u{f16df} {target}"),
                             }
                         })
                         .collect();

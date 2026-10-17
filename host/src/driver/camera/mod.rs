@@ -180,6 +180,22 @@ impl Recorder {
     pub fn record_state(&self) -> RecordState {
         self.record_state.load()
     }
+
+    /// Дождаться завершения фоновой финализации записи (bounded).
+    /// Тёплый DVR открывает файлы немедленно по закрытию гонки — без
+    /// ожидания open попадает в дописываемый файл. Флаг — поле
+    /// RecordState.done (централизовано, отдельной ячейки нет).
+    pub fn wait_finalized(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while !matches!(self.record_state.load(), RecordState::Done)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !matches!(self.record_state.load(), RecordState::Done) {
+            log::warn!("dvr: finalize wait timed out");
+        }
+    }
 }
 
 pub struct Camera {
@@ -219,11 +235,8 @@ impl Camera {
         let slot: ImageSlot = Arc::default();
         let running = Arc::new(AtomicBool::new(true));
         let capture_state: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
-        let record_state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
-            ok: false,
-            fps: 0.0,
-            first_frame_at: None,
-        }));
+        let record_state: SharedRecordState =
+            Arc::new(AtomicCell::new(RecordState::Idle));
         let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
         let ui_latency = Arc::new(Mutex::new(fps::FrameStats::default()));
         // 1×1-пустышка: id валиден с рождения, размер возьмёт первый кадр
@@ -640,11 +653,7 @@ mod tests {
             slot: Arc::clone(&slot),
             on_frame: Arc::new(|| {}),
         };
-        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState {
-            ok: false,
-            fps: 0.0,
-            first_frame_at: None,
-        }));
+        let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
         let dir = std::env::temp_dir().join(format!("laps-pipe-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let negotiated = CaptureFormat {
@@ -661,7 +670,6 @@ mod tests {
             stem: "test-stem".to_owned(),
             camera: CameraConfig::new("Test", 8, 8, 60, PixelConfig::Yuyv),
         });
-        assert!(state.load().ok, "recorder must be live");
 
         let mut dj = fps::FrameStats::default();
         let mut dy = fps::FrameStats::default();
@@ -674,6 +682,18 @@ mod tests {
             &mut dj,
             &mut dy
         ));
+        // Writing ставит worker по факту первого кадра (асинхронно) —
+        // ждём, а не проверяем немедленно.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(state.load(), RecordState::Writing { .. })
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(state.load(), RecordState::Writing { .. }),
+            "recorder must be live"
+        );
         assert!(
             matches!(
                 &slot.lock().unwrap().as_ref().map(|f| &f.data),

@@ -34,12 +34,21 @@ impl Default for StartSignalDelay {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct RaceRules {
     pub start_signal_delay: StartSignalDelay,
     /// Лимит длительности гонки. None — без лимита: гонка идёт, пока
     /// её не завершат (RACE/REC/EXIT).
     pub duration: Option<Duration>,
+}
+
+impl Default for RaceRules {
+    fn default() -> Self {
+        Self {
+            start_signal_delay: Default::default(),
+            duration: Some(Duration::from_secs(15)),
+        }
+    }
 }
 
 /// Число бипов отсчёта перед стартовой паузой.

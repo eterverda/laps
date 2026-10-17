@@ -279,8 +279,7 @@ impl Flight {
             let pos = t.position();
             let speed = t.velocity();
             for (id, player) in self.players.iter() {
-                let file =
-                    Self::clip_rec_ms(&clip, id).map_or(pos, |rec| pos.saturating_sub(rec));
+                let file = Self::clip_rec_ms(&clip, id).map_or(pos, |rec| pos.saturating_sub(rec));
                 player.sync(file.min(player.duration()), speed);
             }
         }
@@ -317,9 +316,7 @@ impl Flight {
                     // домене сессии — маппинг не нужен.
                     let circle = self.transport.as_ref().and_then(|t| t.circle()).map(|c| {
                         let lo = c.center.saturating_sub(c.radius).saturating_sub(dvr_start);
-                        let hi = (c.center + c.radius)
-                            .min(dvr_end)
-                            .saturating_sub(dvr_start);
+                        let hi = (c.center + c.radius).min(dvr_end).saturating_sub(dvr_start);
                         (lo as f32 / dvr_span as f32, hi as f32 / dvr_span as f32)
                     });
                     // Растяжение сосиски до минимума: реальный круг уже
@@ -351,9 +348,12 @@ impl Flight {
                         )
                     });
                     // Точка отсчёта: момент RaceCountdown на полоске.
-                    let marker = clip.as_ref().and_then(|clip| clip.race_countdown_ms).map(
-                        |cd| (cd.saturating_sub(dvr_start) as f32 / dvr_span as f32).clamp(0.0, 1.0),
-                    );
+                    let marker = clip
+                        .as_ref()
+                        .and_then(|clip| clip.race_countdown_ms)
+                        .map(|cd| {
+                            (cd.saturating_sub(dvr_start) as f32 / dvr_span as f32).clamp(0.0, 1.0)
+                        });
                     // Каретка — цветом активного транспортного контролла.
                     let (response, events) = self.timeline.show(
                         ui,
@@ -1098,9 +1098,7 @@ impl Flight {
                     (Some(p), Some((_, rec))) => {
                         let shown_session = rec + p.shown();
                         match tp {
-                            Some(tp) if tp.abs_diff(shown_session) <= DIAL_LAG_MS => {
-                                shown_session
-                            }
+                            Some(tp) if tp.abs_diff(shown_session) <= DIAL_LAG_MS => shown_session,
                             _ => tp.unwrap_or(shown_session),
                         }
                     }
@@ -1148,7 +1146,12 @@ impl Flight {
         match clip {
             Some(clip) => match (clip.files.get(camera_id), players.get(camera_id)) {
                 (Some((_, file_ms)), Some(p)) => {
-                    journal_pos < *file_ms || journal_pos >= file_ms + p.duration()
+                    // Покрытие — до КОНЦА последнего кадра (duration +
+                    // last_step): кадр демонстрируется интервал, а не
+                    // мгновение, иначе хвост до record-finished (~период
+                    // кадра) читался бы как гэп с плейсхолдером.
+                    journal_pos < *file_ms
+                        || journal_pos >= *file_ms + p.duration() + p.last_step()
                 }
                 _ => false,
             },

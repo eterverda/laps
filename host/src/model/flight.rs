@@ -289,7 +289,6 @@ pub fn race_clip<'a>(events: impl IntoIterator<Item = (u64, &'a FlightEvent)>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn sample_journal() -> Journal {
         let date_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();

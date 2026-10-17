@@ -161,15 +161,34 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
     IsobmffWriter::create_mov/create_mp4)
 - One file per recording start; **no segment rotation** (documented gap)
 - Стем имён файлов — `date_time` первого события журнала (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
-- Журнал полёта (`model::flight::Journal`, единый тип: события + буфер стрима + путь): yaml-стрим `captures/<stem>.yaml` — документ на эвент (`{ms, <variant>: …}`), разделители `---`; владение — фазовое: в эфире журнал внутри RaceCore (он единственный писатель), файл открывается `open_file` только при старте гонки (до старта — события в памяти, без гонки файла нет), при закрытии гонки ядро шлёт `Notice::EnterDvr { journal }` и владение переходит в GUI (`Flight.journal: Option<Journal>`): правки DVR (`retain` — добавление/удаление событий) — там же, файл переписывается атомарно (`<stem>.yaml~` + rename). Метки — мс от старта журнала; `RecordingStarted` — по новому значению `RecordState.first_frame_at` (момент из `Frame::timestamp`, ставится в `DvrSink::on_frame`, поллит поток-обёртка), имя файла сессии привязывается FIFO-очередью стартов (`rec_pending` в ядре); события RecordingStarted до старта гонки откладываются и пишутся с исходными таймстампами в момент старта гонки, при отмене записи без гонки выбрасываются; `RaceFinished.prematurely`: true — кнопкой/выходом, false — лимитом длительности/REC-стопом
+- Журнал полёта (`model::flight::Journal` — чистые данные: заголовок
+  `JournalHeader` первым документом без метки + события `Vec<(ms,
+  FlightEvent)>`): yaml-стрим `captures/<stem>.yaml`, документ на эвент
+  (`{ms, <variant>: …}`), разделители `---`. Файлом журнал не владеет:
+  запись — свободные функции `snapshot` (полный стрим, tmp+rename:
+  первое создание и перезапись после правок) и `append` (copy-append-
+  rename новых документов, счётчик дописанных держит писатель). В эфире
+  журнал внутри RaceCore (единственный писатель событий), поток-обёртка
+  синкает его на диск: снапшот на старте гонки, дальше append; при
+  закрытии гонки `Notice::EnterDvr { journal }` — владение в GUI
+  (`Flight.journal`): правки DVR (`retain`) в памяти + снапшот. События:
+  `RecordStarted` (REC-on, без камер) / `VideoAttached {camera_id,
+  filename}` (метка — первый кадр файла, из `RecordState::Writing.
+  first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
+  `RaceCountdown` (нажатие RACE: стартовая позиция курсора DVR + точка
+  на таймлайне) / `RaceStarted` / `RaceFinished{prematurely}` /
+  `RecordFinished` (коммит). События до старта гонки откладываются и
+  пишутся в старт гонки, при отмене выбрасываются; сессии без файла
+  молча снимаются при коммите (GUI рисует Error для камер без
+  VideoAttached)
 - Writer thread + bounded channel (64): overflow = dropped frame + warn
 - Abort записи: `Recorder::abort()` (команда `Camera::abort_recording`, sink `DvrSink::abort()`) ставит флаг; writer после finalize **удаляет файл** (`RecordParams.stem` — полный стем с camera_id и номером сессии). Flight: `stop_recording_all(commit)`, commit = `race_started()` — записи вне гонки удаляются, гоночные остаются
   (capture outranks recording); periodic sync every 5 s; `Drop` detaches
   the thread intentionally (finalize+sync_all in background, no join —
   don't "fix" without reading the comment in `Recorder::drop`)
 - File created in `Recorder::start` on the caller's thread, so disk errors
-  reach the UI; unrecoverable write errors flip `RecordState{ok:false}`
-  and the UI shows REC error
+  reach the UI; unrecoverable write errors move `RecordState` to
+  `Failed` and the UI shows REC error
 - Timestamp prefix for file names: `time` crate,
   `format_description!` — components must be bracketed (`[year]`), bare
   names emit literals

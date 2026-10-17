@@ -41,6 +41,27 @@ pub enum PlayerState {
     Failed(String),
 }
 
+/// Холодные метаданные файла: выставляются один раз при открытии,
+/// читаются каждый кадр — рядом с состоянием, под общим мьютексом
+/// (отдельные атомики им ни к чему: пишутся единожды).
+#[derive(Clone, Copy, Debug)]
+pub struct Meta {
+    /// Pts последнего кадра, мс.
+    pub duration: u64,
+    /// Интервал последнего кадра (pts[last] − pts[last−1]): последний
+    /// кадр «держится» на экране столько же, сколько предпоследний —
+    /// для расчёта гэпов покрытие файла = duration + last_step.
+    pub last_step: u64,
+    pub resolution: crate::driver::dvr::Resolution,
+}
+
+/// Состояние + метаданные: одна блокировка на холодные данные.
+struct Inner {
+    state: PlayerState,
+    /// None — открытие не завершилось.
+    meta: Option<Meta>,
+}
+
 /// Команды в worker: пришедшие до готовности ждут в очереди канала.
 /// Единственная команда — транспортный синк: позиция файла и знаковая
 /// скорость. Позиция — base на момент синка; между синками worker
@@ -58,14 +79,12 @@ pub struct Player {
     /// Текстура 1×1 пустышка из open(); первый кадр расширит set'ом.
     /// TextureId стабилен всю жизнь Player.
     texture: egui::TextureHandle,
-    state: Arc<Mutex<PlayerState>>,
+    /// Состояние открытия + метаданные (холодные, пишутся один раз).
+    inner: Arc<Mutex<Inner>>,
     /// Pts показанного кадра (мс от начала файла) — источник циферблата.
-    /// Пишет worker при публикации кадра, читает UI.
+    /// Единственная горячая ячейка: пишет worker при публикации кадра,
+    /// читает UI каждый кадр.
     shown: Arc<AtomicCell<u64>>,
-    /// 0, пока идёт open.
-    duration: Arc<AtomicCell<u64>>,
-    /// Разрешение файла; 0×0, пока идёт open.
-    resolution: Arc<AtomicCell<crate::driver::dvr::Resolution>>,
     commands: crossbeam_channel::Sender<Command>,
     /// Останов и join worker-потока (Drop).
     running: Arc<AtomicBool>,
@@ -77,13 +96,11 @@ impl Player {
     /// и само воспроизведение — в worker-потоке.
     pub fn open(path: &std::path::Path, ctx: egui::Context) -> Self {
         let slot: FrameSlot = Arc::new(Mutex::new(None));
-        let state = Arc::new(Mutex::new(PlayerState::Opening));
-        let shown = Arc::new(AtomicCell::new(0u64));
-        let duration = Arc::new(AtomicCell::new(0u64));
-        let resolution = Arc::new(AtomicCell::new(crate::driver::dvr::Resolution {
-            width: 0,
-            height: 0,
+        let inner = Arc::new(Mutex::new(Inner {
+            state: PlayerState::Opening,
+            meta: None,
         }));
+        let shown = Arc::new(AtomicCell::new(0u64));
         // Очередь синков с запасом: UI шлёт их каждый кадр (~60/с),
         // worker забирает по дедлайну; рывок UI-цикла не должен
         // дропать свежий синк (try_send, очередь полна — пропуск).
@@ -99,25 +116,19 @@ impl Player {
         );
         let thread = thread::spawn({
             let slot = Arc::clone(&slot);
-            let state = Arc::clone(&state);
+            let inner = Arc::clone(&inner);
             let shown = Arc::clone(&shown);
-            let duration = Arc::clone(&duration);
-            let resolution = Arc::clone(&resolution);
             let running = Arc::clone(&running);
             let path = path.to_path_buf();
             move || {
-                playback_loop(
-                    path, ctx, slot, state, shown, duration, resolution, running, command_rx,
-                );
+                playback_loop(path, ctx, slot, inner, shown, running, command_rx);
             }
         });
         Self {
             slot,
             texture,
-            state,
+            inner,
             shown,
-            duration,
-            resolution,
             commands,
             running,
             thread: Some(thread),
@@ -126,7 +137,7 @@ impl Player {
 
     /// Открытие файла: scrub рисует индикатор, пока Opening.
     pub fn open_state(&self) -> PlayerState {
-        self.state.lock().unwrap().clone()
+        self.inner.lock().unwrap().state.clone()
     }
 
     /// Транспортный синк: позиция (мс по файлу) и знаковая скорость.
@@ -149,13 +160,20 @@ impl Player {
 
     /// Общая длительность: pts последнего кадра, мс. 0, пока идёт open.
     pub fn duration(&self) -> u64 {
-        self.duration.load()
+        self.inner.lock().unwrap().meta.map_or(0, |m| m.duration)
+    }
+
+    /// Интервал последнего кадра, мс (0 — открытие не завершилось или
+    /// кадр один). Покрытие файла для гэпов: duration + last_step —
+    /// последний кадр демонстрируется столько же, сколько предпоследний.
+    pub fn last_step(&self) -> u64 {
+        self.inner.lock().unwrap().meta.map_or(0, |m| m.last_step)
     }
 
     /// Разрешение файла; None, пока идёт open.
     pub fn resolution(&self) -> Option<crate::driver::dvr::Resolution> {
-        let r = self.resolution.load();
-        (r.height > 0).then_some(r)
+        let meta = self.inner.lock().unwrap().meta;
+        meta.and_then(|m| (m.resolution.height > 0).then_some(m.resolution))
     }
 
     /// Текстура последнего кадра. Id стабилен с open().
@@ -189,10 +207,8 @@ fn playback_loop(
     path: std::path::PathBuf,
     ctx: egui::Context,
     slot: FrameSlot,
-    state: Arc<Mutex<PlayerState>>,
+    inner: Arc<Mutex<Inner>>,
     shown: Arc<AtomicCell<u64>>,
-    duration: Arc<AtomicCell<u64>>,
-    resolution: Arc<AtomicCell<crate::driver::dvr::Resolution>>,
     running: Arc<AtomicBool>,
     commands: crossbeam_channel::Receiver<Command>,
 ) {
@@ -498,13 +514,12 @@ fn playback_loop(
         Ok(reader) => reader,
         Err(e) => {
             log::error!("player: {}: {e}", path.display());
-            *state.lock().unwrap() = PlayerState::Failed(e.to_string());
+            inner.lock().unwrap().state = PlayerState::Failed(e.to_string());
             ctx.request_repaint();
             return;
         }
     };
     let dims = reader.resolution();
-    resolution.store(dims);
     let pts: Vec<u64> = (0..reader.frame_count())
         .map(|i| reader.timestamp(i))
         .collect();
@@ -539,20 +554,33 @@ fn playback_loop(
     if pb.pts.is_empty() {
         let e = io::Error::new(io::ErrorKind::InvalidData, "no frames");
         log::error!("player: {}: {e}", path.display());
-        *state.lock().unwrap() = PlayerState::Failed(e.to_string());
+        inner.lock().unwrap().state = PlayerState::Failed(e.to_string());
         pb.ctx.request_repaint();
         return;
     }
     // «Готов» = «первый кадр на экране», как у Camera.
     if let Err(e) = pb.read_and_present(0, false) {
         log::error!("player: {}: {e}", path.display());
-        *state.lock().unwrap() = PlayerState::Failed(e.to_string());
+        inner.lock().unwrap().state = PlayerState::Failed(e.to_string());
         pb.ctx.request_repaint();
         return;
     }
     pb.shown.store(pb.pts[0]);
-    duration.store(pb.duration);
-    *state.lock().unwrap() = PlayerState::Ready;
+    {
+        let last_step = pb
+            .pts
+            .last()
+            .zip(pb.pts.get(pb.pts.len().saturating_sub(2)))
+            .map(|(last, prev)| last.saturating_sub(*prev))
+            .unwrap_or(0);
+        let mut guard = inner.lock().unwrap();
+        guard.meta = Some(Meta {
+            duration: pb.duration,
+            last_step,
+            resolution: dims,
+        });
+        guard.state = PlayerState::Ready;
+    }
     log::info!(
         "player: {} frames, {} ms span, max frame {} bytes",
         pb.pts.len(),

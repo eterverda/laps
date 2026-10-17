@@ -338,6 +338,7 @@ impl RaceCore {
                 let delay = self.countdown_delay();
                 self.rec_deferred
                     .push((self.ms(now), FlightEvent::RecordStarted {}));
+                self.defer_countdown(now);
                 self.state = State::RaceCountdown { start: now, delay };
                 vec![
                     Effect::Record {
@@ -348,10 +349,14 @@ impl RaceCore {
             }
             State::RecordHead => {
                 let delay = self.countdown_delay();
+                self.defer_countdown(now);
                 self.state = State::RaceCountdown { start: now, delay };
                 vec![Effect::Countdown { delay }]
             }
             State::RaceCountdown { .. } => {
+                // Отмена: отложенный отсчёт не состоялся — выбрасываем.
+                self.rec_deferred
+                    .retain(|(_, ev)| !matches!(ev, FlightEvent::RaceCountdown {}));
                 self.state = State::RecordHead;
                 vec![Effect::CancelAudio]
             }
@@ -450,6 +455,15 @@ impl RaceCore {
         }
     }
 
+    /// Отложенный RaceCountdown: повторное нажатие RACE (REC-циклы
+    /// до гонки) не плодит дубликаты — старый выбрасываем.
+    fn defer_countdown(&mut self, now: Instant) {
+        self.rec_deferred
+            .retain(|(_, ev)| !matches!(ev, FlightEvent::RaceCountdown {}));
+        self.rec_deferred
+            .push((self.ms(now), FlightEvent::RaceCountdown {}));
+    }
+
     fn countdown_delay(&self) -> Duration {
         Duration::from_secs(PRE_BEEP_SECS) + sample_start_delay(&self.rules.start_signal_delay)
     }
@@ -544,6 +558,7 @@ mod tests {
                     FlightEvent::RecordStarted {} => "rec",
                     FlightEvent::RecordFinished {} => "rec-end",
                     FlightEvent::VideoAttached { .. } => "file",
+                    FlightEvent::RaceCountdown {} => "cd",
                     FlightEvent::RaceStarted {} => "go",
                     FlightEvent::RaceFinished { prematurely } => {
                         if *prematurely {
@@ -598,8 +613,9 @@ mod tests {
         let marks = journal_marks(&core);
         assert_eq!(marks[0], (0, "rec"), "REC-on головы: {marks:?}");
         assert_eq!(marks[1], (500, "file"), "файл головы: {marks:?}");
+        assert_eq!(marks[2], (500, "cd"), "отсчёт: {marks:?}");
         assert_eq!(
-            marks[2],
+            marks[3],
             (500 + delay.as_millis() as u64, "go"),
             "{marks:?}"
         );
@@ -608,7 +624,7 @@ mod tests {
         let t_finish = clock.advance(DURATION.as_millis() as u64);
         assert!(matches!(core.tick(t_finish).as_slice(), [Effect::Buzzer]));
         assert_eq!(
-            journal_marks(&core)[3],
+            journal_marks(&core)[4],
             (
                 500 + delay.as_millis() as u64 + DURATION.as_millis() as u64,
                 "finish-auto"
@@ -801,6 +817,7 @@ mod tests {
             marks,
             vec![
                 (0, "rec"),
+                (0, "cd"),
                 (3_000, "go"),
                 (3_100, "file"),
                 (23_100, "finish-auto"),

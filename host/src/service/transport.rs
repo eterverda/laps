@@ -1,15 +1,15 @@
-//! Головка воспроизведения: модель путешествия по времени записи.
-//! Чистая логика — ни потоков, ни декодера, ни UI: позиция = base +
-//! ∫скорость (скорость кусочная: дискретные команды мгновенны,
-//! шаттл — с рампой ease-out). Единственный
-//! источник времени для всех: плееру головка говорит, какую позицию
-//! показывать, трекерам (таймер, шкала) — сколько сейчас времени.
+//! Транспорт DVR: общая модель путешествия по времени сессии записи
+//! (REC on → REC off). Чистая логика — ни потоков, ни декодера, ни UI:
+//! позиция = base + ∫скорость (скорость кусочная: дискретные команды
+//! мгновенны, шаттл — с рампой ease-out). Живёт у экрана (Flight),
+//! владеет навигацией по полоске; плееры — доставщики кадров, worker'ы
+//! экстраполируют от последнего синка на своих часах.
 //!
 //! Время внешнее: ядро `_at` принимает `now: Instant` — приватное,
 //! тесты живут в этом же модуле и крутят часы сами: сценарии
 //! проверяются мгновенно и с точностью до миллисекунды, без сна и
 //! допусков. Снаружи видны только реалтайм-обёртки (Instant::now()
-//! внутри) — worker плеера зовёт их.
+//! внутри).
 
 use std::time::{Duration, Instant};
 
@@ -49,8 +49,8 @@ pub struct Circle {
     pub radius: u64,
 }
 
-/// Головка воспроизведения. Все моменты времени — мс от начала записи.
-pub struct Playhead {
+/// Транспорт: все моменты времени — мс по шкале сессии записи.
+pub struct Transport {
     /// pts на base_at при base_speed; дальше позиция = base + ∫скорость.
     base_at: Instant,
     base_position: u64,
@@ -75,7 +75,7 @@ pub struct Playhead {
     duration: u64,
 }
 
-impl Playhead {
+impl Transport {
     pub fn new(now: Instant, duration: u64) -> Self {
         Self {
             base_at: now,
@@ -92,8 +92,8 @@ impl Playhead {
     }
 
     // Реалтайм-обёртки: то же ядро `_at` на Instant::now(). Рабочий
-    // путь (worker плеера) зовёт эти; тесты — `_at` с фиктивными
-    // часами: сценарии мгновенные и точные до миллисекунды.
+    // путь (экран, синки в плееры) зовёт эти; тесты — `_at` с
+    // фиктивными часами: сценарии мгновенные и точные до миллисекунды.
 
     pub fn position(&self) -> u64 {
         self.position_at(Instant::now())
@@ -146,12 +146,12 @@ impl Playhead {
         self.circle
     }
 
-    /// Позиция на момент now (трекеры читают это каждый кадр).
+    /// Позиция на момент now (циферблат и синки читают это каждый кадр).
     fn position_at(&self, now: Instant) -> u64 {
         self.eval_at(now).1
     }
 
-    /// Эффективная скорость на момент now (worker считает дедлайны
+    /// Эффективная скорость на момент now (плееры считают дедлайны
     /// кадров; во время рампы — профильная, не скоммиченная).
     fn velocity_at(&self, now: Instant) -> f64 {
         self.eval_at(now).0
@@ -167,14 +167,8 @@ impl Playhead {
         self.gesture.as_ref().is_some_and(|g| g.resume == 0.0)
     }
 
-    /// Идёт рампа скорости (жест разгоняется/тормозит): worker капает
-    /// дедлайны по RAMP_POLL, а не по дальности кадра.
-    pub fn is_ramping(&self) -> bool {
-        self.ramp.is_some()
-    }
-
     /// Продвинуть время до now: коммитить завершившиеся рампы,
-    /// останавливаться на границах файла. Worker зовёт раз за цикл
+    /// останавливаться на границах шкалы. Зовут раз за цикл чтения
     /// (между циклами позиция движется сама — формула замкнута).
     fn sync_at(&mut self, now: Instant) {
         self.commit_at(now);
@@ -489,7 +483,7 @@ mod tests {
     fn linear_run_and_pause_freezes() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.play_at(t0);
         assert!(p.is_running());
         // 300 мс × 1x = 300 мс, ровно.
@@ -507,14 +501,14 @@ mod tests {
     fn ramp_lands_continuously_at_exact_speed() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.play_at(t0);
         clock.advance(300);
         p.shuttle_at(clock.now, 10.0);
         // Рампа hold: минимум 1500 мс.
         let t_land = clock.advance(1700);
         p.sync_at(t_land);
-        assert!(!p.is_ramping());
+        assert_eq!(p.velocity_at(clock.now), 10.0, "рампа приземлилась");
         // Приземление бесшовно: позиция на стыке = интеграл, без скачка.
         let at_land = p.position_at(t_land);
         clock.advance(300);
@@ -526,7 +520,7 @@ mod tests {
     fn release_from_pause_stops_instantly_on_frame() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.seek_at(t0, 1000);
         p.shuttle_at(clock.now, 5.0);
         clock.advance(500);
@@ -542,7 +536,7 @@ mod tests {
     fn release_during_play_ramps_back_to_play_speed() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.play_at(t0);
         clock.advance(300);
         p.shuttle_at(clock.now, -10.0);
@@ -552,7 +546,7 @@ mod tests {
         // Возврат к resume-скорости 1x: рампа 500 мс, затем ровный ход.
         let t_land = clock.advance(600);
         p.sync_at(t_land);
-        assert!(!p.is_ramping());
+        assert_eq!(p.velocity_at(clock.now), 1.0, "рампа вернулась к 1x");
         let at_land = p.position_at(t_land);
         clock.advance(300);
         assert_eq!(p.position_at(clock.now), at_land + 300);
@@ -562,7 +556,7 @@ mod tests {
     fn reversal_ramp_passes_through_zero_without_sticking() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         // Стартуем подальше от нуля: профиль рампы от 1x к −5x за
         // 1500 мс интегрально уходит ниже стартовой позиции — при
         // старте с 2000 мс упёрся бы в границу (стоп, не залипание).
@@ -582,14 +576,14 @@ mod tests {
     fn set_speed_reanchors_without_jump() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.play_at(t0);
         clock.advance(200);
         p.set_speed_at(clock.now, 2.0);
         // Бесшовно: 2x с момента смены.
         assert_eq!(p.position_at(clock.advance(200)), 600);
         // Скорость на паузе (park) не двигает время, помнится для play.
-        let mut q = Playhead::new(t0, DUR);
+        let mut q = Transport::new(t0, DUR);
         q.set_speed_at(t0, 0.5);
         assert!(!q.is_running());
         assert_eq!(q.position_at(clock.advance(100)), 0);
@@ -603,7 +597,7 @@ mod tests {
     fn hold_from_stop_starts_at_base() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.seek_at(t0, 1000);
         p.shuttle_at(clock.now, 5.0);
         assert!(p.is_running());
@@ -618,7 +612,7 @@ mod tests {
     fn seek_during_play_continues_at_play_speed() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.play_at(t0);
         clock.advance(100);
         // Жест перемотки внес бы эффективную скорость в базу — seek
@@ -633,7 +627,7 @@ mod tests {
     fn edges_stop_playback() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, 400);
+        let mut p = Transport::new(t0, 400);
         p.play_at(t0);
         clock.advance(600);
         p.sync_at(clock.now);
@@ -651,7 +645,7 @@ mod tests {
     fn circle_wraps_forward_between_edges() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.seek_at(t0, 10_000);
         // Зона ±1 с на 1x: [9000, 11000). Центр — позиция включения.
         p.set_circle_at(
@@ -672,7 +666,7 @@ mod tests {
     fn circle_center_follows_seek_and_shuttle() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.set_circle_at(
             t0,
             Some(Circle {
@@ -705,7 +699,7 @@ mod tests {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
         // Файл 20 с, круг у самого края: «отскакивает чуть раньше».
-        let mut p = Playhead::new(t0, 20_000);
+        let mut p = Transport::new(t0, 20_000);
         p.seek_at(t0, 19_000);
         p.set_circle_at(
             t0,
@@ -724,7 +718,7 @@ mod tests {
     fn circle_covers_video_time_regardless_of_play_speed() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.seek_at(t0, 10_000);
         // Круг — во времени видео: на 2x круг 3 с контента проигрывается
         // за 1.5 с реального времени.
@@ -743,7 +737,7 @@ mod tests {
         // Свои часы: сценарий независим.
         let mut clock2 = FakeClock::new();
         let t1 = clock2.now;
-        let mut q = Playhead::new(t1, DUR);
+        let mut q = Transport::new(t1, DUR);
         q.seek_at(t1, 10_000);
         q.set_speed_at(t1, 0.25);
         q.set_circle_at(
@@ -761,7 +755,7 @@ mod tests {
     fn disabling_circle_continues_from_cursor_position() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.seek_at(t0, 10_000);
         p.set_circle_at(
             t0,
@@ -784,7 +778,7 @@ mod tests {
     fn drag_held_freezes_and_resumes_from_same_position() {
         let mut clock = FakeClock::new();
         let t0 = clock.now;
-        let mut p = Playhead::new(t0, DUR);
+        let mut p = Transport::new(t0, DUR);
         p.play_at(t0);
         clock.advance(1000);
         p.set_drag_held_at(clock.now, true);

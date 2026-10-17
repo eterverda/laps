@@ -14,6 +14,7 @@ use crate::model::flight::{Journal, RaceClip, race_clip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::service::race::{self, AirPhase, AirState, Intent, Notice, Race};
+use crate::service::transport::{Circle, Transport};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -89,6 +90,14 @@ pub struct Flight {
     setup: Setup,
     assignments: HashMap<String, Pilot>,
     active_cameras: HashMap<String, CameraConfig>,
+    /// Транспорт DVR (только DVR-экран): общая головка в домене сессии
+    /// записи. Плееры — доставщики: каждый кадр позиция и скорость
+    /// уходят в плееры синками, worker'ы экстраполируют на своих часах.
+    transport: Option<Transport>,
+    /// Мастер-камера: её показанный кадр — источник позиции циферблата
+    /// (жёсткое соответствие цифры и картинки). Первая по порядку сетапа
+    /// камера с файлом; переключаемая в рантайме.
+    master: String,
     /// Журнал полёта — владение в GUI: приходит с EnterDvr от ядра
     /// (прямой путь) или парсится из файла (холодный вход). Правки DVR
     /// (добавление/удаление событий) — здесь.
@@ -164,6 +173,8 @@ impl Flight {
                 race_done: None,
             },
             race: None,
+            transport: None,
+            master: String::new(),
             webcams: HashMap::new(),
             awake: None,
             rules,
@@ -240,6 +251,7 @@ impl Flight {
         }
         self.dvr_tick();
         self.arm_race_repaint(ui.ctx());
+        self.arm_transport_repaint(ui.ctx());
         self.rew.flash = false;
         self.ff.flash = false;
 
@@ -258,6 +270,20 @@ impl Flight {
         let (dvr_start, dvr_pos, dvr_end) = self.dvr_clock(&clip);
         let dvr_span = dvr_end.saturating_sub(dvr_start).max(1);
         let dvr_ready = self.dvr_ready();
+
+        // Транспорт → плееры: позиция (сессия) и скорость синком на
+        // каждый кадр UI; worker'ы экстраполируют между синками на
+        // своих часах (пейсинг не зависит от частоты кадров UI).
+        if let Some(t) = &mut self.transport {
+            t.sync();
+            let pos = t.position();
+            let speed = t.velocity();
+            for (id, player) in self.players.iter() {
+                let file =
+                    Self::clip_rec_ms(&clip, id).map_or(pos, |rec| pos.saturating_sub(rec));
+                player.sync(file.min(player.duration()), speed);
+            }
+        }
 
         view::Letterbox::new(egui::vec2(ruler::cell_x(GRID_WIDTH), ruler::cell_y(45)))
             .max_virtual_height(ruler::cell_y(50))
@@ -287,18 +313,14 @@ impl Flight {
                 if dvr && dvr_ready {
                     let frac = dvr_pos.saturating_sub(dvr_start) as f32 / dvr_span as f32;
                     // Круг зацикливания: доли (начало, конец) — для
-                    // индикатора-капсулы на головке. Геометрия круга —
-                    // в файловых позициях плеера: в журнальный домен
-                    // через rec_ms той же камеры.
-                    let circle = self.players.iter().find_map(|(id, p)| {
-                        let c = p.circle()?;
-                        let rec = Self::clip_rec_ms(&clip, id).unwrap_or(0);
-                        let lo =
-                            (rec + c.center.saturating_sub(c.radius)).saturating_sub(dvr_start);
-                        let hi = (rec + c.center + c.radius)
+                    // индикатора-капсулы на головке. Транспорт уже в
+                    // домене сессии — маппинг не нужен.
+                    let circle = self.transport.as_ref().and_then(|t| t.circle()).map(|c| {
+                        let lo = c.center.saturating_sub(c.radius).saturating_sub(dvr_start);
+                        let hi = (c.center + c.radius)
                             .min(dvr_end)
                             .saturating_sub(dvr_start);
-                        Some((lo as f32 / dvr_span as f32, hi as f32 / dvr_span as f32))
+                        (lo as f32 / dvr_span as f32, hi as f32 / dvr_span as f32)
                     });
                     // Растяжение сосиски до минимума: реальный круг уже
                     // минимума — капсула и голова идут по общему скейлу;
@@ -328,6 +350,10 @@ impl Flight {
                             hi.min(dvr_end).saturating_sub(dvr_start) as f32 / dvr_span as f32,
                         )
                     });
+                    // Точка отсчёта: момент RaceCountdown на полоске.
+                    let marker = clip.as_ref().and_then(|clip| clip.race_countdown_ms).map(
+                        |cd| (cd.saturating_sub(dvr_start) as f32 / dvr_span as f32).clamp(0.0, 1.0),
+                    );
                     // Каретка — цветом активного транспортного контролла.
                     let (response, events) = self.timeline.show(
                         ui,
@@ -337,24 +363,20 @@ impl Flight {
                         window,
                         circle,
                         circle_real,
-                        TRANSPORT_ACTIVE,
+                        marker,
                     );
                     for event in events {
                         match event {
                             scrub::TimelineEvent::SetDragHeld(held) => {
-                                for player in self.players.values() {
-                                    player.set_drag_held(held);
+                                if let Some(t) = &mut self.transport {
+                                    t.set_drag_held(held);
                                 }
                             }
-                            scrub::TimelineEvent::Seek(t) => {
-                                // t — мс от начала таймлайна: в журнальный
-                                // домен, каждый плеер — в свой файловый
-                                // (ноль файла = первый кадр).
-                                let target = dvr_start + t;
-                                for (id, player) in self.players.iter() {
-                                    let file = Self::clip_rec_ms(&clip, id)
-                                        .map_or(target, |rec| target.saturating_sub(rec));
-                                    player.seek(file.min(player.duration()));
+                            scrub::TimelineEvent::Seek(t_ms) => {
+                                // t — мс от начала таймлайна: в домен
+                                // сессии (транспорт сам клампит к шкале).
+                                if let Some(t) = &mut self.transport {
+                                    t.seek(dvr_start + t_ms);
                                 }
                             }
                         }
@@ -648,9 +670,9 @@ impl Flight {
                 .paint(ui, rew_rect);
 
                 let playing = self
-                    .players
-                    .values()
-                    .any(|p| p.is_playing() && !p.is_seeking());
+                    .transport
+                    .as_ref()
+                    .is_some_and(|t| t.is_running() && !t.is_seeking());
                 let play_response = if dvr {
                     Some(idle_btn("\u{f04b}").interact(
                         ui,
@@ -692,7 +714,10 @@ impl Flight {
                 )
                 .paint(ui, ff_rect);
 
-                let circled = self.players.values().any(|p| p.is_circled());
+                let circled = self
+                    .transport
+                    .as_ref()
+                    .is_some_and(|t| t.circle().is_some());
                 let loop_response = if dvr {
                     Some(idle_btn("\u{F0456}").interact(
                         ui,
@@ -769,21 +794,21 @@ impl Flight {
                     }
                 }
                 if play_response.as_ref().is_some_and(|r| r.clicked()) {
-                    for player in self.players.values() {
-                        if player.is_playing() {
-                            player.pause();
+                    if let Some(t) = &mut self.transport {
+                        if t.is_running() {
+                            t.pause();
                         } else {
-                            player.play();
+                            t.play();
                         }
                     }
                 }
                 if loop_response.as_ref().is_some_and(|r| r.clicked()) {
                     let radius = (scrub::RPT_SIZES[self.rpt_size] * 1000.0) as u64;
-                    for player in self.players.values() {
-                        player.set_circle(if circled {
+                    if let Some(t) = &mut self.transport {
+                        t.set_circle(if circled {
                             None
                         } else {
-                            Some(crate::driver::player::Circle { center: 0, radius })
+                            Some(Circle { center: 0, radius })
                         });
                     }
                 }
@@ -903,16 +928,16 @@ impl Flight {
                                 let before = self.rpt_size;
                                 shift(&mut self.rpt_size, scrub::RPT_SIZES.len(), dir);
                                 // Круг включён — переприменить радиус
-                                // (центр головка переставит сама).
+                                // (транспорт центр переставит сам).
                                 if self.rpt_size != before
-                                    && self.players.values().any(|p| p.is_circled())
+                                    && self
+                                        .transport
+                                        .as_ref()
+                                        .is_some_and(|t| t.circle().is_some())
                                 {
                                     let radius = (scrub::RPT_SIZES[self.rpt_size] * 1000.0) as u64;
-                                    for player in self.players.values() {
-                                        player.set_circle(Some(crate::driver::player::Circle {
-                                            center: 0,
-                                            radius,
-                                        }));
+                                    if let Some(t) = &mut self.transport {
+                                        t.set_circle(Some(Circle { center: 0, radius }));
                                     }
                                 }
                             }
@@ -922,9 +947,9 @@ impl Flight {
                                 let before = self.play_speed;
                                 shift(&mut self.play_speed, scrub::PLAY_SPEEDS.len(), dir);
                                 if self.play_speed != before {
-                                    let speed = scrub::PLAY_SPEEDS[self.play_speed] as f32 / 100.0;
-                                    for player in self.players.values() {
-                                        player.set_speed(speed);
+                                    let speed = scrub::PLAY_SPEEDS[self.play_speed] as f64 / 100.0;
+                                    if let Some(t) = &mut self.transport {
+                                        t.set_speed(speed);
                                     }
                                 }
                             }
@@ -1049,21 +1074,31 @@ impl Flight {
                     let lo = clip.files.values().map(|(_, ms)| *ms).min().unwrap_or(0);
                     (lo, clip.end_ms().unwrap_or(lo))
                 });
-                let mut pos = lo;
-                for (id, p) in &self.players {
-                    if let Some((_, file_ms)) = clip.files.get(id) {
-                        pos = pos.max(file_ms + p.position());
+                // Позиция циферблата: показанный кадр мастер-камеры
+                // (маппинг в сессию через ноль её файла), пока он близок
+                // к позиции транспорта — жёсткое соответствие картинке.
+                // Расстояние больше толеранса (гэп, мастер недоступен,
+                // быстрый шаттл, где shown отстаёт на секунды) — цифра =
+                // позиция транспорта. Критерий — дистанция, не окно:
+                // границы как точки переключения не существует, обе
+                // ветки на стыке равны — фликер невозможен.
+                let tp = self.transport.as_ref().map(|t| t.position());
+                let pos = match (self.players.get(&self.master), clip.files.get(&self.master)) {
+                    (Some(p), Some((_, rec))) => {
+                        let shown_session = rec + p.shown();
+                        match tp {
+                            Some(tp) if tp.abs_diff(shown_session) <= DIAL_LAG_MS => {
+                                shown_session
+                            }
+                            _ => tp.unwrap_or(shown_session),
+                        }
                     }
-                }
+                    _ => tp.unwrap_or(lo),
+                };
                 (lo, pos.clamp(lo, hi.max(lo)), hi)
             }
             None => {
-                let pos = self
-                    .players
-                    .values()
-                    .map(|p| p.position())
-                    .max()
-                    .unwrap_or(0);
+                let pos = self.players.values().map(|p| p.shown()).max().unwrap_or(0);
                 let dur = self
                     .players
                     .values()
@@ -1116,17 +1151,13 @@ impl Flight {
         Some((clip.race_started_ms?, clip.race_finished_ms?))
     }
 
-    /// Перемотка всех плееров на delta мс в журнальном домене: база —
-    /// конверт таймлайна, каждый плеер получает свой файловый сдвиг.
-    fn seek_by(&self, clip: &Option<RaceClip>, delta: i64) {
-        if self.players.is_empty() {
-            return;
-        }
+    /// Перемотка транспорта на delta мс в журнальном домене: база —
+    /// конверт таймлайна. Плееры получат новую позицию следующим синком.
+    fn seek_by(&mut self, clip: &Option<RaceClip>, delta: i64) {
         let (start, pos, end) = self.dvr_clock(clip);
         let target = (pos as i64 + delta).clamp(start as i64, end as i64) as u64;
-        for (id, player) in &self.players {
-            let file = Self::clip_rec_ms(clip, id).map_or(target, |rec| target.saturating_sub(rec));
-            player.seek(file.min(player.duration()));
+        if let Some(t) = &mut self.transport {
+            t.seek(target);
         }
     }
 
@@ -1176,8 +1207,8 @@ impl Flight {
                     } else {
                         self.ff.hold_sent
                     } {
-                        for player in self.players.values() {
-                            player.shuttle_release(scrub::SEEK_RELEASE_RAMP);
+                        if let Some(t) = &mut self.transport {
+                            t.shuttle_release(scrub::SEEK_RELEASE_RAMP);
                         }
                     }
                     let state = if back { &mut self.rew } else { &mut self.ff };
@@ -1185,8 +1216,8 @@ impl Flight {
                     let step = scrub::SEEK_SPEEDS[self.seek_speed] as i64 * scrub::SEEK_TAP as i64;
                     self.seek_by(clip, if back { -step } else { step });
                 } else {
-                    for player in self.players.values() {
-                        player.shuttle_release(scrub::SEEK_RELEASE_RAMP);
+                    if let Some(t) = &mut self.transport {
+                        t.shuttle_release(scrub::SEEK_RELEASE_RAMP);
                     }
                 }
             }
@@ -1209,8 +1240,8 @@ impl Flight {
             let state = if back { &mut self.rew } else { &mut self.ff };
             state.hold_sent = true;
             let speed = scrub::SEEK_SPEEDS[self.seek_speed] as f64 * if back { -1.0 } else { 1.0 };
-            for player in self.players.values() {
-                player.shuttle(speed);
+            if let Some(t) = &mut self.transport {
+                t.shuttle(speed);
             }
         }
     }
@@ -1227,6 +1258,20 @@ impl Flight {
             .any(|w| w.capture_state() == CaptureState::Live);
         if !streaming {
             ctx.request_repaint_after(Duration::from_millis(43));
+        }
+    }
+
+    /// Будильник автономного транспорта: без плееров некому будить UI
+    /// на каждый «кадр» — пока время бежит, будим сами (~30 Гц,
+    /// эквивалент потока кадров); стоит — тишина, ни одного лишнего
+    /// репейнта. С плеерами их публикации кадров будят сами, этот
+    /// будильник — дубль, egui склеивает.
+    fn arm_transport_repaint(&self, ctx: &egui::Context) {
+        let Some(t) = &self.transport else {
+            return;
+        };
+        if t.is_running() {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
     }
 
@@ -1261,6 +1306,26 @@ impl Flight {
         let clip = race_clip(journal.iter_ms());
         self.stop_all();
         self.open_dvr_players(ctx, &clip);
+        // Мастер — первая по порядку сетапа камера с файлом.
+        self.master = self
+            .setup
+            .pads
+            .values()
+            .map(|pad| pad.fpv.camera_id.clone())
+            .find(|cam| clip.files.contains_key(cam))
+            .unwrap_or_default();
+        // Транспорт: шкала — окно записи, курсор — на момент отсчёта
+        // (каждая камера покажет свой предшествующий кадр).
+        let span = clip
+            .recording
+            .map(|(_, hi)| hi)
+            .or_else(|| clip.end_ms())
+            .unwrap_or(0);
+        let mut transport = Transport::new(Instant::now(), span);
+        if let Some(cd) = clip.race_countdown_ms {
+            transport.seek(cd.min(span));
+        }
+        self.transport = Some(transport);
         self.journal = Some(journal);
         self.screen = Screen::DvrOpening;
     }
@@ -1379,11 +1444,11 @@ impl Flight {
                 ok(String::new())
             }
             "play" => {
-                for player in self.players.values() {
-                    if player.is_playing() {
-                        player.pause();
+                if let Some(t) = &mut self.transport {
+                    if t.is_running() {
+                        t.pause();
                     } else {
-                        player.play();
+                        t.play();
                     }
                 }
                 ok(String::new())
@@ -1399,9 +1464,11 @@ impl Flight {
                 ok(String::new())
             }
             "seek" => {
+                // Абсолютная позиция в домене сессии (мс от нуля
+                // журнала); транспорт клампит к шкале.
                 let ms: u64 = command.get(1).and_then(|a| a.parse().ok())?;
-                for player in self.players.values() {
-                    player.seek(ms.min(player.duration()));
+                if let Some(t) = &mut self.transport {
+                    t.seek(ms);
                 }
                 ok(String::new())
             }
@@ -1432,6 +1499,11 @@ const REC_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xEA, 0x31, 0x23);
 const REC_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x42, 0x3C);
 const RACE_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xC8, 0xF5, 0x00);
 const RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x75, 0x77, 0x48);
+
+/// Толеран отставания показанного кадра мастера от позиции транспорта,
+/// в пределах которого циферблат верен картинке (лень кадра + декод на
+/// обычных скоростях; шаттл уходит дальше — цифра честно = курсор).
+const DIAL_LAG_MS: u64 = 150;
 
 /// мм:ss от длительности.
 fn mmss(dur: Duration) -> String {

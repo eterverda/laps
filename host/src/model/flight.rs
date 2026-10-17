@@ -213,6 +213,9 @@ pub enum FlightEvent {
         camera_id: String,
         filename: String,
     },
+    /// Пользователь нажал RACE: начался отсчёт (до старта гонки).
+    /// Метка — момент нажатия. Курсор DVR встаёт сюда при открытии.
+    RaceCountdown {},
     /// Структурный вариант без полей: в yaml пишется `{}` (unit-вариант
     /// сериализовался бы null).
     RaceStarted {},
@@ -234,6 +237,9 @@ pub struct RaceClip {
     /// camera_id → (имя файла, journal-ms первого кадра = ноль файла):
     /// файл кладётся на полоску по первому кадру.
     pub files: HashMap<String, (String, u64)>,
+    /// Момент нажатия RACE (начало отсчёта): стартовая позиция
+    /// курсора DVR и точка на таймлайне.
+    pub race_countdown_ms: Option<u64>,
     pub race_started_ms: Option<u64>,
     pub race_finished_ms: Option<u64>,
 }
@@ -272,6 +278,7 @@ pub fn race_clip<'a>(events: impl IntoIterator<Item = (u64, &'a FlightEvent)>) -
             } => {
                 clip.files.insert(camera_id.clone(), (filename.clone(), ms));
             }
+            FlightEvent::RaceCountdown {} => clip.race_countdown_ms = Some(ms),
             FlightEvent::RaceStarted {} => clip.race_started_ms = Some(ms),
             FlightEvent::RaceFinished { .. } => clip.race_finished_ms = Some(ms),
         }
@@ -462,6 +469,7 @@ mod tests {
                     filename: "f-camera-1-mjpeg.mkv".to_owned(),
                 },
             ),
+            (23_000, FlightEvent::RaceCountdown {}),
             (23_500, FlightEvent::RaceStarted {}),
             (60_000, FlightEvent::RecordFinished {}),
             (68_000, FlightEvent::RaceFinished { prematurely: true }),
@@ -475,6 +483,8 @@ mod tests {
             clip.files["camera-1"],
             ("f-camera-1-mjpeg.mkv".to_owned(), 20_500)
         );
+        // Отсчёт собран: курсор DVR встаёт на него.
+        assert_eq!(clip.race_countdown_ms, Some(23_000));
         // Экстент журнала — финиш гонки.
         assert_eq!(clip.end_ms(), Some(68_000));
         // Границы гонки — в журнальном домене (файловые позиции — на

@@ -82,7 +82,11 @@ pub enum TimelineEvent {
     Seek(u64),
 }
 
-/// Таймлайн scrub: линия с кружком позиции, интерактив. Держит своё
+/// Акцентный цвет каретки и активного фрагмента трека — слоновая кость
+/// (как TRANSPORT_ACTIVE flight'а).
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xE2, 0xCE);
+
+/// Таймлайн DVR: линия с кружком позиции, интерактив. Держит своё
 /// состояние ввода (нажатие, точку последнего seek'а), наружу отдаёт
 /// только события. Клик и таскание перематывают по временной шкале;
 /// seek — только при реальном сдвиге указателя. Время рисует хозяин.
@@ -124,15 +128,17 @@ impl Timeline {
         // circle_real: доли (начало, конец) реального круга до растяжения
         // — для обратного маппинга seek'а внутри растянутой капсулы.
         circle_real: Option<(f32, f32)>,
-        // Акцентный цвет: каретка и активный фрагмент трека. Белый у
-        // scrub, слоновая кость (активный транспортный) у flight.
-        knob: egui::Color32,
+        // Маркер момента: доля 0..1 — белая точка 2px на линии
+        // (RaceCountdown: стартовая позиция курсора DVR).
+        marker: Option<f32>,
     ) -> (egui::Response, Vec<TimelineEvent>) {
+        // Акцент: каретка и активный фрагмент трека — цвет активного
+        // транспортного контролла (единственная роль виджета).
+        let knob = ACCENT;
         let mut events = Vec::new();
         let y = rect.center().y;
         let x = |f: f32| rect.left() + rect.width() * f;
-        // Трек — 40% акцентного, активный фрагмент — акцентным
-        // (параметр knob: белый у scrub, слоновая кость у flight).
+        // Трек — 40% акцентного, активный фрагмент — акцентным.
         let track = egui::Stroke::new(2.0, knob.gamma_multiply(0.4));
         let white = egui::Stroke::new(2.0, knob);
         match window {
@@ -150,6 +156,15 @@ impl Timeline {
                     track,
                 );
             }
+        }
+        // Маркер (отсчёт): белая точка 2px прямо на линии.
+        if let Some(f) = marker {
+            ui.painter().circle(
+                egui::pos2(x(f.clamp(0.0, 1.0)), y),
+                1.0,
+                egui::Color32::WHITE,
+                egui::Stroke::NONE,
+            );
         }
         let knob_r = ruler::CELL_SIZE.y * 0.24;
         match circle {

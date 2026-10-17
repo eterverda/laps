@@ -117,7 +117,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) signaled
   UI-ward via `crossbeam_utils::AtomicCell`
 - **Гоночное ядро** (сервис `service::race`; чистое ядро `RaceCore`,
-  тесты на FakeClock по образцу `Playhead`): фазы эфира LiveBefore →
+  тесты на FakeClock по образцу `Transport`): фазы эфира LiveBefore →
   RecordHead → RaceCountdown → Race → RecordTail → Finished; часы гонки
   (отсчёт, авто-финиш по лимиту), политика записи (старт/стоп/abort),
   журнал (события + файл). Намерения (`Intent`: RecPressed/RacePressed/Exit)
@@ -208,44 +208,45 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 - `read_frame_into` per frame (no streaming pipeline), **zune-jpeg** decode
   of a single frame; scrubbing = index lookup + one JPEG decode (~5 ms);
   every MJPEG frame is a keyframe, no GOP rewinds
-- Player (`driver/player/`): facade mirrors `Camera` — io lives in a
+- Player (`driver/player.rs`): facade mirrors `Camera` — io lives in a
   worker thread (free function, like `capture_loop`), the facade holds
   texture, frame slot, state atomics and a command channel. Opening is
   async: `open()` returns immediately, index + first frame are built in
   the thread (`PlayerState::Opening/Ready/Failed`); commands sent before
   readiness wait in the channel queue. Container timestamps are the
-  clock, no resampling; frame-accurate `seek`; playback-tested at
-  30 fps FullHD. The player is a dumb frame supplier: which frame to
-  show and when is decided by the playhead, the time model lives
-  entirely in `driver/player/playhead.rs`
-- Playhead (`Playhead`): the single time-travel model — position =
-  base + ∫speed, a pure struct owned by the player's worker thread
-  (never the UI thread: UI frame quantization must not affect
-  playback), covered by unit tests. UI sends intents (`Play`/`Pause`/
-  `Seek`/`SetSpeed`, wheel x0.25–x2 — instant, cancel any gesture;
-  `Shuttle`/`ShuttleRelease` — the only source of speed ramps,
-  ease-out, landing commits seamlessly by re-anchoring at the landing
-  position; shuttle is the jog/shuttle term: скоростная прокрутка с
-  разгоном, не путать с дискретным seek);
-  the worker maps position → frame index via its pts map, paces
-  decodes by frame deadlines (`MIN_PRESENT_SPAN` gate at high speeds;
-  backpressure: slot unclaimed by UI — no decode at all, no wasted
-  work for occluded windows; under/over-decode counters logged per
-  session). Release during play ramps back to the play speed; release
-  from pause is an instant stop on the current frame (no drift —
-  precise scrubbing). Timeline drag = discrete `Seek` per frame,
-  sticks to the cursor, no ramps. Two API layers: real-time wrappers
-  (`play()`, `seek()`…) for the worker and an `_at(now)` core —
-  private, tests drive it with a fake clock (instant, ms-exact).
+  clock, no resampling; playback-tested at 30 fps FullHD. The player is
+  a dumb frame supplier: the single command is the transport sync
+  (`Sync { position, speed }` — file position, signed speed); between
+  syncs the worker extrapolates on its own clock, so decode pacing
+  never depends on UI frame rate. Static sync (speed 0) shows the
+  preceding frame (pts <= position), one decode per frame change.
+  `shown()` — pts of the displayed frame (the dial reads it)
+- Transport (`service::transport::Transport`): the single time-travel
+  model — position = base + ∫speed in the SESSION domain (REC on →
+  REC off); owned by the Flight screen (DVR), not by any player.
+  UI sends intents (`play()`/`pause()`/`seek()`/`set_speed`, wheel
+  x0.25–x2 — instant, cancel any gesture; `shuttle()`/
+  `shuttle_release()` — the only source of speed ramps, ease-out,
+  landing commits seamlessly by re-anchoring at the landing position;
+  shuttle is the jog/shuttle term: скоростная прокрутка с разгоном,
+  не путать с дискретным seek); each UI frame the (position, velocity)
+  is synced into every player. Two API layers: real-time wrappers
+  (`play()`, `seek()`…) and an `_at(now)` core — private, tests drive
+  it with a fake clock (instant, ms-exact).
   Circle (`Circle { center, radius }`, the LOOP/RPT button): looping
-  in VIDEO time (radius ±1.5 s covers 3 s of content at any play
-  speed); wrap is pure position arithmetic in the playhead, active
-  only in clean play (shuttle/drag run free, center follows any
-  rewind); on disable time continues from the cursor position. The
-  worker detects wraps via position jumps (sticky catch-up) and draws
-  the knob as a stadium spanning the circle
+  in CONTENT time (radius ±1.5 s covers 3 s at any play speed); wrap
+  is pure position arithmetic in the transport, active only in clean
+  play (shuttle/drag run free, center follows any rewind); on disable
+  time continues from the cursor position. Players see a wrap as a
+  position jump on a sync (sticky catch-up in the worker); the
+  timeline draws the knob as a stadium spanning the circle
+- Master camera: the dial shows the pts of the DISPLAYED frame of the
+  master camera (first setup camera with a file, switchable at
+  runtime) — the number is the timestamp of the pixels on screen,
+  never ahead of the picture; with time frozen every camera shows its
+  preceding frame relative to the master position
 - Remote: `rec`, `race`, `play`, `ff`, `rew` (button presses, same
-  code as the clicks), `seek <ms>` (absolute seek of all players),
+  code as the clicks), `seek <ms>` (absolute, session domain),
   `exit` (to menu) — see `Flight::handle_remote`
 
 ## Configuration

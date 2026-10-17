@@ -3,8 +3,8 @@ mod config;
 mod driver;
 mod gui;
 mod model;
-mod service;
 mod remote;
+mod service;
 
 #[derive(clap::Parser)]
 #[command(name = "laps")]
@@ -71,6 +71,8 @@ fn main() {
         },
         Some(Commands::Scrub) => {
             let captures = std::path::PathBuf::from("captures");
+            // DVR живёт и без видео: журнала (yaml) хватает для полоски
+            // и транспорта — пустой captures не пускаем, видео не требуем.
             let has_any = std::fs::read_dir(&captures)
                 .map(|mut d| {
                     d.any(|e| {
@@ -78,14 +80,14 @@ fn main() {
                             e.path()
                                 .extension()
                                 .and_then(|x| x.to_str())
-                                .is_some_and(|x| matches!(x, "mkv" | "mp4" | "mov"))
+                                .is_some_and(|x| matches!(x, "mkv" | "mp4" | "mov" | "yaml"))
                         })
                         .unwrap_or(false)
                     })
                 })
                 .unwrap_or(false);
             if !has_any {
-                eprintln!("no recordings in captures/");
+                eprintln!("nothing in captures/");
                 std::process::exit(1);
             }
             gui::run(Some(captures));

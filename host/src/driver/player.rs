@@ -1,14 +1,12 @@
 //! Воспроизведение записей (scrub): reader контейнера, декод JPEG →
 //! текстура, worker-поток с дедлайнами кадров. Плеер — тупой
-//! исполнитель: какой кадр показывать и когда — решает головка
-//! (`playhead::Playhead`, чистый протестированный модуль: позиция =
-//! base + ∫скорость, жесты с рампами), живущая в этом потоке; время
-//! крутится здесь, а не на UI-потоке — квантование кадров UI на
-//! воспроизведение не влияет. UI шлёт намерения командами и читает
-//! позицию/флаги через атомики.
-
-pub mod playhead;
-pub use playhead::{Circle, Playhead};
+//! доставщик кадров: какую позицию показывать и с какой скоростью
+//! решает транспорт (`service::transport::Transport`, чистый
+//! протестированный модуль: позиция = base + ∫скорость, жесты с
+//! рампами), экран шлёт ему синки — позицию файла и скорость; worker
+//! экстраполирует между синками на своих часах, пейсинг не зависит
+//! от частоты кадров UI. Позиция на экране — pts показанного кадра
+//! (атомик `shown`), циферблат читает его.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,13 +24,9 @@ use crate::driver::dvr::{VideoReader, open_reader};
 /// декодер — чаще одного показа за это время не декодируем вообще, индекс
 /// едет за часами без декода.
 const MIN_PRESENT_SPAN: Duration = Duration::from_millis(8);
-/// Пока идёт рампа, не спим дольше этого между тиками: дедлайн обратно
-/// пропорционален |speed|, возле нуля он раздувается до секунд, и
-/// переход через 0 (смена направления) застревает.
-const RAMP_POLL: Duration = Duration::from_millis(50);
 
 /// Пауза цикла worker'а, когда дедлайна следующего кадра нет
-/// (пауза/hold/конец): чтобы видеть останов по `running`.
+/// (стоп-кадр/конец): чтобы видеть останов по `running`.
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 
 /// Кадр из worker-потока → UI-поток (latest-wins), как слот у Camera.
@@ -48,29 +42,14 @@ pub enum PlayerState {
 }
 
 /// Команды в worker: пришедшие до готовности ждут в очереди канала.
-/// Все — намерения для головки; первые пять дискретны (мгновенный
-/// эффект, жест отменяют), последние две — шаттл (единственный
-/// источник рамп скорости).
+/// Единственная команда — транспортный синк: позиция файла и знаковая
+/// скорость. Позиция — base на момент синка; между синками worker
+/// экстраполирует на своих часах (пейсинг не зависит от частоты кадров
+/// UI). Скорость 0 — стоп-кадр: worker показывает предшествующий
+/// position кадр. Рампы, жесты, круг — модель транспорта, worker их не
+/// видит: скачок позиции на синке — обычное дело (seek, заворот круга).
 enum Command {
-    Play,
-    Pause,
-    Seek(u64),
-    SetDragHeld(bool),
-    /// Скорость воспроизведения мгновенно, 1.0 — штатная.
-    SetSpeed(f32),
-    /// Шаттл: рампа к ±velocity, длительность — внутри головки.
-    /// Стартует время, если стояло.
-    Shuttle {
-        velocity: f64,
-    },
-    /// Отпускание шаттла: возврат к запомненному resume — рампа за dur
-    /// при игре, мгновенный стоп при удержании из паузы.
-    ShuttleRelease {
-        dur: Duration,
-    },
-    /// Зацикливание: Some(круг) включает (центр ставит головка),
-    /// None выключает.
-    SetCircle(Option<Circle>),
+    Sync { position: u64, speed: f64 },
 }
 
 pub struct Player {
@@ -80,17 +59,9 @@ pub struct Player {
     /// TextureId стабилен всю жизнь Player.
     texture: egui::TextureHandle,
     state: Arc<Mutex<PlayerState>>,
-    /// Авторитет у worker'а: конец файла гасит кнопку сам.
-    playing: Arc<AtomicCell<bool>>,
-    /// Шаттл, начатый из паузы: PLAY при нём тёмный, хотя
-    /// время крутится (playing выше — про «время бежит», не про UI).
-    seeking: Arc<AtomicCell<bool>>,
-    /// Круг включён (кнопка LOOP нажата) — для подсветки.
-    circled: Arc<AtomicCell<bool>>,
-    /// Параметры круга (центр/радиус в мс, во времени видео) —
-    /// для индикатора на таймлайне.
-    circle: Arc<AtomicCell<Option<Circle>>>,
-    position: Arc<AtomicCell<u64>>,
+    /// Pts показанного кадра (мс от начала файла) — источник циферблата.
+    /// Пишет worker при публикации кадра, читает UI.
+    shown: Arc<AtomicCell<u64>>,
     /// 0, пока идёт open.
     duration: Arc<AtomicCell<u64>>,
     /// Разрешение файла; 0×0, пока идёт open.
@@ -107,17 +78,16 @@ impl Player {
     pub fn open(path: &std::path::Path, ctx: egui::Context) -> Self {
         let slot: FrameSlot = Arc::new(Mutex::new(None));
         let state = Arc::new(Mutex::new(PlayerState::Opening));
-        let playing = Arc::new(AtomicCell::new(false));
-        let seeking = Arc::new(AtomicCell::new(false));
-        let circled = Arc::new(AtomicCell::new(false));
-        let circle = Arc::new(AtomicCell::new(None));
-        let position = Arc::new(AtomicCell::new(0u64));
+        let shown = Arc::new(AtomicCell::new(0u64));
         let duration = Arc::new(AtomicCell::new(0u64));
         let resolution = Arc::new(AtomicCell::new(crate::driver::dvr::Resolution {
             width: 0,
             height: 0,
         }));
-        let (commands, command_rx) = crossbeam_channel::bounded::<Command>(32);
+        // Очередь синков с запасом: UI шлёт их каждый кадр (~60/с),
+        // worker забирает по дедлайну; рывок UI-цикла не должен
+        // дропать свежий синк (try_send, очередь полна — пропуск).
+        let (commands, command_rx) = crossbeam_channel::bounded::<Command>(256);
         let running = Arc::new(AtomicBool::new(true));
         // 1×1-пустышка, как у Camera: id валиден с рождения, размер
         // возьмёт первый кадр. Контент не отрисовывается: до первого
@@ -130,19 +100,14 @@ impl Player {
         let thread = thread::spawn({
             let slot = Arc::clone(&slot);
             let state = Arc::clone(&state);
-            let playing = Arc::clone(&playing);
-            let seeking = Arc::clone(&seeking);
-            let circled = Arc::clone(&circled);
-            let circle = Arc::clone(&circle);
-            let position = Arc::clone(&position);
+            let shown = Arc::clone(&shown);
             let duration = Arc::clone(&duration);
             let resolution = Arc::clone(&resolution);
             let running = Arc::clone(&running);
             let path = path.to_path_buf();
             move || {
                 playback_loop(
-                    path, ctx, slot, state, playing, seeking, circled, circle, position, duration,
-                    resolution, running, command_rx,
+                    path, ctx, slot, state, shown, duration, resolution, running, command_rx,
                 );
             }
         });
@@ -150,11 +115,7 @@ impl Player {
             slot,
             texture,
             state,
-            playing,
-            seeking,
-            circled,
-            circle,
-            position,
+            shown,
             duration,
             resolution,
             commands,
@@ -168,102 +129,22 @@ impl Player {
         self.state.lock().unwrap().clone()
     }
 
-    pub fn play(&self) {
-        if self.commands.try_send(Command::Play).is_err() {
-            log::warn!("player: play ignored (worker gone)");
-        }
-    }
-
-    pub fn pause(&self) {
-        if self.commands.try_send(Command::Pause).is_err() {
-            log::warn!("player: pause ignored (worker gone)");
-        }
-    }
-
-    pub fn is_playing(&self) -> bool {
-        self.playing.load()
-    }
-
-    /// Шаттл, начатый из паузы: PLAY при этом не
-    /// подсвечен (во время play удержание FF/REW играющей кнопки
-    /// не гасит).
-    pub fn is_seeking(&self) -> bool {
-        self.seeking.load()
-    }
-
-    /// Круг включён (кнопка LOOP нажата) — для подсветки.
-    pub fn is_circled(&self) -> bool {
-        self.circled.load()
-    }
-
-    /// Параметры круга (центр/радиус в мс, во времени видео).
-    /// None — круг выключен.
-    pub fn circle(&self) -> Option<Circle> {
-        self.circle.load()
-    }
-
-    /// Зацикливание: Some(круг) включает (центр — текущая позиция),
-    /// None выключает. Работает только в чистом play: шаттл и скраб
-    /// ходят свободно, центр при этом следует за позицией.
-    pub fn set_circle(&self, circle: Option<Circle>) {
-        if self.commands.try_send(Command::SetCircle(circle)).is_err() {
-            log::warn!("player: set_circle ignored (worker gone)");
-        }
-    }
-
-    /// Жест шаттла (удержание REW/FF): рампа к ±velocity (длительность
-    /// — у головки). Если время стояло — стартует от показанного кадра,
-    /// отпускание вернёт его в стоп.
-    pub fn shuttle(&self, velocity: f64) {
+    /// Транспортный синк: позиция (мс по файлу) и знаковая скорость.
+    /// Worker экстраполирует между синками на своих часах; скорость 0 —
+    /// стоп-кадр на предшествующем position кадре.
+    pub fn sync(&self, position: u64, speed: f64) {
         if self
             .commands
-            .try_send(Command::Shuttle { velocity })
+            .try_send(Command::Sync { position, speed })
             .is_err()
         {
-            log::warn!("player: shuttle ignored (worker gone)");
+            log::warn!("player: sync ignored (worker gone)");
         }
     }
 
-    /// Отпускание шаттла: возврат к режиму до него. Если шёл во время
-    /// play — рампа назад за dur; если из паузы — мгновенный стоп на
-    /// текущем кадре (dur не участвует).
-    pub fn shuttle_release(&self, dur: Duration) {
-        if self
-            .commands
-            .try_send(Command::ShuttleRelease { dur })
-            .is_err()
-        {
-            log::warn!("player: shuttle_release ignored (worker gone)");
-        }
-    }
-
-    /// Скорость воспроизведения, 1.0 — штатная. Дискретно: время
-    /// перепривязывается к показанному кадру — смена бесшовная.
-    pub fn set_speed(&self, speed: f32) {
-        if self.commands.try_send(Command::SetSpeed(speed)).is_err() {
-            log::warn!("player: set_speed ignored (worker gone)");
-        }
-    }
-
-    /// Захват шкалы: пока держат — время заморожено (это не пауза:
-    /// playing сохраняется), отпускание продолжает с показанного кадра.
-    pub fn set_drag_held(&self, held: bool) {
-        if self.commands.try_send(Command::SetDragHeld(held)).is_err() {
-            log::warn!("player: set_drag_held ignored (worker gone)");
-        }
-    }
-
-    /// Перемотка на позицию (мс от начала): показывается последний
-    /// кадр с pts <= position. До готовности ждёт в очереди команд.
-    pub fn seek(&self, position: u64) {
-        if self.commands.try_send(Command::Seek(position)).is_err() {
-            log::warn!("player: seek ignored (worker gone)");
-        }
-    }
-
-    /// Позиция на экране: pts показанного кадра, мс от начала.
-    pub fn position(&self) -> u64 {
-        self.position.load()
+    /// Pts показанного кадра, мс от начала файла — источник циферблата.
+    pub fn shown(&self) -> u64 {
+        self.shown.load()
     }
 
     /// Общая длительность: pts последнего кадра, мс. 0, пока идёт open.
@@ -301,19 +182,15 @@ impl Drop for Player {
 }
 
 /// Тело worker-потока: open (индекс, первый кадр), затем цикл
-/// воспроизведения. Головка, буферы и reader живут здесь (io +
-/// ожидание дедлайнов), UI видит слот и атомики. Зеркало capture_loop:
-/// функция без self, состояние — локальный тип.
+/// воспроизведения. Буферы и reader живут здесь (io + ожидание
+/// дедлайнов), UI видит слот и атомики. Зеркало capture_loop: функция
+/// без self, состояние — локальный тип.
 fn playback_loop(
     path: std::path::PathBuf,
     ctx: egui::Context,
     slot: FrameSlot,
     state: Arc<Mutex<PlayerState>>,
-    playing: Arc<AtomicCell<bool>>,
-    seeking: Arc<AtomicCell<bool>>,
-    circled: Arc<AtomicCell<bool>>,
-    circle: Arc<AtomicCell<Option<Circle>>>,
-    position: Arc<AtomicCell<u64>>,
+    shown: Arc<AtomicCell<u64>>,
     duration: Arc<AtomicCell<u64>>,
     resolution: Arc<AtomicCell<crate::driver::dvr::Resolution>>,
     running: Arc<AtomicBool>,
@@ -323,14 +200,12 @@ fn playback_loop(
     struct Playback {
         ctx: egui::Context,
         slot: FrameSlot,
-        playing: Arc<AtomicCell<bool>>,
-        seeking: Arc<AtomicCell<bool>>,
-        circled: Arc<AtomicCell<bool>>,
-        circle: Arc<AtomicCell<Option<Circle>>>,
-        position: Arc<AtomicCell<u64>>,
+        shown: Arc<AtomicCell<u64>>,
         reader: Box<dyn VideoReader>,
         /// pts всех кадров — тайм-карта: позиция → индекс.
         pts: Vec<u64>,
+        /// Длительность: pts последнего кадра (край экстраполяции).
+        duration: u64,
         /// Буфер под JPEG кадр, размер — максимальный в файле.
         jpeg: Vec<u8>,
         /// Пиксельный буфер кадра; в слот уходит Arc-клон.
@@ -338,18 +213,21 @@ fn playback_loop(
         dims: crate::driver::dvr::Resolution,
         /// Сейчас на экране (индекс в pts).
         shown_idx: usize,
+        /// Транспортный синк: позиция (файл) на sync_at со скоростью;
+        /// между синками позиция = sync_position + speed·(now − sync_at)
+        /// — на часах worker'а, пейсинг не зависит от UI.
+        sync_at: Instant,
+        sync_position: u64,
+        sync_speed: f64,
+        /// Показали кадр с последнего стопа: граница/стоп-кадр пишут
+        /// лог сеанса один раз (переход показ → стоп, не каждый тик).
+        playing: bool,
         /// Позиция на прошлом тике: скачок против хода движения —
-        /// заворот круга, включает догон shown.
+        /// заворот круга (позиция прыгнула на синке), включает догон shown.
         last_position: u64,
         /// Догон после заворота: shown отстаёт от позиции (прыгнула
         /// назад/вперёд), показываем каждый кадр до встречи с ней.
         catching: bool,
-        /// Захват шкалы мышью/скроллом: время заморожено, само по
-        /// себе не играет (playing сохраняется).
-        held: bool,
-        /// Головка: единственная модель времени (скорости, жесты,
-        /// рампы — всё внутри, чистый модуль).
-        head: Playhead,
         /// Момент последнего показа — клапан MIN_PRESENT_SPAN.
         last_present: Instant,
         decode: FrameStats,
@@ -370,39 +248,49 @@ fn playback_loop(
             self.ctx.request_repaint_after(Duration::from_millis(1));
         }
 
-        /// Остановка воспроизведения с логом сеанса. Единственная точка
-        /// перехода playing → false (Pause, граница файла, рампа в ноль).
-        /// Счётчики сеанса (декод/read/skips/over-decodes) после лога
-        /// сбрасываются все: каждый блок в логе — «за прогон».
+        /// Лог сеанса (декод/read/skips/over-decodes) и сброс счётчиков:
+        /// каждый блок в логе — «за прогон».
+        fn log_session(&mut self) {
+            if let Some(s) = self.decode.snapshot() {
+                log::info!("player: jpeg→rgba decode duration: {s}");
+            }
+            if let Some(s) = self.read.snapshot() {
+                log::info!("player: frame read duration: {s}");
+            }
+            if self.skips > 0 {
+                log::info!("player: {} frames skipped", self.skips);
+            }
+            if self.over_decodes > 0 {
+                log::info!(
+                    "player: {} frames over-decoded (UI behind)",
+                    self.over_decodes
+                );
+            }
+        }
+
+        /// Остановка воспроизведения (конец файла, стоп-кадр по синку):
+        /// лог сеанса, счётчики сброшены.
         fn stop(&mut self) {
-            if self.playing.load() {
-                if let Some(s) = self.decode.snapshot() {
-                    log::info!("player: jpeg→rgba decode duration: {s}");
-                }
-                if let Some(s) = self.read.snapshot() {
-                    log::info!("player: frame read duration: {s}");
-                }
-                if self.skips > 0 {
-                    log::info!("player: {} frames skipped", self.skips);
-                }
-                if self.over_decodes > 0 {
-                    log::info!(
-                        "player: {} frames over-decoded (UI behind)",
-                        self.over_decodes
-                    );
-                }
+            if self.playing {
+                self.log_session();
                 self.decode = FrameStats::default();
                 self.read = FrameStats::default();
                 self.skips = 0;
                 self.over_decodes = 0;
             }
-            self.playing.store(false);
-            self.seeking.store(false);
-            self.head.pause();
+            self.playing = false;
+        }
+
+        /// Позиция на момент now: экстраполяция последнего синка на
+        /// часах worker'а, прижатая к границам файла.
+        fn pos_at(&self, now: Instant) -> u64 {
+            let dt = now.saturating_duration_since(self.sync_at).as_millis() as f64;
+            (self.sync_position as f64 + self.sync_speed * dt).clamp(0.0, self.duration as f64)
+                as u64
         }
 
         /// Кадр i: read в постоянный JPEG-буфер, декод in-place в image.
-        /// presented=false — стоп-кадр/seek (клапан показа не трогаем).
+        /// presented=false — стоп-кадр (клапан показа не трогаем).
         fn read_and_present(&mut self, i: usize, presented: bool) -> io::Result<()> {
             let t0 = Instant::now();
             let (_, len) = self.reader.read_frame_into(i, &mut self.jpeg)?;
@@ -445,43 +333,58 @@ fn playback_loop(
                 // никто не покажет.
                 self.over_decodes += 1;
             }
-            *slot = Some(self.image.clone());
+            *slot = Some(Arc::clone(&self.image));
             self.wake();
         }
 
-        /// Один проход головки: показать не больше одного кадра —
-        /// последний due по направлению движения. Возвращает время до
-        /// ближайшего события (None — ждать команду: пауза/hold/конец).
-        fn tick(&mut self) -> Option<Duration> {
-            if self.held {
-                return None;
+        /// Транспортный синк: новая база экстраполяции. Скорость 0 —
+        /// стоп-кадр: показываем предшествующий position кадр (один
+        /// декод на смену кадра, повторные синки на ту же позицию
+        /// бесплатны).
+        fn command_sync(&mut self, position: u64, speed: f64) {
+            self.sync_at = Instant::now();
+            self.sync_position = position;
+            self.sync_speed = speed;
+            if speed != 0.0 {
+                return;
             }
-            let was_playing = self.playing.load();
-            self.head.sync();
-            if was_playing && !self.head.is_running() {
-                // Граница файла или рампа в ноль — фиксируем стоп.
+            if self.playing {
                 self.stop();
-                return None;
             }
-            if !self.head.is_running() {
-                return None;
+            let next = self.pts.partition_point(|&p| p <= position).max(1);
+            let i = (next - 1).min(self.pts.len() - 1);
+            if i != self.shown_idx {
+                match self.read_and_present(i, false) {
+                    Ok(()) => {
+                        self.shown_idx = i;
+                        self.shown.store(self.pts[i]);
+                    }
+                    Err(e) => {
+                        log::error!("player: {e}");
+                        self.stop();
+                    }
+                }
             }
-            self.playing.store(true);
-            self.seeking.store(self.head.is_seeking());
-            let velocity = self.head.velocity();
+        }
+
+        /// Один проход: показать не больше одного кадра — последний due
+        /// по направлению движения. Возвращает время до ближайшего
+        /// события (None — ждать синк: стоп-кадр/конец).
+        fn tick(&mut self) -> Option<Duration> {
+            let velocity = self.sync_speed;
             if velocity == 0.0 {
-                // Рампа через ноль (разворот): позиция стоит, ждём
-                // пересечение с капом RAMP_POLL.
-                return Some(RAMP_POLL);
+                return None;
             }
-            let position = self.head.position();
-            // Заворот круга: позиция скачет против хода движения —
-            // «кадр впереди есть всегда», дедлайн по pts не ждём.
+            let now = Instant::now();
+            let position = self.pos_at(now);
+            // Заворот круга (позиция прыгнула на синке) против хода
+            // движения — «кадр впереди есть всегда», дедлайн по pts не
+            // ждём.
             let wrapped = (velocity > 0.0 && position < self.last_position)
                 || (velocity < 0.0 && position > self.last_position);
             if wrapped {
-                // Заворот круга: shown догоняет позицию покадрово,
-                // монотонная логика дедлайнов до конца круга не работает.
+                // Заворот: shown догоняет позицию покадрово, монотонная
+                // логика дедлайнов до конца круга не работает.
                 self.catching = true;
             }
             self.last_position = position;
@@ -511,12 +414,9 @@ fn playback_loop(
                     return Some(MIN_PRESENT_SPAN - self.last_present.elapsed());
                 }
             }
-            let ramping = self.head.is_ramping();
             let wait_ms = |file_ms: u64| {
-                let d = Duration::from_millis((file_ms as f64 / velocity.abs().max(0.001)) as u64)
-                    .max(Duration::from_millis(1));
-                // При рампе кап: см. RAMP_POLL.
-                if ramping { d.min(RAMP_POLL) } else { d }
+                Duration::from_millis((file_ms as f64 / velocity.abs().max(0.001)) as u64)
+                    .max(Duration::from_millis(1))
             };
             let show = if fwd {
                 if target <= self.shown_idx && !self.catching {
@@ -536,8 +436,8 @@ fn playback_loop(
             // Бэкпрессher: слот ещё занят — UI предыдущий кадр не
             // забрал (запоздал/окно закрыто), декодить некуда, кадр
             // ушёл бы в мусор. shown пусть догоняет позицию: как слот
-            // освободится, покажем последний due. Дискретные seek'и
-            // (пауза) этот клапан не проходят — их результат однозначен.
+            // освободится, покажем последний due. Синки этот клапан не
+            // проходят — стоп-кадр по ним однозначен.
             if self.slot.lock().unwrap().is_some() {
                 return Some(Duration::from_millis(8));
             }
@@ -546,6 +446,10 @@ fn playback_loop(
                 self.stop();
                 return None;
             }
+            // «Воспроизведение» = показали кадр: с этого момента стоп
+            // (граница, стоп-кадр по синку) пишет лог сеанса. Стоим на
+            // границе с бегущим транспортом — стоп повторный, без лога.
+            self.playing = true;
             // Скачок при догоне заворота — переход кольца, не пропуск:
             // каждый кадр кольца всё равно показываем.
             if !self.catching {
@@ -557,7 +461,7 @@ fn playback_loop(
             if self.catching && self.shown_idx == target {
                 self.catching = false;
             }
-            self.position.store(self.pts[show]);
+            self.shown.store(self.pts[show]);
             if show == last && fwd {
                 self.stop(); // конец файла — стоп-кадр
                 return None;
@@ -572,76 +476,15 @@ fn playback_loop(
             Some(wait_ms(wait))
         }
 
-        /// Принимающая сторона команд: вся их логика — в этом матче.
-        fn command(&mut self, cmd: Command) {
-            match cmd {
-                // Дискретные: жест отменяют, эффект мгновенный.
-                Command::Play => {
-                    if !self.playing.load() {
-                        self.playing.store(true);
-                        if !self.held {
-                            self.head.play();
-                        }
-                    }
-                }
-                Command::Pause => self.stop(),
-                Command::Seek(position) => {
-                    // Перемотка на позицию: показывается последний
-                    // кадр с pts <= position. При игре время
-                    // перепривязывается с resume-скоростью; пока стоит
-                    // drag — позиция просто переносится (перепривяжем
-                    // по отпусканию).
-                    self.head.seek(position);
-                    let mut next = self.pts.partition_point(|&p| p <= position);
-                    if next == 0 {
-                        next = 1;
-                    }
-                    let i = (next - 1).min(self.pts.len().saturating_sub(1));
-                    if i != self.shown_idx {
-                        match self.read_and_present(i, false) {
-                            Ok(()) => {
-                                self.shown_idx = i;
-                                self.position.store(self.pts[i]);
-                            }
-                            Err(e) => {
-                                log::error!("player: {e}");
-                                self.stop();
-                            }
-                        }
-                    }
-                }
-                Command::SetSpeed(speed) => self.head.set_speed(speed as f64),
-                Command::SetDragHeld(held) => {
-                    if self.held != held {
-                        self.held = held;
-                        self.head.set_drag_held(held);
-                    }
-                }
-                // Шаттл — единственный источник рамп скорости.
-                Command::Shuttle { velocity } => self.head.shuttle(velocity),
-                Command::ShuttleRelease { dur } => self.head.shuttle_release(dur),
-                Command::SetCircle(zone) => {
-                    self.circled.store(zone.is_some());
-                    self.head.set_circle(zone);
-                    // Головка ставит центр текущей позицией: забираем
-                    // фактические параметры для индикатора.
-                    self.circle.store(self.head.circle());
-                }
-            }
-        }
-
-        /// Цикл: крутим головку, команды влетают по дедлайну кадра.
+        /// Цикл: дедлайн кадра или синк — что раньше.
         fn run(&mut self, commands: &crossbeam_channel::Receiver<Command>, running: &AtomicBool) {
             loop {
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
                 let wait = self.tick().unwrap_or(IDLE_WAIT);
-                // Индикатор круга: центр живёт в головке (seek'и и
-                // шаттл его смещают) — публикуем актуальное каждый тик.
-                self.circle.store(self.head.circle());
                 match commands.recv_timeout(wait) {
-                    Ok(cmd) => self.command(cmd),
+                    Ok(Command::Sync { position, speed }) => self.command_sync(position, speed),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
@@ -673,21 +516,20 @@ fn playback_loop(
     let mut pb = Playback {
         ctx,
         slot,
-        playing,
-        seeking,
-        circled,
-        circle,
-        position,
+        shown,
         reader,
+        duration: pts.last().copied().unwrap_or(0),
         pts,
         jpeg,
         image,
         dims,
         shown_idx: 0,
+        sync_at: Instant::now(),
+        sync_position: 0,
+        sync_speed: 0.0,
+        playing: false,
         last_position: 0,
         catching: false,
-        held: false,
-        head: Playhead::new(Instant::now(), 0),
         last_present: Instant::now(),
         decode: FrameStats::default(),
         read: FrameStats::default(),
@@ -708,16 +550,13 @@ fn playback_loop(
         pb.ctx.request_repaint();
         return;
     }
-    // Головка без длительности ничего не решает — ставим настоящую
-    // (конец файла, стоп на границах, clamp позиции).
-    pb.head = Playhead::new(Instant::now(), pb.pts.last().copied().unwrap_or(0));
-    pb.position.store(pb.pts[0]);
-    duration.store(pb.pts.last().copied().unwrap_or(0));
+    pb.shown.store(pb.pts[0]);
+    duration.store(pb.duration);
     *state.lock().unwrap() = PlayerState::Ready;
     log::info!(
         "player: {} frames, {} ms span, max frame {} bytes",
         pb.pts.len(),
-        pb.pts.last().copied().unwrap_or(0),
+        pb.duration,
         pb.reader.max_frame_len()
     );
     pb.ctx.request_repaint();

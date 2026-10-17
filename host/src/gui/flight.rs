@@ -1068,7 +1068,7 @@ impl Flight {
                 if let Some(race) = &self.race {
                     race.intent(Intent::Exit);
                 }
-                navigator.goto(menu::Menu)
+                navigator.goto(menu::Menu::new())
             }
             Action::None => {}
         }

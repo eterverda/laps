@@ -422,17 +422,6 @@ fn stripe(
         .with_max_x(plate.max.x - super::ruler::cell_x(1))
 }
 
-/// Состояние заливки транспортной кнопки: покой / активна (нажата).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TransportState {
-    /// Обычное состояние: заливка неярким цветом, текст чёрный.
-    Idle,
-    /// Нажата (включая тап) или активирована: заливка ярким, текст чёрный.
-    Active,
-    /// Некликабельна: чёрный фон, неяркая обводка, глиф неяркого цвета.
-    Disabled,
-}
-
 /// Кнопка транспорта (scrub): залитый прямоугольник 3 клетки высотой,
 /// верхний текст (иконка) по центру верхних двух клеток, нижний текст —
 /// в третьей клетке, с отступом в колонку с каждой стороны (не касается
@@ -442,18 +431,23 @@ pub enum TransportState {
 /// нажатым (иначе вспышка нажатия теряется между кадрами).
 pub struct TransportButton<T: AsRef<str>> {
     text: T,
-    state: TransportState,
+    enabled: bool,
+    active: bool,
     idle: egui::Color32,
-    active: egui::Color32,
+    active_color: egui::Color32,
 }
 
 impl<T: AsRef<str>> TransportButton<T> {
-    pub fn new(text: T, state: TransportState, idle: egui::Color32, active: egui::Color32) -> Self {
+    /// enabled — кликабельна; active — нажата (включая тап) или
+    /// активирована. Внешние состояния не нужны: решения о виде —
+    /// внутри (disabled = !enabled).
+    pub fn new(text: T, enabled: bool, active: bool, idle: egui::Color32, active_color: egui::Color32) -> Self {
         Self {
             text,
-            state,
-            idle,
+            enabled,
             active,
+            idle,
+            active_color,
         }
     }
 
@@ -467,15 +461,15 @@ impl<T: AsRef<str>> TransportButton<T> {
     pub fn paint(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let text = self.text.as_ref();
         let disabled_color = self.idle.gamma_multiply(0.35);
-        let (fill, icon_color) = match self.state {
-            TransportState::Idle => (self.idle, egui::Color32::BLACK),
-            TransportState::Active => (self.active, egui::Color32::BLACK),
+        let (fill, icon_color) = match (self.enabled, self.active) {
+            (true, true) => (self.active_color, egui::Color32::BLACK),
+            (true, false) => (self.idle, egui::Color32::BLACK),
             // Выключенная: чёрный фон, обводка и глиф вдвое бледнее
             // (альфой, новый цвет не нужен).
-            TransportState::Disabled => (egui::Color32::BLACK, disabled_color),
+            (false, _) => (egui::Color32::BLACK, disabled_color),
         };
         ui.painter().rect_filled(rect, 0.0, fill);
-        if matches!(self.state, TransportState::Disabled) {
+        if !self.enabled {
             // Полная обводка поверх чёрного фона.
             ui.painter().rect_stroke(
                 rect,

@@ -50,9 +50,10 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   the top 2), click area = whole widget without the chevron tips;
   generic over `AsRef<str>` text/sub; `view::TransportButton` — scrub
   transport (REW/PLAY/FF/RPT): filled rect, icon centered in the top
-  2 cells, sub centered in the 3rd with 1-cell side insets, 2 states
-  (`TransportState`: Idle/Active), colors passed in, `interact`/`paint`
-  split (seek logic between them); `view::arrow_plate` — the plate
+  2 cells, sub centered in the 3rd with 1-cell side insets, API is
+  `(icon, enabled, active, idle, lit)` — the widget derives the look
+  (disabled = !enabled: black fill + faded outline/glyph), colors passed
+  in, `interact`/`paint` split (seek logic between them); `view::arrow_plate` — the plate
   geometry shared by NavButton (per-edge `PlateEdge` + `PlatePaint`,
   outline drawn StrokeKind::Inside); `viewfinder::ViewfinderFrame` —
   plate + label + name; `header::Header` — LAPS + date/time for a
@@ -117,23 +118,31 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) signaled
   UI-ward via `crossbeam_utils::AtomicCell`
 - **Гоночное ядро** (сервис `service::race`; чистое ядро `RaceCore`,
-  тесты на FakeClock по образцу `Transport`): фазы эфира LiveBefore →
-  RecordHead → RaceCountdown → Race → RecordTail → Finished; часы гонки
+  тесты на FakeClock по образцу `Transport`): фазы эфира Before →
+  Countdown → Running → After → Finished; ядро ленивое — рождается
+  первым намерением REC/RACE (`RaceCore::born`, сразу в результате
+  намерения; журнал и ноль меток — от этого момента, файлы называются
+  временем первой записи), жизнь потока = одна сессия REC. REC-off
+  до старта гонки завершает сессию отменой: ядро дропается (журнала
+  на диске нет), GUI возвращается в Idle (`Notice::
+`);
+  REC-off после финиша отдаёт журнал в DVR (`Notice::EnterDvr`;
+  отличие — флаг `raced`). Часы гонки
   (отсчёт, авто-финиш по лимиту), политика записи (старт/стоп/abort),
   журнал (события + файл). Намерения (`Intent`: RecPressed/RacePressed/Exit)
   → решения; решения возвращаются эффектами (`Effect`) — ядро без IO.
   Поток-обёртка (`service::race::spawn`) исполняет эффекты (команды рекордерам
   через `Camera::recorder()` — отделённый хэндл, звук), поллит
   `first_frame_at` и шлёт GUI `Notice::State` (при изменении) /
-  `EnterDvr`. Правила гонки (сигнал старта, отсчёт, длительность) —
+  `EnterDvr` / `BackToIdle`. Правила гонки (сигнал старта, отсчёт, длительность) —
   `model::rules` (`RaceRules.duration: Option`, None — без авто-финиша).
-  GUI (`gui/flight.rs`) — только намерения и рендер снапшота `AirState`,
-  гоночного стейта не имеет; до старта гонки отжатия шагают назад,
-  после — только вперёд
+  GUI (`gui/flight.rs`) — только намерения и рендер снапшота
+  `race::Phase`, гоночного стейта не имеет; до старта гонки отжатия
+  шагают назад, после — только вперёд
 - Инварианты переходов: `race-started` в журнале всегда с парным
-  `race-finished` (лимит, RACE-кнопка, REC-стоп в Race, EXIT из Race);
+  `race-finished` (лимит, RACE-кнопка, REC-стоп в Running, EXIT из Running);
   записи вне гонки удаляются (abort) на любом пути — REC-off до старта,
-  отмена отсчёта, EXIT из RecordHead/RaceCountdown (`RaceCore::exit`
+  отмена отсчёта, EXIT из Before/Countdown (`RaceCore::exit`
   доводит машину до целостности). Порядок «журнал раньше уведомления
   GUI» — контракт обёртки: экран не врёт файлу
 

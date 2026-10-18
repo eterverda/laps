@@ -31,7 +31,7 @@ const POLL: Duration = Duration::from_millis(30);
 // --- Ядро гонки --------------------------------------------------------------
 
 /// Намерения в ядро (GUI-кнопки, выход).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
     RecPressed,
     RacePressed,
@@ -58,89 +58,94 @@ pub enum Effect {
     CancelAudio,
 }
 
-/// Фазы эфира — домен ядра. DVR (экран) живёт в GUI.
+/// Фазы эфира — единственная машина состояний домена (снапшот для GUI —
+/// сам же enum). Данные живут в вариантах; `Countdown.start` — момент
+/// старта гонки (старт отсчёта + задержка + гудок), считается при входе —
+/// GUI длину гудка не знает. DVR (экран) живёт в GUI. Жизнь ядра —
+/// одна сессия REC: Before (REC, гонки нет) → Countdown → Running →
+/// After → Finished; отмена до старта (REC-off из Before/Countdown) —
+/// тоже Finished, но без гонки (ядро дропается, GUI в Idle).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AirPhase {
-    LiveBefore,
-    RecordHead,
-    RaceCountdown,
-    Race,
-    RecordTail,
+pub enum Phase {
+    /// REC включена, гонка не началась (первая запись — ядро рождается
+    /// первым намерением сразу в этой фазе или в Countdown).
+    Before,
+    Countdown {
+        start: Instant,
+    },
+    Running {
+        start: Instant,
+    },
+    After {
+        race: Duration,
+    },
     /// Гонка закрыта, журнал передан: GUI переходит в DVR.
     Finished,
 }
 
-/// Снапшот состояния эфира для GUI (рендер кнопок/счётчиков).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct AirState {
-    pub phase: AirPhase,
-    /// Конец отсчёта (старт отсчёта + задержка + длина гудка) — для
-    /// мигания счётчика; GUI длину гудка не знает.
-    pub countdown_end: Option<Instant>,
-    /// Бегущая гонка: момент старта.
-    pub race: Option<Instant>,
-    /// Замороженное время гонки (после финиша).
-    pub race_done: Option<Duration>,
-}
-
-impl AirState {
+impl Phase {
     /// REC активна (индикатор/цвет кнопки).
     pub fn rec_on(&self) -> bool {
         matches!(
-            self.phase,
-            AirPhase::RecordHead | AirPhase::RaceCountdown | AirPhase::Race | AirPhase::RecordTail
+            self,
+            Phase::Before | Phase::Countdown { .. } | Phase::Running { .. } | Phase::After { .. }
         )
     }
 
     /// Идёт отсчёт (мигание счётчика).
     pub fn countdown_active(&self) -> bool {
-        self.countdown_end.is_some()
+        matches!(self, Phase::Countdown { .. })
     }
 
     /// Время гонки для счётчика: бежит в Race, заморожено после.
     pub fn race_elapsed(&self, now: Instant) -> Duration {
-        if let Some(done) = self.race_done {
-            return done;
+        match *self {
+            Phase::After { race } => race,
+            Phase::Running { start } => now.saturating_duration_since(start),
+            _ => Duration::ZERO,
         }
-        self.race
-            .map_or(Duration::ZERO, |start| now.saturating_duration_since(start))
     }
 
     /// REC кликабельна: с эфира до конца хвоста.
     pub fn rec_available(&self) -> bool {
-        !matches!(self.phase, AirPhase::Finished)
+        !matches!(self, Phase::Finished)
     }
 
     /// RACE кликабельна: нажатие до старта, отжатие в Countdown/Race.
     pub fn race_available(&self) -> bool {
         matches!(
-            self.phase,
-            AirPhase::LiveBefore | AirPhase::RecordHead | AirPhase::RaceCountdown | AirPhase::Race
+            self,
+            Phase::Before | Phase::Countdown { .. } | Phase::Running { .. }
         )
     }
 
     /// Гонка началась (или дальше): записи относятся к ней.
     pub fn race_started(&self) -> bool {
         matches!(
-            self.phase,
-            AirPhase::Race | AirPhase::RecordTail | AirPhase::Finished
+            self,
+            Phase::Running { .. } | Phase::After { .. } | Phase::Finished
         )
     }
 
     pub fn finished(&self) -> bool {
-        matches!(self.phase, AirPhase::Finished)
+        matches!(self, Phase::Finished)
     }
 }
 
-/// Состояние ядра (приватное; наружу — AirState).
-#[derive(Clone, Copy)]
-enum State {
-    LiveBefore,
-    RecordHead,
-    RaceCountdown { start: Instant, delay: Duration },
-    Race { start: Instant },
-    RecordTail { race: Duration },
-    Finished,
+/// Фаза, в которой окажется ядро после born с этим намерением —
+/// GUI ставит её в Live на кадр рождения, до первого Notice::State.
+pub fn born_state(first: Intent, now: Instant, rules: &RaceRules) -> Phase {
+    match first {
+        Intent::RecPressed => Phase::Before,
+        Intent::RacePressed => Phase::Countdown {
+            start: race_time_start(
+                now,
+                Duration::from_secs(PRE_BEEP_SECS) + sample_start_delay(&rules.start_signal_delay),
+                BUZZER.duration(),
+            ),
+        },
+        Intent::Exit => Phase::Finished,
+    }
 }
 
 /// Гоночное ядро: часы гонки, политика записи, журнал. Чистое — решения
@@ -148,7 +153,7 @@ enum State {
 /// писатель журнала; порядок «журнал раньше уведомления GUI» обеспечивает
 /// обёртка (эффекты применяются после записи в журнал).
 pub struct RaceCore {
-    state: State,
+    phase: Phase,
     rules: RaceRules,
     journal: Journal,
     captures_dir: PathBuf,
@@ -169,24 +174,33 @@ pub struct RaceCore {
     rec_deferred: Vec<(u64, FlightEvent)>,
     /// Последнее известное first_frame_at по камерам (edge-детект).
     rec_seen: HashMap<String, Option<Instant>>,
+    /// Гонка состоялась (Running или дальше): отличает финиш после гонки
+    /// (журнал отдаём в DVR) от отмены записи до старта (ядро дропается,
+    /// GUI возвращается в Idle).
+    raced: bool,
 }
 
 impl RaceCore {
+    /// Конструктор = REC нажали: ядро рождается с записью (Before) —
+    /// журнал, ноль меток, сессии записи и отложенный RecordStarted
+    /// стартуют от этого момента (файлы называются временем первой
+    /// записи, а не запуска экрана). Первое действие RACE — обычный
+    /// race_pressed поверх new(). Жизнь ядра — одна сессия REC.
     pub fn new(
         now: Instant,
         rules: RaceRules,
-        captures_dir: PathBuf,
+        captures_dir: std::path::PathBuf,
         buzzer_len: Duration,
         pads: BTreeMap<String, PadConfig>,
         assignments: HashMap<String, Pilot>,
         cameras: HashMap<String, CameraConfig>,
-    ) -> Self {
+    ) -> (Self, Vec<Effect>) {
         let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
             log::warn!("flight: local time unavailable, journal falls back to UTC");
             time::OffsetDateTime::now_utc()
         });
-        Self {
-            state: State::LiveBefore,
+        let mut core = Self {
+            phase: Phase::Before,
             rules,
             journal: Journal::new(date_time, pads, assignments),
             captures_dir,
@@ -196,7 +210,14 @@ impl RaceCore {
             rec_pending: HashMap::new(),
             rec_deferred: Vec::new(),
             rec_seen: HashMap::new(),
-        }
+            raced: false,
+        };
+        core.rec_deferred
+            .push((core.ms(now), FlightEvent::RecordStarted {}));
+        let effects = vec![Effect::Record {
+            sessions: core.start_sessions(),
+        }];
+        (core, effects)
     }
 
     /// Метка мс от нуля журнала.
@@ -204,81 +225,57 @@ impl RaceCore {
         at.saturating_duration_since(self.started).as_millis() as u64
     }
 
-    pub fn state(&self) -> AirState {
-        let (countdown_end, race, race_done) = match self.state {
-            State::LiveBefore | State::RecordHead | State::Finished => (None, None, None),
-            State::RaceCountdown { start, delay } => (
-                Some(race_time_start(start, delay, self.buzzer_len)),
-                None,
-                None,
-            ),
-            State::Race { start } => (None, Some(start), None),
-            State::RecordTail { race } => (None, None, Some(race)),
-        };
-        AirState {
-            phase: match self.state {
-                State::LiveBefore => AirPhase::LiveBefore,
-                State::RecordHead => AirPhase::RecordHead,
-                State::RaceCountdown { .. } => AirPhase::RaceCountdown,
-                State::Race { .. } => AirPhase::Race,
-                State::RecordTail { .. } => AirPhase::RecordTail,
-                State::Finished => AirPhase::Finished,
-            },
-            countdown_end,
-            race,
-            race_done,
-        }
+    pub fn phase(&self) -> Phase {
+        self.phase
     }
 
-    /// Журнал для передачи GUI при закрытии гонки (EnterDvr) и для
+    /// Журнал для передачи GUI при закрытии гонки (EnterReview) и для
     /// записи на диск (поток-обёртка — единственный писатель файла).
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
 
-    /// Журнал для передачи GUI при закрытии гонки (EnterDvr).
+    /// Журнал для передачи GUI при закрытии гонки (EnterReview).
     pub fn into_journal(self) -> Journal {
         self.journal
     }
 
+    /// Гонка состоялась: финиш после гонки (DVR) vs отмена записи (Idle).
+    pub fn has_raced(&self) -> bool {
+        self.raced
+    }
+
     /// Ближайший таймер ядра: конец отсчёта или лимит гонки.
     pub fn next_deadline(&self) -> Option<Instant> {
-        match self.state {
-            State::RaceCountdown { start, delay } => {
-                Some(race_time_start(start, delay, self.buzzer_len))
-            }
-            State::Race { start } => self.rules.duration.map(|d| start + d),
+        match self.phase {
+            Phase::Countdown { start } => Some(start),
+            Phase::Running { start } => self.rules.duration.map(|d| start + d),
             _ => None,
         }
     }
 
-    /// Перевод часов: конец отсчёта — в Race, лимит — в RecordTail.
+    /// Перевод часов: конец отсчёта — в Running, лимит — в After.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
-        match self.state {
-            State::RaceCountdown { start, delay }
-                if now >= race_time_start(start, delay, self.buzzer_len) =>
-            {
+        match self.phase {
+            Phase::Countdown { start } if now >= start => {
                 // Журнал появляется только если гонка состоялась:
                 // отложенная голова уходит в память, файл создаёт
                 // писатель (поток-обёртка) снапшотом на этом же тике.
                 self.flush_rec_deferred();
-                self.journal.push(
-                    self.ms(race_time_start(start, delay, self.buzzer_len)),
-                    FlightEvent::RaceStarted {},
-                );
-                self.state = State::Race {
-                    start: race_time_start(start, delay, self.buzzer_len),
-                };
+                self.journal
+                    .push(self.ms(start), FlightEvent::RaceStarted {});
+                self.phase = Phase::Running { start };
+                self.raced = true;
                 Vec::new()
             }
-            State::Race { start } => {
+            Phase::Running { start } => {
                 let elapsed = now.saturating_duration_since(start);
                 if self.rules.duration.is_some_and(|limit| elapsed >= limit) {
                     self.journal.push(
                         self.ms(now),
                         FlightEvent::RaceFinished { prematurely: false },
                     );
-                    self.state = State::RecordTail { race: elapsed };
+                    self.phase = Phase::After { race: elapsed };
                     vec![Effect::Buzzer]
                 } else {
                     Vec::new()
@@ -288,89 +285,66 @@ impl RaceCore {
         }
     }
 
-    /// Намерение REC.
+    /// Намерение REC (ядро рождено — см. born).
     pub fn rec_pressed(&mut self, now: Instant) -> Vec<Effect> {
-        match self.state {
-            State::LiveBefore => {
-                self.rec_deferred
-                    .push((self.ms(now), FlightEvent::RecordStarted {}));
-                self.state = State::RecordHead;
-                vec![Effect::Record {
-                    sessions: self.start_sessions(),
-                }]
-            }
-            State::RecordHead => {
-                // Запись без гонки — её отложенные события не нужны.
+        match self.phase {
+            Phase::Before | Phase::Countdown { .. } => {
+                // REC-off до старта гонки: отмена сессии. Поток увидит
+                // Finished без raced и дропнет ядро (GUI — в Idle).
                 self.rec_deferred.clear();
                 self.rec_pending.clear();
-                self.state = State::LiveBefore;
-                vec![Effect::StopRecording { commit: false }]
-            }
-            State::RaceCountdown { .. } => {
-                self.rec_deferred.clear();
-                self.rec_pending.clear();
-                self.state = State::LiveBefore;
+                self.phase = Phase::Finished;
                 vec![Effect::CancelAudio, Effect::StopRecording { commit: false }]
             }
-            State::Race { .. } => {
+            Phase::Running { .. } => {
                 // REC гасит запись посреди гонки — гонка финиширует здесь.
                 self.journal.push(
                     self.ms(now),
                     FlightEvent::RaceFinished { prematurely: false },
                 );
                 self.finish_recording(now);
-                self.state = State::Finished;
+                self.phase = Phase::Finished;
                 vec![Effect::Buzzer, Effect::StopRecording { commit: true }]
             }
-            State::RecordTail { .. } => {
+            Phase::After { .. } => {
                 self.finish_recording(now);
-                self.state = State::Finished;
+                self.phase = Phase::Finished;
                 vec![Effect::StopRecording { commit: true }]
             }
-            State::Finished => Vec::new(),
+            Phase::Finished => Vec::new(),
         }
     }
 
-    /// Намерение RACE.
+    /// Намерение RACE (ядро рождено — см. born).
     pub fn race_pressed(&mut self, now: Instant) -> Vec<Effect> {
-        match self.state {
-            State::LiveBefore => {
-                let delay = self.countdown_delay();
-                self.rec_deferred
-                    .push((self.ms(now), FlightEvent::RecordStarted {}));
-                self.defer_countdown(now);
-                self.state = State::RaceCountdown { start: now, delay };
-                vec![
-                    Effect::Record {
-                        sessions: self.start_sessions(),
-                    },
-                    Effect::Countdown { delay },
-                ]
-            }
-            State::RecordHead => {
+        match self.phase {
+            Phase::Before => {
+                // Запись уже идёт (new = REC-on): отсчёт к ней.
                 let delay = self.countdown_delay();
                 self.defer_countdown(now);
-                self.state = State::RaceCountdown { start: now, delay };
+                self.phase = Phase::Countdown {
+                    start: race_time_start(now, delay, self.buzzer_len),
+                };
                 vec![Effect::Countdown { delay }]
             }
-            State::RaceCountdown { .. } => {
+            Phase::Countdown { .. } => {
                 // Отмена: отложенный отсчёт не состоялся — выбрасываем.
                 self.rec_deferred
                     .retain(|(_, ev)| !matches!(ev, FlightEvent::RaceCountdown {}));
-                self.state = State::RecordHead;
+                self.phase = Phase::Before;
                 vec![Effect::CancelAudio]
             }
-            State::Race { start } => {
+            Phase::Running { start } => {
                 // Финиш кнопкой — гудок, запись хвоста продолжается.
                 let race = now.saturating_duration_since(start);
                 self.journal.push(
                     self.ms(now),
                     FlightEvent::RaceFinished { prematurely: true },
                 );
-                self.state = State::RecordTail { race };
+                self.phase = Phase::After { race };
                 vec![Effect::Buzzer]
             }
-            State::RecordTail { .. } | State::Finished => Vec::new(),
+            Phase::After { .. } | Phase::Finished => Vec::new(),
         }
     }
 
@@ -378,8 +352,8 @@ impl RaceCore {
     /// парным race-finished, записи вне гонки не остаются на диске.
     /// Ядро после вызова уничтожается — состояние не переводим.
     pub fn exit(&mut self, now: Instant) -> Vec<Effect> {
-        match self.state {
-            State::Race { .. } => {
+        match self.phase {
+            Phase::Running { .. } => {
                 self.journal.push(
                     self.ms(now),
                     FlightEvent::RaceFinished { prematurely: true },
@@ -387,16 +361,16 @@ impl RaceCore {
                 self.finish_recording(now);
                 vec![Effect::Buzzer, Effect::StopRecording { commit: true }]
             }
-            State::RecordTail { .. } => {
+            Phase::After { .. } => {
                 self.finish_recording(now);
                 vec![Effect::StopRecording { commit: true }]
             }
-            State::RecordHead | State::RaceCountdown { .. } => {
+            Phase::Before | Phase::Countdown { .. } => {
                 self.rec_deferred.clear();
                 self.rec_pending.clear();
                 vec![Effect::CancelAudio, Effect::StopRecording { commit: false }]
             }
-            State::LiveBefore | State::Finished => Vec::new(),
+            Phase::Finished => Vec::new(),
         }
     }
 
@@ -440,7 +414,7 @@ impl RaceCore {
             camera_id: camera_id.to_owned(),
             filename,
         };
-        if self.state().race_started() {
+        if self.phase().race_started() {
             self.journal.push(self.ms(at), event);
         } else {
             self.rec_deferred.push((self.ms(at), event));
@@ -455,7 +429,7 @@ impl RaceCore {
         }
     }
 
-    /// Отложенный RaceCountdown: повторное нажатие RACE (REC-циклы
+    /// Отложенный Countdown: повторное нажатие RACE (REC-циклы
     /// до гонки) не плодит дубликаты — старый выбрасываем.
     fn defer_countdown(&mut self, now: Instant) {
         self.rec_deferred
@@ -547,6 +521,7 @@ mod tests {
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
         )
+        .0
     }
 
     /// События журнала как (ms, короткая метка) для asserts.
@@ -578,16 +553,9 @@ mod tests {
     #[test]
     fn full_race_cycle() {
         let mut clock = FakeClock::new();
+        // born с RecPressed — запись головы уже включена (REC до гонки).
         let mut core = test_core(&clock);
-        let t0 = clock.now;
-
-        // Запись головы (REC до гонки).
-        let effects = core.rec_pressed(t0);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Record { sessions }] if sessions.len() == 1
-        ));
-        assert!(core.state().rec_on() && !core.state().race_started());
+        assert!(core.phase().rec_on() && !core.phase().race_started());
 
         // Первый кадр головы — событие откладывается (гонки ещё нет),
         // журнал до старта гонки пуст.
@@ -610,6 +578,7 @@ mod tests {
         // Отсчёт начался в t0+500, старт = t0+500+delay.
         let t_start = clock.advance(delay.as_millis() as u64);
         assert!(core.tick(t_start).is_empty());
+        assert!(core.has_raced(), "факт старта гонки — гейт журнала и DVR");
         let marks = journal_marks(&core);
         assert_eq!(marks[0], (0, "rec"), "REC-on головы: {marks:?}");
         assert_eq!(marks[1], (500, "file"), "файл головы: {marks:?}");
@@ -633,7 +602,7 @@ mod tests {
             journal_marks(&core)
         );
         assert_eq!(
-            core.state().race_elapsed(t_finish),
+            core.phase().race_elapsed(t_finish),
             DURATION,
             "счётчик заморожен на лимите"
         );
@@ -652,33 +621,33 @@ mod tests {
             )),
             "сессия закрыта: {marks:?}"
         );
-        assert!(core.state().finished());
+        assert!(core.phase().finished());
     }
 
-    /// Отмена отсчёта RACE-кнопкой: назад в RecordHead, записи живы.
+    /// Отмена отсчёта RACE-кнопкой: назад в Before, записи живы.
     #[test]
     fn cancel_countdown_race_button() {
         let clock = FakeClock::new();
+        // born с RecPressed — запись уже идёт.
         let mut core = test_core(&clock);
-        core.rec_pressed(clock.now);
         let t = clock.now;
         core.race_pressed(t);
-        assert!(core.state().countdown_active());
+        assert!(core.phase().countdown_active());
         assert!(matches!(
             core.race_pressed(t).as_slice(),
             [Effect::CancelAudio]
         ));
-        assert!(!core.state().countdown_active());
-        assert!(core.state().rec_on(), "запись продолжается");
-        assert!(!core.state().race_started());
+        assert!(!core.phase().countdown_active());
+        assert!(core.phase().rec_on(), "запись продолжается");
+        assert!(!core.phase().race_started());
     }
 
     /// Отмена отсчёта REC'ом: запись abort, отложенные события выброшены.
     #[test]
     fn cancel_countdown_rec_aborts() {
         let mut clock = FakeClock::new();
+        // born с RecPressed — запись уже идёт.
         let mut core = test_core(&clock);
-        core.rec_pressed(clock.now);
         core.note_frame("camera-1", Some(clock.advance(300)));
         core.race_pressed(clock.now);
         assert!(matches!(
@@ -709,7 +678,7 @@ mod tests {
             Some(&(23_001, "rec-end")),
             "коммит закрывает запись: {marks:?}"
         );
-        assert!(core.state().finished());
+        assert!(core.phase().finished());
     }
 
     /// RACE-кнопка в Race: финиш пользователя, запись продолжается (хвост).
@@ -724,8 +693,8 @@ mod tests {
         assert!(matches!(core.race_pressed(t).as_slice(), [Effect::Buzzer]));
         let marks = journal_marks(&core);
         assert_eq!(marks.last(), Some(&(15_345, "finish-user")), "{marks:?}");
-        assert!(core.state().rec_on(), "хвост продолжается");
-        assert!(!core.state().finished());
+        assert!(core.phase().rec_on(), "хвост продолжается");
+        assert!(!core.phase().finished());
     }
 
     /// EXIT из каждой фазы: инварианты целостности.
@@ -750,7 +719,7 @@ mod tests {
             "коммит закрывает запись"
         );
 
-        // Из RecordTail: только коммит (финиш уже в журнале).
+        // Из After: только коммит (финиш уже в журнале).
         let mut clock = FakeClock::new();
         let mut core = test_core(&clock);
         core.race_pressed(clock.now);
@@ -763,11 +732,11 @@ mod tests {
             [Effect::StopRecording { commit: true }]
         ));
 
-        // Из RecordHead/Countdown: cancel + abort, без гонки файла нет.
+        // Из Before/Countdown: cancel + abort, без гонки файла нет.
         for race_first in [false, true] {
             let clock = FakeClock::new();
+            // born с RecPressed — ядро уже в Before.
             let mut core = test_core(&clock);
-            core.rec_pressed(clock.now);
             if race_first {
                 core.race_pressed(clock.now);
             }
@@ -801,7 +770,8 @@ mod tests {
             BTreeMap::new(),
             HashMap::new(),
             cameras,
-        );
+        )
+        .0;
         core.race_pressed(clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
@@ -842,15 +812,19 @@ mod tests {
             BTreeMap::new(),
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
-        );
+        )
+        .0;
         core.race_pressed(clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
         // Час гонки — никакого авто-финиша.
         let t_later = clock.advance(3_600_000);
         assert!(core.tick(t_later).is_empty());
-        assert!(core.state().race.is_some(), "гонка без лимита жива");
-        assert!(!core.state().race_started() || core.state().race.is_some());
+        assert!(
+            matches!(core.phase(), Phase::Running { .. }),
+            "гонка без лимита жива"
+        );
+        assert!(!core.phase().race_started() || matches!(core.phase(), Phase::Running { .. }));
         // Пользователь завершает кнопкой.
         assert!(matches!(
             core.race_pressed(t_later).as_slice(),
@@ -858,58 +832,37 @@ mod tests {
         ));
     }
 
-    /// Повторные REC до гонки: стемы совпадают (аборт стирает следы
-    /// сессии), в журнале — один файл живой сессии.
+    /// REC-off до старта гонки завершает сессию: cancel + abort,
+    /// журнал пуст (на диск он не попадал — снапшот только со старта
+    /// гонки). Новая сессия — новое ядро (born), новый стем.
     #[test]
-    fn repeat_recording_reuses_stem() {
+    fn rec_off_before_race_finishes_session() {
         let mut clock = FakeClock::new();
         let mut core = test_core(&clock);
-        // Три сессии = пять нажатий (вкл/выкл/вкл/выкл/вкл); стемы
-        // собираем только из Record-эффектов.
-        let mut stems = Vec::new();
-        for _ in 0..5 {
-            for effect in core.rec_pressed(clock.now) {
-                if let Effect::Record { sessions } = effect {
-                    stems.push(sessions[0].1.stem.clone());
-                }
-            }
-        }
-        assert_eq!(stems.len(), 3, "три сессии записи");
-        assert!(
-            stems[1] == stems[0] && stems[2] == stems[0],
-            "стем без -r2 (аборт стирает прошлую сессию): {stems:?}"
-        );
-
-        // Первый кадр живой сессии привязывается к её имени. До гонки
-        // событие откладывается — старт гонки сбрасывает его в журнал.
         core.note_frame("camera-1", Some(clock.advance(300)));
-        core.race_pressed(clock.now);
-        let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
-        core.tick(t_start);
-        let names: Vec<_> = core
-            .journal
-            .iter_ms()
-            .filter_map(|(_, event)| match event {
-                FlightEvent::VideoAttached { filename, .. } => Some(filename.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            names.len(),
-            1,
-            "журналируется один файл живой сессии: {names:?}"
+        assert!(matches!(
+            core.rec_pressed(clock.now).as_slice(),
+            [Effect::CancelAudio, Effect::StopRecording { commit: false }]
+        ));
+        assert!(core.phase().finished());
+        assert!(!core.has_raced());
+        assert!(
+            journal_marks(&core).is_empty(),
+            "отменённая сессия не журналирована"
         );
-        assert!(names[0].ends_with("-camera-1-mjpeg.mkv"), "{names:?}");
     }
 }
 
 /// Сообщения ядра → GUI.
 pub enum Notice {
     /// Состояние эфира изменилось (GUI держит последний).
-    State(AirState),
+    State(Phase),
     /// Гонка закрыта: журнал переходит GUI (открытие плееров — GUI,
     /// там egui::Context). Поток после этого завершается.
-    EnterDvr { journal: Journal },
+    EnterReview { journal: Journal },
+    /// REC-off до старта гонки: сессия отменена, журнала на диске нет.
+    /// GUI возвращается в Idle (поток завершился).
+    BackToIdle,
 }
 
 /// Хэндл гоночного потока для GUI: шлём намерения, забираем уведомления.
@@ -935,21 +888,30 @@ pub fn spawn(
     key_events: std::sync::Arc<std::sync::Mutex<Vec<crate::driver::keyboard::KeyEvent>>>,
     key_dead: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    first: Intent,
+    audio: crate::driver::audio::Audio,
 ) -> Race {
     let (intent_tx, intent_rx) = crossbeam_channel::bounded(16);
     let (notice_tx, notice_rx) = crossbeam_channel::bounded(64);
     std::thread::spawn(move || {
-        let audio = Audio::spawn();
-        let mut core = Some(RaceCore::new(
+        // new = REC нажали: журнал и ноль меток — от этого момента.
+        // Жизнь потока — сессия REC: REC-off до старта гонки отменяет
+        // её (ядро дропается, GUI — в Idle), после финиша отдаём журнал
+        // в DVR. Первое действие RACE — обычный race_pressed поверх new.
+        let (mut core, mut effects) = RaceCore::new(
             Instant::now(),
             rules,
             captures_dir.clone(),
             BUZZER.duration(),
             pads,
             assignments,
-            cameras.clone(),
-        ));
-        let mut last_air = core.as_ref().unwrap().state();
+            cameras,
+        );
+        if first == Intent::RacePressed {
+            effects.extend(core.race_pressed(Instant::now()));
+        }
+        apply(&effects, &recorders, &audio);
+        let mut last_air = core.phase();
         let _ = notice_tx.try_send(Notice::State(last_air));
         // Журнал на диске: снапшот на старте гонки, дальше дописываем.
         // Путь и счётчик дописанных событий держит писатель (этот цикл).
@@ -958,7 +920,10 @@ pub fn spawn(
         let sync_journal = |active: &RaceCore,
                             journal_path: &mut Option<std::path::PathBuf>,
                             journal_written: &mut usize| {
-            if !active.state().race_started() {
+            // Гейт — факт старта гонки, не фаза: аварийное отжатие
+            // уходит в Finished без гонки (has_raced == false), и писать
+            // пустую шапку на диск не нужно.
+            if !active.has_raced() {
                 return;
             }
             let journal = active.journal();
@@ -979,42 +944,29 @@ pub fn spawn(
             }
         };
 
-        while let Some(active) = core.as_mut() {
+        loop {
             let now = Instant::now();
-            let until_deadline = active
+            let until_deadline = core
                 .next_deadline()
                 .map(|d| d.saturating_duration_since(now))
                 .unwrap_or(POLL);
             let effects = match intent_rx.recv_timeout(until_deadline.min(POLL)) {
-                Ok(Intent::RecPressed) => active.rec_pressed(Instant::now()),
-                Ok(Intent::RacePressed) => active.race_pressed(Instant::now()),
+                Ok(Intent::RecPressed) => core.rec_pressed(Instant::now()),
+                Ok(Intent::RacePressed) => core.race_pressed(Instant::now()),
                 Ok(Intent::Exit) => {
-                    let effects = active.exit(Instant::now());
+                    let effects = core.exit(Instant::now());
                     apply(&effects, &recorders, &audio);
                     // Финальный коммит — на диск до ухода.
-                    sync_journal(active, &mut journal_path, &mut journal_written);
+                    sync_journal(&core, &mut journal_path, &mut journal_written);
                     break;
                 }
-                Err(RecvTimeoutError::Timeout) => active.tick(Instant::now()),
+                Err(RecvTimeoutError::Timeout) => core.tick(Instant::now()),
                 Err(RecvTimeoutError::Disconnected) => break,
             };
             apply(&effects, &recorders, &audio);
 
-            // Поллинг first_frame_at: edge-детект — в ядре.
-            for (id, recorder) in &recorders {
-                let first_frame_at = match recorder.record_state() {
-                    crate::driver::dvr::RecordState::Writing { first_frame_at, .. } => {
-                        Some(first_frame_at)
-                    }
-                    _ => None,
-                };
-                active.note_frame(id, first_frame_at);
-            }
-            sync_journal(active, &mut journal_path, &mut journal_written);
-
             // Клавиатуры: дрен каналов в общую очередь для GUI. Обрыв
-            // канала — id в dead-сет (GUI рисует дисконнект). Будим UI
-            // только когда что-то пришло.
+            // канала — id в dead-сет. Будим UI только когда что-то пришло.
             if !keyboards.is_empty() {
                 let mut got = false;
                 let mut dead_now = Vec::new();
@@ -1043,22 +995,43 @@ pub fn spawn(
                 }
             }
 
+            // Поллинг first_frame_at: edge-детект — в ядре.
+            for (id, recorder) in &recorders {
+                let first_frame_at = match recorder.record_state() {
+                    crate::driver::dvr::RecordState::Writing { first_frame_at, .. } => {
+                        Some(first_frame_at)
+                    }
+                    _ => None,
+                };
+                core.note_frame(id, first_frame_at);
+            }
+            sync_journal(&core, &mut journal_path, &mut journal_written);
+
             // State — только при изменении: опрос каждые POLL не должен
             // гнать уведомления.
-            let air = active.state();
+            let air = core.phase();
             if air != last_air {
                 last_air = air;
                 let _ = notice_tx.try_send(Notice::State(air));
             }
             if air.finished() {
-                // Тёплый DVR открывает файлы сразу по EnterDvr — ждём
-                // финализации writer'ов (Cues, патчи, sync), чтобы не
-                // читать дописываемый файл.
-                for recorder in recorders.values() {
-                    recorder.wait_finalized(Duration::from_secs(5));
+                if core.has_raced() {
+                    // Финализация writer'ов (Cues, патчи, sync) — до
+                    // того, как GUI (тёплый Review) откроет файлы на чтение.
+                    for recorder in recorders.values() {
+                        recorder.wait_finalized(Duration::from_secs(5));
+                    }
+                    let _ = notice_tx.try_send(Notice::EnterReview {
+                        journal: core.into_journal(),
+                    });
+                } else {
+                    // REC-off до старта гонки: сессия отменена, файлы
+                    // удаляются в фоне, GUI их не читает — ждать нечего:
+                    // BackToIdle немедленно, кнопки оживают в Idle без
+                    // провисания в мёртвом Finished.
+                    drop(core);
+                    let _ = notice_tx.try_send(Notice::BackToIdle);
                 }
-                let journal = core.take().unwrap().into_journal();
-                let _ = notice_tx.try_send(Notice::EnterDvr { journal });
                 break;
             }
         }

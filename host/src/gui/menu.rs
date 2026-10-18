@@ -57,18 +57,16 @@ impl Menu {
                         .into();
                 let response = view::TransportButton::new(
                     label,
-                    view::TransportState::Idle,
+                    true,
+                    false,
                     START_IDLE,
                     START_ACTIVE,
                 )
                 .interact(ui, start_rect, ui.make_persistent_id("menu_start"));
                 view::TransportButton::new(
                     label,
-                    if response.clicked() {
-                        view::TransportState::Active
-                    } else {
-                        view::TransportState::Idle
-                    },
+                    true,
+                    response.clicked(),
                     START_IDLE,
                     START_ACTIVE,
                 )

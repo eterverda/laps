@@ -551,6 +551,7 @@ fn decode(buf: &[u8], tracker: &mut ModifierTracker, keyboard_id: &str) -> Vec<K
             modifiers,
             keycode: usage as u32,
             action,
+            at: std::time::Instant::now(),
         });
     }
     events

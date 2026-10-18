@@ -7,16 +7,18 @@
 use super::ruler::{self, IntoRuler};
 use super::*;
 use crate::config::camera::CameraConfig;
-use crate::config::setup::Setup;
+use crate::config::setup::{PadConfig, Setup};
 use crate::driver::camera::CaptureState;
+use crate::driver::keyboard::{AttachError, KeyAction, KeyEvent};
 use crate::driver::player::{Player, PlayerState};
 use crate::model::flight::{Journal, RaceClip, race_clip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::service::race::{self, AirPhase, AirState, Intent, Notice, Race};
 use crate::service::transport::{Circle, Transport};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_PADS: usize = 4;
@@ -102,6 +104,19 @@ pub struct Flight {
     /// (прямой путь) или парсится из файла (холодный вход). Правки DVR
     /// (добавление/удаление событий) — здесь.
     journal: Option<Journal>,
+    /// Аттач настроенных клавиатур (Live): Ok — дрейнит поток гонки,
+    /// Err — причина (плашка дисконнекта). В DVR-режиме пусто.
+    keyboards: HashMap<String, Result<(), AttachError>>,
+    /// Очередь клавиатурных событий из потока гонки (дренится раз в
+    /// кадр в held_keys).
+    key_events: Arc<Mutex<Vec<KeyEvent>>>,
+    /// Клавиатуры с оборвавшимся каналом (поток гонки кладёт id, GUI
+    /// переводит аттач в Err и снимает удерживаемые символы).
+    key_dead: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Удерживаемые клавиши по падам (символы `key_name`) для нижнего
+    /// прямоугольника: Press добавляет, Release убирает; закрытый канал
+    /// клавиатуры снимает все её символы.
+    held_keys: HashMap<String, Vec<String>>,
 }
 
 impl From<Box<Flight>> for State {
@@ -111,6 +126,83 @@ impl From<Box<Flight>> for State {
 }
 
 impl Flight {
+    /// Дрен клавиатурных событий из общей очереди потока гонки в
+    /// per-pad состояние удерживаемых клавиш. Обрыв канала (id в
+    /// key_dead) снимает все символы клавиатуры и переводит аттач в Err
+    /// — плашка дисконнекта. Возвращает true, если состояние могло
+    /// измениться, — caller просит перерисовку.
+    fn drain_keyboards(&mut self) -> bool {
+        let events = std::mem::take(&mut *self.key_events.lock().expect("key events"));
+        for event in &events {
+            Self::apply_key_event(&self.setup.pads, &mut self.held_keys, event);
+        }
+        let dead: Vec<String> = std::mem::take(&mut *self.key_dead.lock().expect("key dead"))
+            .into_iter()
+            .collect();
+        for keyboard_id in &dead {
+            if let Some(slot) = self.keyboards.get_mut(keyboard_id) {
+                *slot = Err(AttachError::NoMatch); // канал закрылся — как "не найдена"
+            }
+            Self::drop_keyboard_keys(&self.setup.pads, &mut self.held_keys, keyboard_id);
+        }
+        !events.is_empty() || !dead.is_empty()
+    }
+
+    /// Событие → per-pad удерживаемые клавиши: совпали бинды пада по
+    /// keyboard_id и usage — символ клавиши добавляется (Press) или
+    /// убирается (Release). Незабинженные клавиши ни на что не влияют.
+    fn apply_key_event(
+        pads: &BTreeMap<String, PadConfig>,
+        held: &mut HashMap<String, Vec<String>>,
+        event: &KeyEvent,
+    ) {
+        for (pad_id, pad) in pads {
+            let bound = pad
+                .keybinds
+                .iter()
+                .any(|b| b.keyboard_id == event.keyboard_id && b.key == event.keycode);
+            if !bound {
+                continue;
+            }
+            let symbols = held.entry(pad_id.clone()).or_default();
+            let symbol = crate::driver::keyboard::key_name(event.keycode);
+            match event.action {
+                KeyAction::Press => {
+                    if !symbols.contains(&symbol) {
+                        symbols.push(symbol);
+                    }
+                }
+                KeyAction::Release => {
+                    symbols.retain(|s| *s != symbol);
+                }
+            }
+        }
+    }
+
+    /// Снять все символы клавиатуры: канал закрылся — удерживаемые ею
+    /// клавиши не должны зависать в плейсхолдерах.
+    fn drop_keyboard_keys(
+        pads: &BTreeMap<String, PadConfig>,
+        held: &mut HashMap<String, Vec<String>>,
+        keyboard_id: &str,
+    ) {
+        for (pad_id, pad) in pads {
+            let usages: Vec<u32> = pad
+                .keybinds
+                .iter()
+                .filter(|b| b.keyboard_id == keyboard_id)
+                .map(|b| b.key)
+                .collect();
+            let Some(symbols) = held.get_mut(pad_id) else {
+                continue;
+            };
+            for usage in usages {
+                let symbol = crate::driver::keyboard::key_name(usage);
+                symbols.retain(|s| *s != symbol);
+            }
+        }
+    }
+
     /// Главный экран — сразу в эфире: захват стартует в конструкторе.
     pub fn live(
         ctx: &egui::Context,
@@ -195,17 +287,51 @@ impl Flight {
             assignments,
             active_cameras,
             journal: None,
+            keyboards: HashMap::new(),
+            key_events: Arc::new(Mutex::new(Vec::new())),
+            key_dead: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            held_keys: HashMap::new(),
         };
         if mode == Mode::Live {
             this.start_captures(ctx);
             this.screen_awake();
+            // Клавиатуры: один аттач на запись сетапа (дедуп — сама
+            // карта). Ошибки старту не мешают: падам с keybinds
+            // рисуется плашка дисконнекта. Ok-каналы уходят в поток
+            // гонки — он дрейнит их в key_events и будит UI. open —
+            // платформенный фасад (не-linux отвечает NoMatch).
+            let mut key_streams = HashMap::new();
+            this.keyboards = this
+                .setup
+                .keyboards
+                .iter()
+                .map(|(id, cfg)| {
+                    let attached = match crate::driver::keyboard::open(id, cfg) {
+                        Ok(rx) => {
+                            key_streams.insert(id.clone(), rx);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    };
+                    (id.clone(), attached)
+                })
+                .collect();
+            for (id, result) in &this.keyboards {
+                if let Err(e) = result {
+                    log::warn!("keyboard {id} not attached: {e}");
+                }
+            }
             // Гоночный поток: ядро (часы, политика записи, журнал) плюс
-            // исполнение эффектов (команды рекордерам, звук).
+            // исполнение эффектов (команды рекордерам, звук) и дрен
+            // клавиатур.
             let recorders: HashMap<_, _> = this
                 .webcams
                 .iter()
                 .map(|(id, camera)| (id.clone(), camera.recorder()))
                 .collect();
+            let key_events = this.key_events.clone();
+            let key_dead = this.key_dead.clone();
+            let ctx = ctx.clone();
             this.race = Some(race::spawn(
                 this.rules,
                 std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR),
@@ -213,6 +339,10 @@ impl Flight {
                 this.assignments.clone(),
                 this.active_cameras.clone(),
                 recorders,
+                key_streams,
+                key_events,
+                key_dead,
+                Arc::new(move || ctx.request_repaint()),
             ));
         } else {
             // Холодный вход в скраббинг: рамка гонки — из последнего
@@ -252,6 +382,11 @@ impl Flight {
         self.dvr_tick();
         self.arm_race_repaint(ui.ctx());
         self.arm_transport_repaint(ui.ctx());
+        if self.drain_keyboards() {
+            // Удерживаемые клавиши изменились — следующий кадр по
+            // собственному расписанию может не наступить (нет видео).
+            ui.ctx().request_repaint();
+        }
         self.rew.flash = false;
         self.ff.flash = false;
 
@@ -506,7 +641,18 @@ impl Flight {
                     // клетка ниже первого, низ — на нижней границе.
                     let vf_bottom = ruler::cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows + 2);
                     let first_top = vf_bottom + ruler::cell_y(1);
-                    for &(zone_start, zone_width) in &column_geometry {
+                    let dvr = matches!(self.screen, Screen::Dvr);
+                    // Плейсхолдер: плюс двойного размера, тёмно-серый.
+                    let placeholder = |ui: &mut egui::Ui, rect: egui::Rect| {
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "\u{ead0}",
+                            style::FONT_REGULAR_X2,
+                            egui::Color32::from_rgb(0x30, 0x30, 0x30),
+                        );
+                    };
+                    for (i, &(zone_start, zone_width)) in column_geometry.iter().enumerate() {
                         // Ширина — как у вьюфайндера: центр той же зоны.
                         let x = ruler::cell_x(zone_start + (zone_width - viewfinder_cols) / 2);
                         let w = ruler::cell_x(viewfinder_cols);
@@ -523,15 +669,45 @@ impl Flight {
                             .into();
                         guidelines::dashed_rect(ui, first);
                         guidelines::dashed_rect(ui, second);
-                        // Плейсхолдеры в центрах: плюс двойного размера,
-                        // тёмно-серый.
-                        for rect in [first, second] {
+                        // Верхний прямоугольник: плейсхолдер как раньше.
+                        placeholder(ui, first);
+                        // Нижний: в DVR — как раньше; в эфире — по биндам
+                        // пада (колонка привязана к pads[i]).
+                        if dvr {
+                            placeholder(ui, second);
+                            continue;
+                        }
+                        let (pad_id, pad) = pads[i];
+                        if pad.keybinds.is_empty() {
+                            placeholder(ui, second);
+                            continue;
+                        }
+                        let attached = pad.keybinds.iter().all(|b| {
+                            self.keyboards
+                                .get(&b.keyboard_id)
+                                .is_some_and(|r| r.is_ok())
+                        });
+                        if !attached {
+                            // Клавиатура не аттачена — красный дисконнект.
                             ui.painter().text(
-                                rect.center(),
+                                second.center(),
                                 egui::Align2::CENTER_CENTER,
-                                "\u{ead0}",
+                                "\u{f0319}", // mdi-lan-disconnect
                                 style::FONT_REGULAR_X2,
-                                egui::Color32::from_rgb(0x30, 0x30, 0x30),
+                                egui::Color32::from_rgb(0xFF, 0x33, 0x33),
+                            );
+                        } else if let Some(symbols) =
+                            self.held_keys.get(pad_id).filter(|s| !s.is_empty())
+                        {
+                            // Удерживаемые клавиши — белым одинарным
+                            // шрифтом, в левом верхнем углу с 1-клеточным
+                            // инсетом, через ", ".
+                            ui.painter().text(
+                                second.min + egui::vec2(ruler::cell_x(1), ruler::cell_y(1)),
+                                egui::Align2::LEFT_TOP,
+                                symbols.join(", "),
+                                style::FONT_REGULAR,
+                                egui::Color32::WHITE,
                             );
                         }
                     }
@@ -1150,8 +1326,7 @@ impl Flight {
                     // last_step): кадр демонстрируется интервал, а не
                     // мгновение, иначе хвост до record-finished (~период
                     // кадра) читался бы как гэп с плейсхолдером.
-                    journal_pos < *file_ms
-                        || journal_pos >= *file_ms + p.duration() + p.last_step()
+                    journal_pos < *file_ms || journal_pos >= *file_ms + p.duration() + p.last_step()
                 }
                 _ => false,
             },
@@ -1547,5 +1722,75 @@ impl Res {
             symbol_size,
         );
         Self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::keyboard::KeyBind;
+    use crate::config::setup::{ColorConfig, FpvConfig};
+    use std::collections::BTreeMap;
+
+    fn bind(keyboard_id: &str, key: u32) -> KeyBind {
+        KeyBind {
+            keyboard_id: keyboard_id.to_owned(),
+            key,
+            action: "lap".to_owned(),
+        }
+    }
+
+    fn pad(keybinds: Vec<KeyBind>) -> PadConfig {
+        PadConfig {
+            label: "CH".to_owned(),
+            color: ColorConfig::Red,
+            fpv: FpvConfig {
+                camera_id: "camera-1".to_owned(),
+                viewport: Default::default(),
+            },
+            keybinds,
+        }
+    }
+
+    fn event(key: u32, action: KeyAction) -> KeyEvent {
+        KeyEvent {
+            keyboard_id: "key-1".to_owned(),
+            modifiers: 0,
+            keycode: key,
+            action,
+            at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn held_keys_follow_pad_binds() {
+        let mut pads = BTreeMap::new();
+        pads.insert(
+            "pad-1".to_owned(),
+            pad(vec![bind("key-1", 0x1E), bind("key-1", 0x1F)]),
+        );
+        pads.insert("pad-4".to_owned(), pad(vec![bind("key-1", 0x21)]));
+        let mut held = HashMap::new();
+        // Press добавляет символ во все пады с таким биндом (0x1E — "1").
+        Flight::apply_key_event(&pads, &mut held, &event(0x1E, KeyAction::Press));
+        assert_eq!(held["pad-1"], vec!["1".to_owned()]);
+        // Второй бинд того же пада копится (0x1F — "2").
+        Flight::apply_key_event(&pads, &mut held, &event(0x1F, KeyAction::Press));
+        assert_eq!(held["pad-1"], vec!["1".to_owned(), "2".to_owned()]);
+        // Клавиша другого пада (0x21 — "4") туда не попадает.
+        Flight::apply_key_event(&pads, &mut held, &event(0x21, KeyAction::Press));
+        assert_eq!(held["pad-1"], vec!["1".to_owned(), "2".to_owned()]);
+        assert_eq!(held["pad-4"], vec!["4".to_owned()]);
+        // Release убирает только свой символ.
+        Flight::apply_key_event(&pads, &mut held, &event(0x1E, KeyAction::Release));
+        assert_eq!(held["pad-1"], vec!["2".to_owned()]);
+        // Незабинженная клавиша ни на что не влияет.
+        Flight::apply_key_event(&pads, &mut held, &event(0x70, KeyAction::Press));
+        assert_eq!(held["pad-1"], vec!["2".to_owned()]);
+        assert_eq!(held["pad-4"], vec!["4".to_owned()]);
+        // Обрыв канала клавиатуры снимает все её символы.
+        Flight::drop_keyboard_keys(&pads, &mut held, "key-1");
+        assert!(held["pad-1"].is_empty());
+        assert!(held["pad-4"].is_empty());
     }
 }

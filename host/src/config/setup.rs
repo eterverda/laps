@@ -16,6 +16,10 @@ pub struct PadConfig {
     pub label: String,
     pub color: ColorConfig,
     pub fpv: FpvConfig,
+    /// Клавиши настроенных клавиатур, привязанные к паду (пусто —
+    /// пад без клавиатурных биндов).
+    #[serde(default)]
+    pub keybinds: Vec<super::keyboard::KeyBind>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -87,5 +91,26 @@ mod tests {
             setup.keyboards["pad-1"].mode,
             super::super::keyboard::KeyboardMode::Grab
         );
+    }
+
+    #[test]
+    fn test_pad_keybinds() {
+        // keybinds parse: key as a yaml number resolves to the usage.
+        let pad: PadConfig = serde_yaml::from_str(
+            "label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\nkeybinds:\n  - keyboard-id: key-1\n    key: 1\n    action: lap\n",
+        )
+        .unwrap();
+        assert_eq!(pad.keybinds.len(), 1);
+        assert_eq!(pad.keybinds[0].key, 0x1E);
+        assert_eq!(pad.keybinds[0].keyboard_id, "key-1");
+        // Отсутствие блока — пустой список, не ошибка.
+        let pad: PadConfig =
+            serde_yaml::from_str("label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\n").unwrap();
+        assert!(pad.keybinds.is_empty());
+        // Неизвестное имя клавиши — ошибка конфига.
+        assert!(serde_yaml::from_str::<PadConfig>(
+            "label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\nkeybinds:\n  - keyboard-id: key-1\n    key: banana\n    action: lap\n"
+        )
+        .is_err());
     }
 }

@@ -931,6 +931,10 @@ pub fn spawn(
     assignments: HashMap<String, Pilot>,
     cameras: HashMap<String, CameraConfig>,
     recorders: HashMap<String, Recorder>,
+    mut keyboards: HashMap<String, crossbeam_channel::Receiver<crate::driver::keyboard::KeyEvent>>,
+    key_events: std::sync::Arc<std::sync::Mutex<Vec<crate::driver::keyboard::KeyEvent>>>,
+    key_dead: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 ) -> Race {
     let (intent_tx, intent_rx) = crossbeam_channel::bounded(16);
     let (notice_tx, notice_rx) = crossbeam_channel::bounded(64);
@@ -1007,6 +1011,37 @@ pub fn spawn(
                 active.note_frame(id, first_frame_at);
             }
             sync_journal(active, &mut journal_path, &mut journal_written);
+
+            // Клавиатуры: дрен каналов в общую очередь для GUI. Обрыв
+            // канала — id в dead-сет (GUI рисует дисконнект). Будим UI
+            // только когда что-то пришло.
+            if !keyboards.is_empty() {
+                let mut got = false;
+                let mut dead_now = Vec::new();
+                for (id, rx) in keyboards.iter_mut() {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(event) => {
+                                key_events.lock().expect("key events").push(event);
+                                got = true;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                dead_now.push(id.clone());
+                                break;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        }
+                    }
+                }
+                for id in dead_now {
+                    keyboards.remove(&id);
+                    key_dead.lock().expect("key dead").insert(id);
+                    got = true;
+                }
+                if got {
+                    wake();
+                }
+            }
 
             // State — только при изменении: опрос каждые POLL не должен
             // гнать уведомления.

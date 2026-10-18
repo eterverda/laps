@@ -302,6 +302,7 @@ mod tests {
                     camera_id: "camera-1".to_owned(),
                     viewport: crate::config::camera::ViewportConfig::default(),
                 },
+                keybinds: Vec::new(),
             },
         );
         let mut assignments = HashMap::new();

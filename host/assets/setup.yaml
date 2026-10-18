@@ -19,21 +19,43 @@ pads:
     fpv:
       camera-id: camera-1
       viewport: 2x2-r1c1-narrow
+    keybinds:
+      - keyboard-id: key-1
+        key: 1
+        action: lap
   pad-2:
     label: CH2
     color: blue
     fpv:
       camera-id: camera-1
       viewport: 2x2-r1c2-narrow
+    keybinds:
+      - keyboard-id: key-1
+        key: 2
+        action: lap
   pad-3:
     label: CH3
     color: green
     fpv:
       camera-id: camera-1
       viewport: 2x2-r2c1-narrow
+    keybinds:
+      - keyboard-id: key-1
+        key: 3
+        action: lap
   pad-4:
     label: CH4
     color: yellow
     fpv:
       camera-id: camera-1
       viewport: 2x2-r2c2-narrow
+    keybinds:
+      - keyboard-id: key-1
+        key: 4
+        action: lap
+      - keyboard-id: key-1
+        key: 5
+        action: lap
+      - keyboard-id: key-1
+        key: 6
+        action: lap

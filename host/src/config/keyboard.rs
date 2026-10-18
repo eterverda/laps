@@ -76,6 +76,55 @@ impl KeyboardConfig {
     }
 }
 
+/// One pad keybind: a key of a configured keyboard bound to a pad
+/// action. `key` is stored as the resolved HID usage (page 0x07), not
+/// the name — the config either resolves at load or fails to parse.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct KeyBind {
+    /// Keyboard id: a key of `Setup.keyboards`.
+    #[serde(rename = "keyboard-id")]
+    pub keyboard_id: String,
+    /// Key as a canonical name (`F21`) or a bare yaml number (`1` —
+    /// read as the number-key name). Unknown names are config errors.
+    #[serde(deserialize_with = "de_key_usage", serialize_with = "ser_key_usage")]
+    pub key: u32,
+    /// Pad action ("lap", …). Parsed but not consumed yet — the
+    /// keybind-driven actions change will use it.
+    #[allow(dead_code)]
+    pub action: String,
+}
+
+/// `key:` accepts the canonical name ("F21", "1") or a bare yaml number
+/// (1 — the digits name the number keys); both resolve through
+/// `driver::keyboard::key_usage`, anything else is an error.
+fn de_key_usage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    struct KeyName;
+    impl<'de> serde::de::Visitor<'de> for KeyName {
+        type Value = u32;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("key name (e.g. F21) or number")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u32, E> {
+            crate::driver::keyboard::key_usage(v)
+                .ok_or_else(|| E::custom(format!("unknown key name: {v}")))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u32, E> {
+            let name = v.to_string();
+            crate::driver::keyboard::key_usage(&name)
+                .ok_or_else(|| E::custom(format!("unknown key number: {v}")))
+        }
+    }
+
+    d.deserialize_any(KeyName)
+}
+
+fn ser_key_usage<S: serde::Serializer>(usage: &u32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&crate::driver::keyboard::key_name(*usage))
+}
+
 /// vid/pid are 0x-prefixed hex scalars in setup files (`vid: 0x8089`):
 /// the yaml parser decodes the hex into an integer, so `visit_u64` takes
 /// it as is — a bare number also arrives here, read as decimal (there
@@ -203,6 +252,38 @@ mod tests {
     #[test]
     fn test_deserialize_bad_hex_fails() {
         assert!(serde_yaml::from_str::<KeyboardConfig>("vid: zz\n").is_err());
+    }
+
+    #[test]
+    fn test_keybind_key_forms() {
+        // Canonical name (yaml string).
+        let bind: KeyBind =
+            serde_yaml::from_str("keyboard-id: key-1\nkey: F21\naction: lap\n").unwrap();
+        assert_eq!(bind.key, 0x70);
+        assert_eq!(bind.keyboard_id, "key-1");
+        // Bare yaml number — read as the number-key name.
+        let bind: KeyBind =
+            serde_yaml::from_str("keyboard-id: key-1\nkey: 1\naction: lap\n").unwrap();
+        assert_eq!(bind.key, 0x1E);
+        // Quoted digit goes through the string path.
+        let bind: KeyBind =
+            serde_yaml::from_str("keyboard-id: key-1\nkey: '6'\naction: lap\n").unwrap();
+        assert_eq!(bind.key, 0x23);
+        // Serialization writes the name and round-trips.
+        let yaml = serde_yaml::to_string(&bind).unwrap();
+        let back: KeyBind = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back, bind);
+    }
+
+    #[test]
+    fn test_keybind_unknown_key_fails() {
+        for key in ["0x1E", "banana", "999", "f21"] {
+            let yaml = format!("keyboard-id: k\nkey: {key}\naction: lap\n");
+            assert!(
+                serde_yaml::from_str::<KeyBind>(&yaml).is_err(),
+                "key {key} must be rejected"
+            );
+        }
     }
 
     mod matching {

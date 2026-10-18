@@ -20,6 +20,9 @@ enum Commands {
     ListInstances,
     /// Воспроизведение последней записи из captures/.
     Scrub,
+    /// Temporary: attach all setup keyboards and print raw key events.
+    /// Replaced by `test-keyboard` from docs/keyboard.md.
+    DebugKeyboards,
 }
 
 /// Modes column of the listing: `listen,grab`, `listen` or `--` (no
@@ -153,10 +156,76 @@ fn main() {
                 println!("pid: {} port: {}", inst.pid, inst.port);
             }
         }
+        Some(Commands::DebugKeyboards) => debug_keyboards(),
         None => {
             gui::run(None);
         }
     }
+}
+
+/// Temporary debug command (replaced by `test-keyboard` from
+/// docs/keyboard.md): attach every keyboard configured in the embedded
+/// setup and print each event. All attach failures are listed before
+/// exiting 1; on success the command blocks until killed.
+#[cfg(target_os = "linux")]
+fn debug_keyboards() -> ! {
+    let setup: config::setup::Setup = match serde_yaml::from_str(assets::SETUP_YAML) {
+        Ok(setup) => setup,
+        Err(e) => {
+            eprintln!("embedded setup.yaml failed to parse: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut failures = 0usize;
+    let mut streams = Vec::new();
+    for (id, cfg) in &setup.keyboards {
+        match driver::keyboard::open(id, cfg) {
+            Ok(rx) => streams.push(rx),
+            Err(e) => {
+                failures += 1;
+                eprintln!("{id}: {e}");
+            }
+        }
+    }
+    if failures > 0 {
+        std::process::exit(1);
+    }
+    // Fan every stream into one channel; each event already carries its
+    // keyboard_id, so the printer needs no per-stream bookkeeping.
+    let (tx, rx) = crossbeam_channel::unbounded::<driver::keyboard::KeyEvent>();
+    for stream in streams {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(event) = stream.recv() {
+                if tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    while let Ok(event) = rx.recv() {
+        // Mod+Mod+Key spelling: modifiers prefix the key, joined by "+".
+        let modifiers = driver::keyboard::modifier_names(event.modifiers);
+        let key = driver::keyboard::key_name(event.keycode);
+        let combo = if modifiers.is_empty() {
+            key
+        } else {
+            format!("{modifiers}+{key}")
+        };
+        println!(
+            "{}  {:<7} {}",
+            event.keyboard_id,
+            event.action.as_str(),
+            combo
+        );
+    }
+    std::process::exit(0); // all streams ended (devices unplugged)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn debug_keyboards() -> ! {
+    eprintln!("debug-keyboards is not supported on this platform");
+    std::process::exit(1);
 }
 
 #[cfg(test)]

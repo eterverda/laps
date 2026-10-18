@@ -8,6 +8,10 @@ cameras:
     dvr:
       container: mkv
       frame-rate: 30fps
+keyboards:
+  key-1:
+    serial: 036D12307772CDBD420000000000
+    mode: grab
 pads:
   pad-1:
     label: CH1

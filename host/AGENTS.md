@@ -292,7 +292,9 @@ first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
   / --; evdev+sysfs+by-id discovery in `driver/keyboard/linux.rs`, other
   platforms return an empty list until their backend lands);
   `driver::keyboard` itself is unconditional — platform backends live in
-  submodules (linux today, mac later); no args → GUI mode
+  submodules (linux today, mac later); `debug-keyboards` (temporary,
+  replaced by the doc'd `test-keyboard`) attaches every setup keyboard
+  via `driver::keyboard::open` and prints raw key events; no args → GUI mode
 - **Remote control** (`src/remote/mod.rs`): the same binary controls a
   running instance. Invocation: `laps [+pid] +command [tail]` — `+pid`
   (at most one) addresses a specific instance; without it the command

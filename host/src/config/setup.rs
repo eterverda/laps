@@ -5,6 +5,10 @@ use std::collections::BTreeMap;
 pub struct Setup {
     pub cameras: BTreeMap<String, super::camera::CameraConfig>,
     pub pads: BTreeMap<String, PadConfig>,
+    // Attached by `laps debug-keyboards`; parsed here so setup files can
+    // carry keyboards already.
+    #[serde(default)]
+    pub keyboards: BTreeMap<String, super::keyboard::KeyboardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -46,6 +50,10 @@ impl ColorConfig {
 mod tests {
     use super::*;
 
+    const CAMERAS: &str = "cameras:\n  camera-1:\n    name: C7-1\n    resolution: 1920x1080\n    frame-rate: 30fps\n    format: mjpeg\n";
+    const PADS: &str =
+        "pads:\n  pad-1:\n    label: CH1\n    color: red\n    fpv:\n      camera-id: camera-1\n";
+
     #[test]
     fn test_viewport_defaults_to_full_frame() {
         let fpv: FpvConfig = serde_yaml::from_str("camera-id: camera-1\n").unwrap();
@@ -57,6 +65,27 @@ mod tests {
                 right: 1.0,
                 bottom: 1.0,
             }
+        );
+    }
+
+    #[test]
+    fn test_keyboards_default_to_empty() {
+        // No keyboards: block — the map defaults to empty.
+        let setup: Setup = serde_yaml::from_str(&format!("{CAMERAS}{PADS}")).unwrap();
+        assert!(setup.keyboards.is_empty());
+    }
+
+    #[test]
+    fn test_keyboards_load() {
+        let setup: Setup = serde_yaml::from_str(&format!(
+            "{CAMERAS}{PADS}keyboards:\n  pad-1:\n    name: RED\n    vid: 0x8089\n    mode: grab\n"
+        ))
+        .unwrap();
+        assert_eq!(setup.keyboards.len(), 1);
+        assert_eq!(setup.keyboards["pad-1"].name.as_deref(), Some("RED"));
+        assert_eq!(
+            setup.keyboards["pad-1"].mode,
+            super::super::keyboard::KeyboardMode::Grab
         );
     }
 }

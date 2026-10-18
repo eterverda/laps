@@ -415,77 +415,42 @@ impl Flight {
         }
     }
 
-    /// Кадр Idle-эфира: как Live, но REC/RACE живы (первое нажатие
-    /// родит поток), счётчик погашен.
-    fn prepare_idle(
-        i: &mut Idle,
-        setup: &Setup,
-        assignments: &HashMap<String, Pilot>,
+    /// Alt-баббл над REC: строка на камеру (shown_cameras продедуплены
+    /// по camera_id — несколько падов на одну камеру дают одну строку).
+    /// target — целевой fps (dvr.frame-rate, иначе camera); «error» при
+    /// мёртвом потоке и при провале записи в REC-он.
+    fn fps_lines(
+        webcams: &HashMap<String, crate::driver::camera::Camera>,
         shown_cameras: &HashMap<String, CameraConfig>,
-        alt: bool,
-    ) -> FrameContents {
-        let pads = Self::prepare_pads(&mut i.webcams, setup, assignments, shown_cameras, alt);
-        let fps_lines = if alt {
-            setup
-                .pads
-                .iter()
-                .filter(|(pad_id, _)| assignments.contains_key(*pad_id))
-                .take(MAX_PADS)
-                .filter_map(|(_, pad)| {
-                    setup
-                        .cameras
-                        .get(&pad.fpv.camera_id)
-                        .map(|cfg| (&pad.fpv.camera_id, cfg))
-                })
-                .map(|(camera_id, cfg)| {
-                    let target = cfg.dvr.frame_rate.unwrap_or(cfg.frame_rate);
-                    match i.webcams.get(camera_id) {
-                        None => format!("\u{f16df} {target}"),
-                        Some(w) if w.capture_state() == CaptureState::Dead => {
-                            "\u{f03d} error".to_owned()
-                        }
-                        Some(w) => match w.record_state() {
-                            crate::driver::dvr::RecordState::Writing { fps, .. } if fps > 0.0 => {
-                                format!("\u{f16df} {:.0}fps", fps)
-                            }
-                            _ => format!("\u{f16df} {target}"),
-                        },
+        rec_on: bool,
+    ) -> Vec<String> {
+        shown_cameras
+            .iter()
+            .map(|(camera_id, cfg)| {
+                let target = cfg.dvr.frame_rate.unwrap_or(cfg.frame_rate);
+                match webcams.get(camera_id) {
+                    None => format!("\u{f16df} {target}"),
+                    Some(w) if w.capture_state() == CaptureState::Dead => {
+                        "\u{f03d} error".to_owned()
                     }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        FrameContents {
-            pads,
-            transport: TransportContents {
-                rew: ButtonContents::DEAD,
-                play: ButtonContents::DEAD,
-                ff: ButtonContents::DEAD,
-                rpt: ButtonContents::DEAD,
-            },
-            rec: RecContents {
-                rec: ButtonContents {
-                    enabled: true,
-                    active: false,
-                    badge: if fps_lines.is_empty() {
-                        None
-                    } else {
-                        Some(fps_lines.join("\n"))
+                    Some(w)
+                        if rec_on
+                            && matches!(
+                                w.record_state(),
+                                crate::driver::dvr::RecordState::Failed
+                            ) =>
+                    {
+                        "\u{f16df} error".to_owned()
+                    }
+                    Some(w) => match w.record_state() {
+                        crate::driver::dvr::RecordState::Writing { fps, .. } if fps > 0.0 => {
+                            format!("\u{f16df} {:.0}fps", fps)
+                        }
+                        _ => format!("\u{f16df} {target}"),
                     },
-                },
-                race: ButtonContents {
-                    enabled: true,
-                    active: false,
-                    badge: None,
-                },
-            },
-            timer: TimerContents {
-                text: "00:00.000".to_owned(),
-                dim: true,
-            },
-            timeline: None,
-        }
+                }
+            })
+            .collect()
     }
 
     /// Контент падов из захватов: картинки (с update_frame) и alt-бейджи
@@ -565,48 +530,9 @@ impl Flight {
         let rec_on = state.rec_on();
         let race_on = state.countdown_active() || matches!(state, race::Phase::Running { .. });
         let now = Instant::now();
-        // Рендерятся все пады (неназначенные — пустые рамки), поэтому
-        // проход по всем, а не по фильтру назначенных.
         let pads = Self::prepare_pads(&mut l.webcams, setup, assignments, shown_cameras, alt);
-        // Alt над REC: fps записи по камерам (целевой, пока не пишем;
-        // error при провале).
         let fps_lines = if alt {
-            setup
-                .pads
-                .iter()
-                .filter(|(pad_id, _)| assignments.contains_key(*pad_id))
-                .take(MAX_PADS)
-                .filter_map(|(_, pad)| {
-                    setup
-                        .cameras
-                        .get(&pad.fpv.camera_id)
-                        .map(|cfg| (&pad.fpv.camera_id, cfg))
-                })
-                .map(|(camera_id, cfg)| {
-                    let target = cfg.dvr.frame_rate.unwrap_or(cfg.frame_rate);
-                    match l.webcams.get(camera_id) {
-                        None => format!("\u{f16df} {target}"),
-                        Some(w) if w.capture_state() == CaptureState::Dead => {
-                            "\u{f03d} error".to_owned()
-                        }
-                        Some(w)
-                            if rec_on
-                                && matches!(
-                                    w.record_state(),
-                                    crate::driver::dvr::RecordState::Failed
-                                ) =>
-                        {
-                            "\u{f16df} error".to_owned()
-                        }
-                        Some(w) => match w.record_state() {
-                            crate::driver::dvr::RecordState::Writing { fps, .. } if fps > 0.0 => {
-                                format!("\u{f16df} {:.0}fps", fps)
-                            }
-                            _ => format!("\u{f16df} {target}"),
-                        },
-                    }
-                })
-                .collect()
+            Self::fps_lines(&l.webcams, shown_cameras, rec_on)
         } else {
             Vec::new()
         };
@@ -668,6 +594,53 @@ impl Flight {
                 },
             },
             timer: TimerContents { text, dim },
+            timeline: None,
+        }
+    }
+
+    /// Кадр Idle-эфира: как Live, но REC/RACE живы (первое нажатие
+    /// родит поток), счётчик погашен.
+    fn prepare_idle(
+        i: &mut Idle,
+        setup: &Setup,
+        assignments: &HashMap<String, Pilot>,
+        shown_cameras: &HashMap<String, CameraConfig>,
+        alt: bool,
+    ) -> FrameContents {
+        let pads = Self::prepare_pads(&mut i.webcams, setup, assignments, shown_cameras, alt);
+        let fps_lines = if alt {
+            Self::fps_lines(&i.webcams, shown_cameras, false)
+        } else {
+            Vec::new()
+        };
+        FrameContents {
+            pads,
+            transport: TransportContents {
+                rew: ButtonContents::DEAD,
+                play: ButtonContents::DEAD,
+                ff: ButtonContents::DEAD,
+                rpt: ButtonContents::DEAD,
+            },
+            rec: RecContents {
+                rec: ButtonContents {
+                    enabled: true,
+                    active: false,
+                    badge: if fps_lines.is_empty() {
+                        None
+                    } else {
+                        Some(fps_lines.join("\n"))
+                    },
+                },
+                race: ButtonContents {
+                    enabled: true,
+                    active: false,
+                    badge: None,
+                },
+            },
+            timer: TimerContents {
+                text: "00:00.000".to_owned(),
+                dim: true,
+            },
             timeline: None,
         }
     }

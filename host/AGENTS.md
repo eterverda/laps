@@ -163,7 +163,7 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 - Стем имён файлов — `date_time` первого события журнала (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
 - Журнал полёта (`model::flight::Journal` — чистые данные: заголовок
   `JournalHeader` первым документом без метки + события `Vec<(ms,
-  FlightEvent)>`): yaml-стрим `captures/<stem>.yaml`, документ на эвент
+FlightEvent)>`): yaml-стрим `captures/<stem>.yaml`, документ на эвент
   (`{ms, <variant>: …}`), разделители `---`. Файлом журнал не владеет:
   запись — свободные функции `snapshot` (полный стрим, tmp+rename:
   первое создание и перезапись после правок) и `append` (copy-append-
@@ -173,8 +173,8 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   закрытии гонки `Notice::EnterDvr { journal }` — владение в GUI
   (`Flight.journal`): правки DVR (`retain`) в памяти + снапшот. События:
   `RecordStarted` (REC-on, без камер) / `VideoAttached {camera_id,
-  filename}` (метка — первый кадр файла, из `RecordState::Writing.
-  first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
+filename}` (метка — первый кадр файла, из `RecordState::Writing.
+first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
   `RaceCountdown` (нажатие RACE: стартовая позиция курсора DVR + точка
   на таймлайне) / `RaceStarted` / `RaceFinished{prematurely}` /
   `RecordFinished` (коммит). События до старта гонки откладываются и
@@ -287,7 +287,12 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 - **clap** derive. Subcommand `list-cameras` prints available cameras;
   `list-instances` — local list of live instances from the registry
-  (no server involved); no args → GUI mode
+  (no server involved); `list-keyboards` — keyboards from
+  `driver::keyboard::scan` with probed attach modes (listen / listen,grab
+  / --; evdev+sysfs+by-id discovery in `driver/keyboard/linux.rs`, other
+  platforms return an empty list until their backend lands);
+  `driver::keyboard` itself is unconditional — platform backends live in
+  submodules (linux today, mac later); no args → GUI mode
 - **Remote control** (`src/remote/mod.rs`): the same binary controls a
   running instance. Invocation: `laps [+pid] +command [tail]` — `+pid`
   (at most one) addresses a specific instance; without it the command

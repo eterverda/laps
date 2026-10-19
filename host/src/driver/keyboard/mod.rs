@@ -10,129 +10,10 @@
 #[cfg(target_os = "linux")]
 pub mod linux;
 
-#[cfg(target_os = "linux")]
-pub use linux::scan;
-
-/// Platform stub until a real backend lands: an empty device list.
-#[cfg(not(target_os = "linux"))]
-pub fn scan() -> IoResult<Vec<KeyboardInfo>> {
-    Ok(Vec::new())
-}
-
-/// A discovered keyboard. Identity fields mirror the matcher of the
-/// future `KeyboardConfig` (name substring, exact vid/pid/serial); every
-/// platform can supply them, only the collection method differs.
-///
-/// `listenable`/`grabbable` are the attach capabilities, the probed
-/// access truth, not policy. On Linux they come from an open-probe of
-/// the node (`linux::probe`); a platform with no per-device mechanism
-/// fills them from its own rules — there is no grab API on Windows, so
-/// a Windows backend answers `grabbable: false` for every device. The
-/// ban on grabbing the system keyboard lives in the driver/config
-/// validation, not here.
-///
-/// No Eq/Ord: matching a config entry is a filter, not equality, and
-/// the only ordering need is the deterministic listing (a plain sort
-/// key in `scan`).
 use crate::config::keyboard::KeyboardConfig;
-use std::time::Instant;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io::Error as IoError;
-
-#[derive(Debug, Clone)]
-pub struct KeyboardInfo {
-    pub name: String,
-    pub vid: u16,
-    pub pid: u16,
-    pub serial: Option<String>,
-    pub listenable: bool,
-    pub grabbable: bool,
-}
-
-/// Key press in the canonical cross-platform shape (see
-/// docs/keyboard.md): `keycode` is the HID usage id (page 0x07),
-/// `modifiers` the HID boot-protocol bitmask of the same keyboard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyEvent {
-    /// Internal name: "main" or the key of `Setup.keyboards`.
-    pub keyboard_id: String,
-    pub modifiers: u32,
-    pub keycode: u32,
-    pub action: KeyAction,
-    /// Reception moment, stamped by the driver as the event is created.
-    pub at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyAction {
-    Press,
-    Release,
-}
-
-impl KeyAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            KeyAction::Press => "press",
-            KeyAction::Release => "release",
-        }
-    }
-}
-
-/// Boot-protocol modifier bits with their short names.
-pub const MODIFIER_NAMES: [(u32, &str); 8] = [
-    (0x01, "LCtrl"),
-    (0x02, "LShift"),
-    (0x04, "LAlt"),
-    (0x08, "LGui"),
-    (0x10, "RCtrl"),
-    (0x20, "RShift"),
-    (0x40, "RAlt"),
-    (0x80, "RGui"),
-];
-
-
-
-/// Per-device HID modifier state: a Press of a modifier usage sets its
-/// bit, a Release clears it. Modifier keys still arrive as regular
-/// KeyEvents — the mask and the key events are independent, as in HID.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ModifierTracker {
-    mask: u32,
-}
-
-impl ModifierTracker {
-    /// Apply one mapped key action; returns the fresh mask.
-    pub fn apply(&mut self, hid_usage: u32, action: KeyAction) -> u32 {
-        if let Some(bit) = Self::bit_of(hid_usage) {
-            match action {
-                KeyAction::Press => self.mask |= bit,
-                KeyAction::Release => self.mask &= !bit,
-            }
-        }
-        self.mask
-    }
-
-    /// "LCtrl+LShift" for a non-empty mask, empty string otherwise. Order
-    /// follows `MODIFIER_NAMES`; the caller joins the combo as Mod+Mod+Key.
-    pub fn names(mask: u32) -> String {
-        let mut s = String::new();
-        for (bit, name) in MODIFIER_NAMES {
-            if mask & bit != 0 {
-                if !s.is_empty() {
-                    s.push('+');
-                }
-                s.push_str(name);
-            }
-        }
-        s
-    }
-
-    pub fn bit_of(hid_usage: u32) -> Option<u32> {
-        (0xE0..=0xE7)
-            .contains(&hid_usage)
-            .then(|| 1 << (hid_usage - 0xE0))
-    }
-}
+use std::time::Instant;
 
 const X: Option<&str> = None;
 // Keyboard/keypad page (0x07) usages 0x00..=0xE7, one entry per usage:
@@ -375,6 +256,123 @@ const KEY_NAMES: [Option<&str>; 0xE8] = [
     Some("RightGui"),
 ];
 const _: () = assert!(KEY_NAMES.len() == 0xE8);
+
+/// A discovered keyboard. Identity fields mirror the matcher of the
+/// future `KeyboardConfig` (name substring, exact vid/pid/serial); every
+/// platform can supply them, only the collection method differs.
+///
+/// `listenable`/`grabbable` are the attach capabilities, the probed
+/// access truth, not policy. On Linux they come from an open-probe of
+/// the node (`linux::probe`); a platform with no per-device mechanism
+/// fills them from its own rules — there is no grab API on Windows, so
+/// a Windows backend answers `grabbable: false` for every device. The
+/// ban on grabbing the system keyboard lives in the driver/config
+/// validation, not here.
+///
+/// No Eq/Ord: matching a config entry is a filter, not equality, and
+/// the only ordering need is the deterministic listing (a plain sort
+/// key in `scan`).
+#[derive(Debug, Clone)]
+pub struct KeyboardInfo {
+    pub name: String,
+    pub vid: u16,
+    pub pid: u16,
+    pub serial: Option<String>,
+    pub listenable: bool,
+    pub grabbable: bool,
+}
+
+/// Key press in the canonical cross-platform shape (see
+/// docs/keyboard.md): `keycode` is the HID usage id (page 0x07),
+/// `modifiers` the HID boot-protocol bitmask of the same keyboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyEvent {
+    /// Internal name: "main" or the key of `Setup.keyboards`.
+    pub keyboard_id: String,
+    pub modifiers: u32,
+    pub keycode: u32,
+    pub action: KeyAction,
+    /// Reception moment, stamped by the driver as the event is created.
+    pub at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    Press,
+    Release,
+}
+
+impl KeyAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyAction::Press => "press",
+            KeyAction::Release => "release",
+        }
+    }
+}
+
+/// Boot-protocol modifier bits with their short names.
+pub const MODIFIER_NAMES: [(u32, &str); 8] = [
+    (0x01, "LCtrl"),
+    (0x02, "LShift"),
+    (0x04, "LAlt"),
+    (0x08, "LGui"),
+    (0x10, "RCtrl"),
+    (0x20, "RShift"),
+    (0x40, "RAlt"),
+    (0x80, "RGui"),
+];
+
+/// Per-device HID modifier state: a Press of a modifier usage sets its
+/// bit, a Release clears it. Modifier keys still arrive as regular
+/// KeyEvents — the mask and the key events are independent, as in HID.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ModifierTracker {
+    mask: u32,
+}
+
+impl ModifierTracker {
+    /// Apply one mapped key action; returns the fresh mask.
+    pub fn apply(&mut self, hid_usage: u32, action: KeyAction) -> u32 {
+        if let Some(bit) = Self::bit_of(hid_usage) {
+            match action {
+                KeyAction::Press => self.mask |= bit,
+                KeyAction::Release => self.mask &= !bit,
+            }
+        }
+        self.mask
+    }
+
+    /// "LCtrl+LShift" for a non-empty mask, empty string otherwise. Order
+    /// follows `MODIFIER_NAMES`; the caller joins the combo as Mod+Mod+Key.
+    pub fn names(mask: u32) -> String {
+        let mut s = String::new();
+        for (bit, name) in MODIFIER_NAMES {
+            if mask & bit != 0 {
+                if !s.is_empty() {
+                    s.push('+');
+                }
+                s.push_str(name);
+            }
+        }
+        s
+    }
+
+    pub fn bit_of(hid_usage: u32) -> Option<u32> {
+        (0xE0..=0xE7)
+            .contains(&hid_usage)
+            .then(|| 1 << (hid_usage - 0xE0))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::scan;
+
+/// Platform stub until a real backend lands: an empty device list.
+#[cfg(not(target_os = "linux"))]
+pub fn scan() -> IoResult<Vec<KeyboardInfo>> {
+    Ok(Vec::new())
+}
 
 /// Canonical key name for a HID usage; unknown codes render as "0xNN".
 pub fn keycode_to_str(keycode: u32) -> String {

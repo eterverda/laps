@@ -4,17 +4,21 @@
 //! EXIT в меню. Гоночное состояние живёт в потоке ядра
 //! (model::rules + service::race), экран — намерения и рендер снапшотов.
 
-use crate::gui::ruler::{IntoRuler, CELL_SIZE, cell_x, cell_y};
-use crate::gui::scrub::{HScroll, ScrollGate, SeekButton, Timeline, TimelineEvent, latest_capture, latest_journal, CIRCLE_MIN_WIDTH_PX, PLAY_SPEEDS, RPT_SIZES, SCROLL_REARM, SCROLL_STEP, SEEK_CLICK_MAX, SEEK_HOLD_DELAY, SEEK_RELEASE_RAMP, SEEK_SPEEDS, SEEK_TAP};
-use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
-use crate::driver::camera::CaptureState;
 use crate::driver::audio::Audio;
 use crate::driver::camera::Camera;
-use crate::driver::dvr::{RecordState, CAPTURES_DIR};
+use crate::driver::camera::CaptureState;
+use crate::driver::dvr::{CAPTURES_DIR, RecordState};
 use crate::driver::player::{Player, PlayerState};
+use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
+use crate::gui::scrub::{
+    CIRCLE_MIN_WIDTH_PX, HScroll, PLAY_SPEEDS, RPT_SIZES, SCROLL_REARM, SCROLL_STEP,
+    SEEK_CLICK_MAX, SEEK_HOLD_DELAY, SEEK_RELEASE_RAMP, SEEK_SPEEDS, SEEK_TAP, ScrollGate,
+    SeekButton, Timeline, TimelineEvent, latest_capture, latest_journal,
+};
+use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
 use crate::model::flight::{Journal, RaceClip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
@@ -22,13 +26,13 @@ use crate::remote::Response;
 use crate::service::race::{self, Intent, Notice, Race};
 use crate::service::transport::{Circle, Transport};
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs;
+use std::mem;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::collections::HashSet;
-use std::path::Path;
-use std::fs;
-use std::mem;
 
 const MAX_PADS: usize = 4;
 const GRID_WIDTH: isize = 160;
@@ -36,19 +40,23 @@ const LEFT_MARGIN: isize = 4;
 const RIGHT_MARGIN: isize = 4;
 const TOP_BAR_ROWS: isize = 2;
 
-/// Число строк вьюфайндера по числу пилотов (копия live'овской раскладки).
-pub fn viewfinder_rows(count: usize) -> isize {
-    match count {
-        1 | 2 => 21,
-        3 => 15,
-        _ => 12,
-    }
-}
+/// Наборы цветов кнопок (см. colors-table.html): два цвета на кнопку —
+/// яркий (активный фон) и неяркий (покой; выключенный = неяркий × 0.35
+/// альфой). EXIT — холодный серый, транспорт — тёплый пластик, REC —
+/// алый, RACE — кислотный.
+const EXIT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xAE, 0xBE, 0xC8);
+const EXIT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x5A, 0x63);
+const TRANSPORT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xE2, 0xCE);
+const TRANSPORT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6A, 0x66, 0x56);
+const REC_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xEA, 0x31, 0x23);
+const REC_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x42, 0x3C);
+const RACE_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xC8, 0xF5, 0x00);
+const RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x75, 0x77, 0x48);
 
-/// Ширина вьюфайндера из соотношения 16:9 (8 клеток на 3 строки).
-pub fn viewfinder_cols(count: usize) -> isize {
-    viewfinder_rows(count) * 8 / 3
-}
+/// Толеран отставания показанного кадра мастера от позиции транспорта,
+/// в пределах которого циферблат верен картинке (лень кадра + декод на
+/// обычных скоростях; шаттл уходит дальше — цифра честно = курсор).
+const DIAL_LAG_MS: u64 = 150;
 
 /// Машина состояний экрана: данные фаз инкапсулированы в вариантах.
 /// Гоночные фазы эфира живут в ядре (service::race::RaceStage) — здесь
@@ -242,10 +250,7 @@ impl Flight {
         // продедуплена по camera_id — открываем захват по одному на камеру.
         let mut webcams = HashMap::new();
         for (id, camera) in &shown_cameras {
-            webcams.insert(
-                id.clone(),
-                Camera::open(camera.clone(), ctx.clone()),
-            );
+            webcams.insert(id.clone(), Camera::open(camera.clone(), ctx.clone()));
         }
         log::info!("flight: webcams starting: {}", webcams.len());
         Self {
@@ -398,7 +403,8 @@ impl Flight {
                 .values()
                 .any(|w| w.capture_state() == CaptureState::Live);
             if !streaming
-                && (l.state.countdown_active() || matches!(l.state, race::RaceStage::Running { .. }))
+                && (l.state.countdown_active()
+                    || matches!(l.state, race::RaceStage::Running { .. }))
             {
                 // Самовзвод перерисовок счётчика гонки — только в живых
                 // фазах без кадров (в DVR кадры гонят перерисовки сами).
@@ -443,13 +449,7 @@ impl Flight {
                     Some(w) if w.capture_state() == CaptureState::Dead => {
                         "\u{f03d} error".to_owned()
                     }
-                    Some(w)
-                        if rec_on
-                            && matches!(
-                                w.record_state(),
-                                RecordState::Failed
-                            ) =>
-                    {
+                    Some(w) if rec_on && matches!(w.record_state(), RecordState::Failed) => {
                         "\u{f16df} error".to_owned()
                     }
                     Some(w) => match w.record_state() {
@@ -551,9 +551,9 @@ impl Flight {
         let duration = l.rules.duration;
         let race_hint = if alt {
             match (state, duration) {
-                (race::RaceStage::Running { start }, Some(duration)) => Some(format!(
+                (race::RaceStage::Running { start_at }, Some(duration)) => Some(format!(
                     "-{}",
-                    mmss(duration.saturating_sub(start.elapsed()))
+                    mmss(duration.saturating_sub(start_at.elapsed()))
                 )),
                 (_, Some(duration)) => Some(format!("Σ{}", mmss(duration))),
                 _ => None,
@@ -564,8 +564,8 @@ impl Flight {
         // Счётчик гонки: мигание последней секунды отсчёта, нули пристыжены.
         let (text, dim) = {
             let blink_off = match state {
-                race::RaceStage::Countdown { start } => {
-                    start.saturating_duration_since(now).as_millis() as u64 % 1000 >= 500
+                race::RaceStage::Countdown { start_at } => {
+                    start_at.saturating_duration_since(now).as_millis() as u64 % 1000 >= 500
                 }
                 _ => false,
             };
@@ -806,15 +806,9 @@ impl Flight {
         // Alt-бейджи транспорта — значения шкал на своих кнопках.
         let transport = if alt {
             let mut t = transport;
-            t.rew.badge = Some(format!(
-                "\u{00d7}{}",
-                SEEK_SPEEDS[d.scrub.seek_speed]
-            ));
+            t.rew.badge = Some(format!("\u{00d7}{}", SEEK_SPEEDS[d.scrub.seek_speed]));
             t.play.badge = Some(format!("{}%", PLAY_SPEEDS[d.scrub.play_speed]));
-            t.ff.badge = Some(format!(
-                "\u{00d7}{}",
-                SEEK_SPEEDS[d.scrub.seek_speed]
-            ));
+            t.ff.badge = Some(format!("\u{00d7}{}", SEEK_SPEEDS[d.scrub.seek_speed]));
             t.rpt.badge = Some(format!("±{:.1}s", RPT_SIZES[d.scrub.rpt_size]));
             t
         } else {
@@ -895,10 +889,9 @@ impl Flight {
                     // скейлу; иначе капсула тянется до CIRCLE_MIN_WIDTH_PX,
                     // а внутри неё голова (и drag) течёт по локальному
                     // скейлу круга).
-                    let min_w = (CIRCLE_MIN_WIDTH_PX
-                        / ui.ctx().pixels_per_point()
-                        / timeline_rect.width())
-                    .min(1.0);
+                    let min_w =
+                        (CIRCLE_MIN_WIDTH_PX / ui.ctx().pixels_per_point() / timeline_rect.width())
+                            .min(1.0);
                     let circle_raw = t.circle.map(|(center, radius)| {
                         let lo = center.saturating_sub(radius).saturating_sub(t.start);
                         let hi = (center + radius).min(t.end).saturating_sub(t.start);
@@ -1014,10 +1007,7 @@ impl Flight {
                             .into();
                         let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
                             .into_ruler()
-                            .extrude(
-                                w,
-                                bottom.bottom_left().y - cell_y(1) - first.bottom(),
-                            )
+                            .extrude(w, bottom.bottom_left().y - cell_y(1) - first.bottom())
                             .into();
                         guidelines::dashed_rect(ui, first);
                         guidelines::dashed_rect(ui, second);
@@ -1030,12 +1020,9 @@ impl Flight {
                     for (i, content) in frame.pads.iter().enumerate() {
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - viewfinder_cols) / 2;
-                        let ruler = egui::pos2(cell_x(col), cell_y(TOP_BAR_ROWS + 1))
-                            .into_ruler();
-                        let viewfinder = ruler.extrude(
-                            cell_x(viewfinder_cols),
-                            cell_y(viewfinder_rows + 2),
-                        );
+                        let ruler = egui::pos2(cell_x(col), cell_y(TOP_BAR_ROWS + 1)).into_ruler();
+                        let viewfinder =
+                            ruler.extrude(cell_x(viewfinder_cols), cell_y(viewfinder_rows + 2));
                         let frame_rect: egui::Rect = viewfinder.into();
                         viewfinder::ViewfinderFrame::new(
                             &content.label,
@@ -1119,8 +1106,11 @@ impl Flight {
 
                 // EXIT: всегда жива.
                 let exit_response =
-                    TransportButton::new(exit_label, true, false, EXIT_IDLE, EXIT_ACTIVE)
-                        .interact(ui, exit_rect, ui.make_persistent_id("flight_exit"));
+                    TransportButton::new(exit_label, true, false, EXIT_IDLE, EXIT_ACTIVE).interact(
+                        ui,
+                        exit_rect,
+                        ui.make_persistent_id("flight_exit"),
+                    );
                 TransportButton::new(
                     exit_label,
                     true,
@@ -1175,18 +1165,8 @@ impl Flight {
                     for (content, rect, id, icon, idle, lit) in &transport {
                         responses.push(if content.enabled {
                             Some(
-                                TransportButton::new(
-                                    *icon,
-                                    content.enabled,
-                                    false,
-                                    *idle,
-                                    *lit,
-                                )
-                                .interact(
-                                    ui,
-                                    *rect,
-                                    ui.make_persistent_id(*id),
-                                ),
+                                TransportButton::new(*icon, content.enabled, false, *idle, *lit)
+                                    .interact(ui, *rect, ui.make_persistent_id(*id)),
                             )
                         } else {
                             None
@@ -1231,11 +1211,11 @@ impl Flight {
                     // Скролл над кнопками — шаг по их шкалам.
                     let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
                     if frame.transport.rew.enabled {
-                        if let Some(up) = d.scrub.vscroll.step(
-                            scroll_delta,
-                            SCROLL_STEP,
-                            SCROLL_REARM,
-                        ) {
+                        if let Some(up) =
+                            d.scrub
+                                .vscroll
+                                .step(scroll_delta, SCROLL_STEP, SCROLL_REARM)
+                        {
                             let dir = if up { -1 } else { 1 };
                             let shift = |cur: &mut usize, len: usize, dir: i64| {
                                 *cur = (*cur as i64 + dir).clamp(0, len as i64 - 1) as usize;
@@ -1254,8 +1234,7 @@ impl Flight {
                                 // Круг включён — переприменить радиус
                                 // (транспорт центр переставит сам).
                                 if d.scrub.rpt_size != before && d.transport.circle().is_some() {
-                                    let radius =
-                                        (RPT_SIZES[d.scrub.rpt_size] * 1000.0) as u64;
+                                    let radius = (RPT_SIZES[d.scrub.rpt_size] * 1000.0) as u64;
                                     d.transport.set_circle(Some(Circle { center: 0, radius }));
                                 }
                             }
@@ -1263,8 +1242,7 @@ impl Flight {
                                 let before = d.scrub.play_speed;
                                 shift(&mut d.scrub.play_speed, PLAY_SPEEDS.len(), dir);
                                 if d.scrub.play_speed != before {
-                                    let speed =
-                                        PLAY_SPEEDS[d.scrub.play_speed] as f64 / 100.0;
+                                    let speed = PLAY_SPEEDS[d.scrub.play_speed] as f64 / 100.0;
                                     d.transport.set_speed(speed);
                                 }
                             }
@@ -1302,18 +1280,8 @@ impl Flight {
 
                 let race_response = if frame.rec.race.enabled {
                     Some(
-                        TransportButton::new(
-                            "\u{f140b}",
-                            true,
-                            false,
-                            RACE_IDLE,
-                            RACE_ACTIVE,
-                        )
-                        .interact(
-                            ui,
-                            race_rect,
-                            ui.make_persistent_id("flight_race"),
-                        ),
+                        TransportButton::new("\u{f140b}", true, false, RACE_IDLE, RACE_ACTIVE)
+                            .interact(ui, race_rect, ui.make_persistent_id("flight_race")),
                     )
                 } else {
                     None
@@ -1545,8 +1513,7 @@ impl Flight {
                         &mut d.scrub.ff
                     };
                     state.flash = true;
-                    let step =
-                        SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
+                    let step = SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
                     Self::seek_by(d, clip, if back { -step } else { step });
                 } else {
                     d.transport.shuttle_release(SEEK_RELEASE_RAMP);
@@ -1582,8 +1549,7 @@ impl Flight {
                 &mut d.scrub.ff
             };
             state.hold_sent = true;
-            let speed =
-                SEEK_SPEEDS[d.scrub.seek_speed] as f64 * if back { -1.0 } else { 1.0 };
+            let speed = SEEK_SPEEDS[d.scrub.seek_speed] as f64 * if back { -1.0 } else { 1.0 };
             d.transport.shuttle(speed);
         }
     }
@@ -1591,11 +1557,7 @@ impl Flight {
     /// Команда удалённого управления — нажатия кнопок экрана: rec, race,
     /// play, ff, rew, exit повторяют клики по кнопкам, seek <ms> —
     /// абсолютную перемотку всех плееров. Some — обработана.
-    pub fn handle_remote(
-        &mut self,
-        ctx: &egui::Context,
-        command: &[String],
-    ) -> Option<Response> {
+    pub fn handle_remote(&mut self, ctx: &egui::Context, command: &[String]) -> Option<Response> {
         let head = command.first()?.as_str();
         let ok = |message: String| Some(Response { message, code: 0 });
         match (&head, &mut self.phase) {
@@ -1754,19 +1716,6 @@ impl Review {
 /// все символы клавиатуры и переводит аттач в Err — плашка дисконнекта.
 /// Возвращает true, если состояние могло измениться, — caller просит
 /// перерисовку.
-/// Наборы цветов кнопок (см. colors-table.html): два цвета на кнопку —
-/// яркий (активный фон) и неяркий (покой; выключенный = неяркий × 0.35
-/// альфой). EXIT — холодный серый, транспорт — тёплый пластик, REC —
-/// алый, RACE — кислотный.
-const EXIT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xAE, 0xBE, 0xC8);
-const EXIT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x5A, 0x63);
-const TRANSPORT_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xE2, 0xCE);
-const TRANSPORT_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6A, 0x66, 0x56);
-const REC_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xEA, 0x31, 0x23);
-const REC_IDLE: egui::Color32 = egui::Color32::from_rgb(0x6E, 0x42, 0x3C);
-const RACE_ACTIVE: egui::Color32 = egui::Color32::from_rgb(0xC8, 0xF5, 0x00);
-const RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x75, 0x77, 0x48);
-
 /// Срез камер активных падов (дедуп по camera_id): захваты открываются
 /// по одному на камеру, гоночному потоку нужен owned срез. «Активные» =
 /// пады с пилотами, в пределах MAX_PADS (рендер падов идёт по всем —
@@ -1789,10 +1738,19 @@ fn filter_cameras(
         .collect()
 }
 
-/// Толеран отставания показанного кадра мастера от позиции транспорта,
-/// в пределах которого циферблат верен картинке (лень кадра + декод на
-/// обычных скоростях; шаттл уходит дальше — цифра честно = курсор).
-const DIAL_LAG_MS: u64 = 150;
+/// Число строк вьюфайндера по числу пилотов (копия live'овской раскладки).
+pub fn viewfinder_rows(count: usize) -> isize {
+    match count {
+        1 | 2 => 21,
+        3 => 15,
+        _ => 12,
+    }
+}
+
+/// Ширина вьюфайндера из соотношения 16:9 (8 клеток на 3 строки).
+pub fn viewfinder_cols(count: usize) -> isize {
+    viewfinder_rows(count) * 8 / 3
+}
 
 /// мм:ss от длительности.
 fn mmss(dur: Duration) -> String {

@@ -47,35 +47,6 @@ pub const SEEK_SPEEDS: [i32; 6] = [3, 5, 7, 10, 15, 20];
 pub const PLAY_SPEEDS: [i32; 7] = [25, 50, 75, 100, 125, 150, 200];
 pub const RPT_SIZES: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
 
-/// Последний по имени файл записи камеры: `{anything}-{camera_id}-mjpeg`
-/// + любой из поддержанных контейнеров. Таймстамп-префикс сортируется
-/// лексикографически.
-pub fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
-    let stem = format!("-{camera_id}-mjpeg.");
-    let exts = ["mkv", "mp4", "mov"];
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().is_some_and(|n| {
-                let n = n.to_string_lossy();
-                exts.iter().any(|ext| n.ends_with(&format!("{stem}{ext}")))
-            })
-        })
-        .max()
-}
-
-/// Последний журнал полёта в каталоге: стемы сортируются лексикографически.
-pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
-        .max()
-}
-
 /// События таймлайна: команды хозяину (flight) на все плееры разом.
 pub enum TimelineEvent {
     /// Захват/отпускание шкалы — hold (не пауза).
@@ -422,4 +393,33 @@ impl SeekButton {
     pub fn lit(&self) -> bool {
         self.down || self.flash
     }
+}
+
+/// Последний по имени файл записи камеры: `{anything}-{camera_id}-mjpeg`
+/// + любой из поддержанных контейнеров. Таймстамп-префикс сортируется
+/// лексикографически.
+pub fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
+    let stem = format!("-{camera_id}-mjpeg.");
+    let exts = ["mkv", "mp4", "mov"];
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                exts.iter().any(|ext| n.ends_with(&format!("{stem}{ext}")))
+            })
+        })
+        .max()
+}
+
+/// Последний журнал полёта в каталоге: стемы сортируются лексикографически.
+pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
+        .max()
 }

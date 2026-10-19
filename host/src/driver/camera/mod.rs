@@ -120,24 +120,6 @@ impl FrameSink for LatestSink {
     }
 }
 
-pub fn list_cameras() -> std::result::Result<Vec<CameraConfig>, Error> {
-    let mut devices = Backend::list_devices()?;
-    devices.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut descriptions = Vec::new();
-    for dev in devices {
-        for fmt in dev.formats {
-            descriptions.push(CameraConfig::new(
-                &dev.name,
-                fmt.resolution.width,
-                fmt.resolution.height,
-                fmt.frame_rate.0,
-                fmt.format,
-            ));
-        }
-    }
-    Ok(descriptions)
-}
-
 /// Хэндл команд записи, отделяемый от фасада: гоночный поток шлёт
 /// команды рекордеру и читает RecordState, не трогая UI-часть Camera
 /// (текстуры, кадры). Клонируем.
@@ -409,9 +391,9 @@ fn capture_loop(
                 errors_since = None;
                 capture_frames += 1;
                 if let Some(prev) = last_timestamp {
-                    frame_interval.on_process(frame.timestamp - prev);
+                    frame_interval.on_process(frame.at - prev);
                 }
-                last_timestamp = Some(frame.timestamp);
+                last_timestamp = Some(frame.at);
                 frame
             }
             Err(FrameError::Recoverable(e)) => {
@@ -564,7 +546,7 @@ fn dispatch_frame(
     decode_jpeg: &mut FrameStats,
     decode_yuyv: &mut FrameStats,
 ) -> bool {
-    let ts = frame.timestamp;
+    let ts = frame.at;
     match frame.data {
         FrameData::Jpeg { buf, len } => {
             // Декод до перемещения буфера: borrow, не копия. Пишем в DVR
@@ -575,13 +557,13 @@ fn dispatch_frame(
             let decoded = decode::decode_frame(PixelConfig::Mjpeg, &buf, width, height);
             decode_jpeg.on_process(t0.elapsed());
             dvr_sink.on_frame(Arc::new(Frame {
-                timestamp: ts,
+                at: ts,
                 data: FrameData::Jpeg { buf, len },
             }));
             match decoded {
                 Ok(image) => {
                     ui_sink.on_frame(Arc::new(Frame {
-                        timestamp: ts,
+                        at: ts,
                         data: FrameData::Rgba { rgba: image },
                     }));
                 }
@@ -598,7 +580,7 @@ fn dispatch_frame(
                 Ok(image) => {
                     // Один декод — обоим sink'ам бампом счётчика.
                     let frame = Arc::new(Frame {
-                        timestamp: ts,
+                        at: ts,
                         data: FrameData::Rgba { rgba: image },
                     });
                     dvr_sink.on_frame(frame.clone());
@@ -612,7 +594,7 @@ fn dispatch_frame(
         // Нативный RGBA от будущих бэкендов: без декода.
         FrameData::Rgba { rgba } => {
             let frame = Arc::new(Frame {
-                timestamp: ts,
+                at: ts,
                 data: FrameData::Rgba { rgba },
             });
             dvr_sink.on_frame(frame.clone());
@@ -620,6 +602,24 @@ fn dispatch_frame(
         }
     }
     true
+}
+
+pub fn list_cameras() -> std::result::Result<Vec<CameraConfig>, Error> {
+    let mut devices = Backend::list_devices()?;
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut descriptions = Vec::new();
+    for dev in devices {
+        for fmt in dev.formats {
+            descriptions.push(CameraConfig::new(
+                &dev.name,
+                fmt.resolution.width,
+                fmt.resolution.height,
+                fmt.frame_rate.0,
+                fmt.format,
+            ));
+        }
+    }
+    Ok(descriptions)
 }
 
 #[cfg(test)]
@@ -632,7 +632,7 @@ mod tests {
 
     fn yuyv_frame(w: u32, h: u32) -> Frame {
         Frame {
-            timestamp: Instant::now(),
+            at: Instant::now(),
             data: FrameData::Yuyv {
                 buf: vec![128u8; (w * h * 2) as usize],
             },

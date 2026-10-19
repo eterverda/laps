@@ -3,6 +3,15 @@ use crate::gui::measure_text;
 use crate::gui::ruler::{CELL_SIZE, cell_x, cell_y};
 use crate::gui::style;
 
+/// Маркер зеркалирования глифа: префикс слова в тексте кнопки — первый
+/// глиф слова рисуется зеркально по горизонтали. Зеркальных пар у иконок
+/// Nerd Fonts нет (exit-to-app, например, есть только со стрелкой
+/// вправо), поэтому разворачиваем сами. Кодпоинт — свободная дыра PUA в
+/// обоих начертаниях шрифта: глифа у него нет, в раскладку не попадает,
+/// ширины не даёт.
+pub const GLYPH_FLIP: char = '\u{e6c0}';
+
+
 pub struct Letterbox {
     min_virtual_size: egui::Vec2,
     max_virtual_size: egui::Vec2,
@@ -170,133 +179,6 @@ impl Letterbox {
     }
 }
 
-/// Маркер зеркалирования глифа: префикс слова в тексте кнопки — первый
-/// глиф слова рисуется зеркально по горизонтали. Зеркальных пар у иконок
-/// Nerd Fonts нет (exit-to-app, например, есть только со стрелкой
-/// вправо), поэтому разворачиваем сами. Кодпоинт — свободная дыра PUA в
-/// обоих начертаниях шрифта: глифа у него нет, в раскладку не попадает,
-/// ширины не даёт.
-pub const GLYPH_FLIP: char = '\u{e6c0}';
-
-/// Слово без маркеров GLYPH_FLIP (измеряем и рисуем сами глифы).
-fn strip_flip_markers(word: &str) -> String {
-    word.chars().filter(|&c| c != GLYPH_FLIP).collect()
-}
-
-/// Округление позиции к физическим пикселям (паритет с тесселятором
-/// текста, у него это метод emath::GuiRounding за пределами крейта).
-fn round_to_pixels(pos: egui::Pos2, pixels_per_point: f32) -> egui::Pos2 {
-    egui::pos2(
-        (pos.x * pixels_per_point).round() / pixels_per_point,
-        (pos.y * pixels_per_point).round() / pixels_per_point,
-    )
-}
-
-/// Слово кнопки на позиции (левый нижний угол). Обычные глифы — прогонами
-/// через painter.text; глиф после маркера GLYPH_FLIP — зеркально
-/// (paint_glyph_flipped). Возвращает ширину слова (как measure_text у
-/// обычного слова).
-fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color32) -> f32 {
-    let font = style::FONT_REGULAR_X2;
-    let mut x = pos.x;
-    // Прогон обычных глифов накапливается в run, маркер его сбрасывает
-    // (прогон рисуется) и переворачивает следующий глиф.
-    let mut run = String::new();
-    let mut chars = word.chars();
-    while let Some(c) = chars.next() {
-        if c == GLYPH_FLIP {
-            if !run.is_empty() {
-                ui.painter().text(
-                    egui::pos2(x, pos.y),
-                    egui::Align2::LEFT_BOTTOM,
-                    &run,
-                    font.clone(),
-                    color,
-                );
-                x += measure_text(ui.ctx(), font.clone(), &run).x;
-                run.clear();
-            }
-            if let Some(g) = chars.next() {
-                x += paint_glyph_flipped(ui, egui::pos2(x, pos.y), g, color);
-            }
-        } else {
-            run.push(c);
-        }
-    }
-    if !run.is_empty() {
-        ui.painter().text(
-            egui::pos2(x, pos.y),
-            egui::Align2::LEFT_BOTTOM,
-            &run,
-            font.clone(),
-            color,
-        );
-        x += measure_text(ui.ctx(), font, &run).x;
-    }
-    x - pos.x
-}
-
-/// Один глиф зеркально по горизонтали. Ширина — как у обычного текста:
-/// квад того же глифа из шрифтового атласа (TextureId::Managed(0)), u в
-/// uv отражена. Позиционирование повторяет painter.text с LEFT_BOTTOM
-/// (включая округление к физпикселям).
-fn paint_glyph_flipped(ui: &mut egui::Ui, pos: egui::Pos2, chr: char, color: egui::Color32) -> f32 {
-    let font = style::FONT_REGULAR_X2;
-    let galley = ui
-        .ctx()
-        .fonts_mut(|fonts| fonts.layout_no_wrap(chr.to_string(), font, color));
-    let Some(row) = galley.rows.first() else {
-        return 0.0;
-    };
-    let Some(glyph) = row.row.glyphs.first() else {
-        return 0.0;
-    };
-    let uv = glyph.uv_rect;
-    // Якорь LEFT_BOTTOM: галлея ставится origin'ом ниже pos на её высоту
-    // (округление к физпикселям — как тесселятор текста).
-    let ppp = ui.ctx().pixels_per_point();
-    let origin = round_to_pixels(egui::pos2(pos.x, pos.y - galley.rect.height()), ppp);
-    let min = origin + row.pos.to_vec2() + (glyph.pos + uv.offset).to_vec2();
-    let tex = ui.ctx().fonts(|fonts| fonts.font_image_size());
-    let u_norm = |u: u16, w: usize| u as f32 / w.max(1) as f32;
-    let (u_min, u_max) = (u_norm(uv.min[0], tex[0]), u_norm(uv.max[0], tex[0]));
-    let (v_min, v_max) = (u_norm(uv.min[1], tex[1]), u_norm(uv.max[1], tex[1]));
-    let rect = egui::Rect::from_min_size(min, uv.size);
-    let mut mesh = egui::Mesh::with_texture(egui::TextureId::Managed(0));
-    // Порядок вершин и пар треугольников — как у текста в атласе, u зеркалим.
-    for (p, u, v) in [
-        (rect.left_top(), u_max, v_min),
-        (rect.right_top(), u_min, v_min),
-        (rect.left_bottom(), u_max, v_max),
-        (rect.right_bottom(), u_min, v_max),
-    ] {
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: p,
-            uv: egui::pos2(u, v),
-            color,
-        });
-    }
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(2, 1, 3);
-    ui.painter().add(egui::Shape::mesh(mesh));
-    glyph.advance_width
-}
-
-/// Ширина текста кнопки в пикселях — чтобы вызывающий код мог
-/// посчитать rect.
-pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
-    let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
-    let mut width: f32 = words
-        .iter()
-        .map(|word| {
-            measure_text(ctx, style::FONT_REGULAR_X2, strip_flip_markers(word)).x
-        })
-        .sum();
-    if words.len() > 1 {
-        width += cell_x(1) * (words.len() - 1) as f32;
-    }
-    width
-}
 
 /// Угол полосы: определяет, с какой стороны обрезочка (с внешней) и
 /// как читать пришедший rect. Полоса никуда сама не тянется —
@@ -550,4 +432,124 @@ pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, line
             egui::Color32::WHITE,
         );
     }
+}
+
+/// Слово без маркеров GLYPH_FLIP (измеряем и рисуем сами глифы).
+fn strip_flip_markers(word: &str) -> String {
+    word.chars().filter(|&c| c != GLYPH_FLIP).collect()
+}
+
+/// Округление позиции к физическим пикселям (паритет с тесселятором
+/// текста, у него это метод emath::GuiRounding за пределами крейта).
+fn round_to_pixels(pos: egui::Pos2, pixels_per_point: f32) -> egui::Pos2 {
+    egui::pos2(
+        (pos.x * pixels_per_point).round() / pixels_per_point,
+        (pos.y * pixels_per_point).round() / pixels_per_point,
+    )
+}
+
+/// Слово кнопки на позиции (левый нижний угол). Обычные глифы — прогонами
+/// через painter.text; глиф после маркера GLYPH_FLIP — зеркально
+/// (paint_glyph_flipped). Возвращает ширину слова (как measure_text у
+/// обычного слова).
+fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color32) -> f32 {
+    let font = style::FONT_REGULAR_X2;
+    let mut x = pos.x;
+    // Прогон обычных глифов накапливается в run, маркер его сбрасывает
+    // (прогон рисуется) и переворачивает следующий глиф.
+    let mut run = String::new();
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        if c == GLYPH_FLIP {
+            if !run.is_empty() {
+                ui.painter().text(
+                    egui::pos2(x, pos.y),
+                    egui::Align2::LEFT_BOTTOM,
+                    &run,
+                    font.clone(),
+                    color,
+                );
+                x += measure_text(ui.ctx(), font.clone(), &run).x;
+                run.clear();
+            }
+            if let Some(g) = chars.next() {
+                x += paint_glyph_flipped(ui, egui::pos2(x, pos.y), g, color);
+            }
+        } else {
+            run.push(c);
+        }
+    }
+    if !run.is_empty() {
+        ui.painter().text(
+            egui::pos2(x, pos.y),
+            egui::Align2::LEFT_BOTTOM,
+            &run,
+            font.clone(),
+            color,
+        );
+        x += measure_text(ui.ctx(), font, &run).x;
+    }
+    x - pos.x
+}
+
+/// Один глиф зеркально по горизонтали. Ширина — как у обычного текста:
+/// квад того же глифа из шрифтового атласа (TextureId::Managed(0)), u в
+/// uv отражена. Позиционирование повторяет painter.text с LEFT_BOTTOM
+/// (включая округление к физпикселям).
+fn paint_glyph_flipped(ui: &mut egui::Ui, pos: egui::Pos2, chr: char, color: egui::Color32) -> f32 {
+    let font = style::FONT_REGULAR_X2;
+    let galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(chr.to_string(), font, color));
+    let Some(row) = galley.rows.first() else {
+        return 0.0;
+    };
+    let Some(glyph) = row.row.glyphs.first() else {
+        return 0.0;
+    };
+    let uv = glyph.uv_rect;
+    // Якорь LEFT_BOTTOM: галлея ставится origin'ом ниже pos на её высоту
+    // (округление к физпикселям — как тесселятор текста).
+    let ppp = ui.ctx().pixels_per_point();
+    let origin = round_to_pixels(egui::pos2(pos.x, pos.y - galley.rect.height()), ppp);
+    let min = origin + row.pos.to_vec2() + (glyph.pos + uv.offset).to_vec2();
+    let tex = ui.ctx().fonts(|fonts| fonts.font_image_size());
+    let u_norm = |u: u16, w: usize| u as f32 / w.max(1) as f32;
+    let (u_min, u_max) = (u_norm(uv.min[0], tex[0]), u_norm(uv.max[0], tex[0]));
+    let (v_min, v_max) = (u_norm(uv.min[1], tex[1]), u_norm(uv.max[1], tex[1]));
+    let rect = egui::Rect::from_min_size(min, uv.size);
+    let mut mesh = egui::Mesh::with_texture(egui::TextureId::Managed(0));
+    // Порядок вершин и пар треугольников — как у текста в атласе, u зеркалим.
+    for (p, u, v) in [
+        (rect.left_top(), u_max, v_min),
+        (rect.right_top(), u_min, v_min),
+        (rect.left_bottom(), u_max, v_max),
+        (rect.right_bottom(), u_min, v_max),
+    ] {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: p,
+            uv: egui::pos2(u, v),
+            color,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(2, 1, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+    glyph.advance_width
+}
+
+/// Ширина текста кнопки в пикселях — чтобы вызывающий код мог
+/// посчитать rect.
+pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
+    let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
+    let mut width: f32 = words
+        .iter()
+        .map(|word| {
+            measure_text(ctx, style::FONT_REGULAR_X2, strip_flip_markers(word)).x
+        })
+        .sum();
+    if words.len() > 1 {
+        width += cell_x(1) * (words.len() - 1) as f32;
+    }
+    width
 }

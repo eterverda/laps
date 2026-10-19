@@ -27,59 +27,6 @@ const CLUSTER_SPAN_MS: u64 = 5_000;
 /// патчим реальный SeekHead + добиваем Void'ом до того же размера.
 const SEEKHEAD_RESERVE: u64 = 128;
 
-// --- EBML-примитивы -------------------------------------------------------
-
-/// Ширина vint в байтах для значения v (минимально достаточная).
-fn vint_width(v: u64) -> usize {
-    let mut width = 1;
-    while width < 8 && v >= (1u64 << (7 * width)) {
-        width += 1;
-    }
-    width
-}
-
-/// Закодировать v как vint фиксированной ширины: маркер — старший бит
-/// первого байта. Достаём младшие `width` байт из BE-представления.
-fn vint(v: u64, width: usize) -> [u8; 8] {
-    (v | (1u64 << (7 * width))).to_be_bytes()
-}
-
-/// Дописать ID элемента заданной длины (значащие байты u32 BE).
-fn push_id(buf: &mut Vec<u8>, id: u32, id_len: usize) {
-    buf.extend_from_slice(&id.to_be_bytes()[4 - id_len..]);
-}
-
-/// Unsigned-элемент в буфер: ID + size vint + значение в минимальной ширине.
-fn push_u(buf: &mut Vec<u8>, id: u32, id_len: usize, v: u64) {
-    push_id(buf, id, id_len);
-    let w = vint_width(v); // байтовая ширина значения
-    let sw = vint_width(w as u64); // size vint кодирует длину, не значение
-    buf.extend_from_slice(&vint(w as u64, sw)[8 - sw..]);
-    buf.extend_from_slice(&v.to_be_bytes()[8 - w..]);
-}
-
-/// ASCII-элемент в буфер.
-fn push_text(buf: &mut Vec<u8>, id: u32, id_len: usize, s: &str) {
-    push_id(buf, id, id_len);
-    let w = vint_width(s.len() as u64);
-    buf.extend_from_slice(&vint(s.len() as u64, w)[8 - w..]);
-    buf.extend_from_slice(s.as_bytes());
-}
-
-/// Элемент с payload из буфера.
-fn push_elem(buf: &mut Vec<u8>, id: u32, id_len: usize, payload: &[u8]) {
-    push_id(buf, id, id_len);
-    let w = vint_width(payload.len() as u64);
-    buf.extend_from_slice(&vint(payload.len() as u64, w)[8 - w..]);
-    buf.extend_from_slice(payload);
-}
-
-fn write_elem(w: &mut impl Write, id: u32, id_len: usize, payload: &[u8]) -> IoResult<()> {
-    let mut buf = Vec::with_capacity(id_len + 9 + payload.len());
-    push_elem(&mut buf, id, id_len, payload);
-    w.write_all(&buf)
-}
-
 /// Писатель Matroska: EBML-заголовок, Segment с резервным SeekHead,
 /// Info/Tracks, кластеры по ходу write_frame, Cues + патчи в finalize().
 pub struct MkvWriter {
@@ -331,14 +278,13 @@ impl VideoWriter for MkvWriter {
     }
 }
 
-
 // --- Ридер (зеркало писателя) -----------------------------------------------
 
-use std::io::{BufReader, Read, SeekFrom};
-use std::iter::repeat_n;
-use std::io::Result as IoResult;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
+use std::io::Result as IoResult;
+use std::io::{BufReader, Read, SeekFrom};
+use std::iter::repeat_n;
 
 /// Запись индекса: кадр в файле.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,6 +518,58 @@ fn skip(r: &mut impl Read, mut n: u64) -> IoResult<()> {
     Ok(())
 }
 
+// --- EBML-примитивы (связаны с MkvWriter) ---
+/// Ширина vint в байтах для значения v (минимально достаточная).
+fn vint_width(v: u64) -> usize {
+    let mut width = 1;
+    while width < 8 && v >= (1u64 << (7 * width)) {
+        width += 1;
+    }
+    width
+}
+
+/// Закодировать v как vint фиксированной ширины: маркер — старший бит
+/// первого байта. Достаём младшие `width` байт из BE-представления.
+fn vint(v: u64, width: usize) -> [u8; 8] {
+    (v | (1u64 << (7 * width))).to_be_bytes()
+}
+
+/// Дописать ID элемента заданной длины (значащие байты u32 BE).
+fn push_id(buf: &mut Vec<u8>, id: u32, id_len: usize) {
+    buf.extend_from_slice(&id.to_be_bytes()[4 - id_len..]);
+}
+
+/// Unsigned-элемент в буфер: ID + size vint + значение в минимальной ширине.
+fn push_u(buf: &mut Vec<u8>, id: u32, id_len: usize, v: u64) {
+    push_id(buf, id, id_len);
+    let w = vint_width(v); // байтовая ширина значения
+    let sw = vint_width(w as u64); // size vint кодирует длину, не значение
+    buf.extend_from_slice(&vint(w as u64, sw)[8 - sw..]);
+    buf.extend_from_slice(&v.to_be_bytes()[8 - w..]);
+}
+
+/// ASCII-элемент в буфер.
+fn push_text(buf: &mut Vec<u8>, id: u32, id_len: usize, s: &str) {
+    push_id(buf, id, id_len);
+    let w = vint_width(s.len() as u64);
+    buf.extend_from_slice(&vint(s.len() as u64, w)[8 - w..]);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+/// Элемент с payload из буфера.
+fn push_elem(buf: &mut Vec<u8>, id: u32, id_len: usize, payload: &[u8]) {
+    push_id(buf, id, id_len);
+    let w = vint_width(payload.len() as u64);
+    buf.extend_from_slice(&vint(payload.len() as u64, w)[8 - w..]);
+    buf.extend_from_slice(payload);
+}
+
+fn write_elem(w: &mut impl Write, id: u32, id_len: usize, payload: &[u8]) -> IoResult<()> {
+    let mut buf = Vec::with_capacity(id_len + 9 + payload.len());
+    push_elem(&mut buf, id, id_len, payload);
+    w.write_all(&buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,7 +698,16 @@ mod tests {
         let path = test_path("header");
         let frames = fake_frames(3);
         {
-            let mut writer = Box::new(MkvWriter::create(&path, ResolutionConfig { width: 1920, height: 1080 }).unwrap());
+            let mut writer = Box::new(
+                MkvWriter::create(
+                    &path,
+                    ResolutionConfig {
+                        width: 1920,
+                        height: 1080,
+                    },
+                )
+                .unwrap(),
+            );
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 1_000_000 + i as u64 * 33)
@@ -772,7 +779,16 @@ mod tests {
         let path = test_path("clusters");
         let frames = fake_frames(400); // 400 * 33 мс ≈ 13 с — два переключения
         {
-            let mut writer = Box::new(MkvWriter::create(&path, ResolutionConfig { width: 640, height: 480 }).unwrap());
+            let mut writer = Box::new(
+                MkvWriter::create(
+                    &path,
+                    ResolutionConfig {
+                        width: 640,
+                        height: 480,
+                    },
+                )
+                .unwrap(),
+            );
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 5_000_000 + i as u64 * 33)
@@ -842,9 +858,18 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let path = test_path("empty");
-        Box::new(MkvWriter::create(&path, ResolutionConfig { width: 640, height: 480 }).unwrap())
-            .finalize()
-            .unwrap();
+        Box::new(
+            MkvWriter::create(
+                &path,
+                ResolutionConfig {
+                    width: 640,
+                    height: 480,
+                },
+            )
+            .unwrap(),
+        )
+        .finalize()
+        .unwrap();
 
         let buf = fs::read(&path).unwrap();
         let top = parse(&buf, 0, buf.len());
@@ -875,7 +900,16 @@ mod tests {
             .map(|i| (i * 40, vec![i as u8; 100 + i as usize]))
             .collect();
         {
-            let mut w: Box<dyn VideoWriter> = Box::new(MkvWriter::create(&path, ResolutionConfig { width: 64, height: 48 }).unwrap());
+            let mut w: Box<dyn VideoWriter> = Box::new(
+                MkvWriter::create(
+                    &path,
+                    ResolutionConfig {
+                        width: 64,
+                        height: 48,
+                    },
+                )
+                .unwrap(),
+            );
             for (ts, data) in &frames {
                 w.write_frame(data, *ts).unwrap();
             }

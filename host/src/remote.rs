@@ -45,142 +45,6 @@ impl Instance {
     }
 }
 
-fn registry_dir() -> PathBuf {
-    dirs::cache_dir()
-        .expect("cache dir is not defined")
-        .join("laps")
-}
-
-/// Сервер удалённого управления. Listener крутит отсоединённый
-/// accept-поток и обслуживает клиентов по очереди: один в обслуживании,
-/// остальные ждут в backlog. Поток умирает с процессом. Хендл держит
-/// запись в реестре: файл инстанса живёт ровно столько, сколько он.
-pub struct Server {
-    instance: Instance,
-    dir: PathBuf,
-}
-
-impl Server {
-    /// Поднимает listener на эфемерном порту 127.0.0.1 и регистрирует
-    /// инстанс. Команды целиком отдаёт `execute` — колбэку, который кладёт
-    /// команду GUI-потоку и будит его (иначе ответ ждал бы ближайшего
-    /// кадра egui).
-    pub fn start(
-        execute: Arc<dyn Fn(Vec<String>) -> Response + Send + Sync>,
-    ) -> IoResult<Self> {
-        cleanup();
-        let listener = TcpListener::bind((DEFAULT_HOST, 0))?;
-        let addr = listener.local_addr()?;
-        let server = Self::register_in(registry_dir(), addr.port())?;
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => serve(stream, execute.as_ref()),
-                    Err(e) => log::warn!("remote: accept failed: {e}"),
-                }
-            }
-        });
-        log::info!(
-            "instance started, remote control on {DEFAULT_HOST}:{} (pid {})",
-            addr.port(),
-            process::id()
-        );
-        Ok(server)
-    }
-
-    /// Пишет файл инстанса текущего процесса (без listener — шов для тестов).
-    fn register_in(dir: PathBuf, port: u16) -> IoResult<Self> {
-        let me = Self {
-            instance: Instance {
-                pid: process::id(),
-                port,
-            },
-            dir,
-        };
-        fs::create_dir_all(&me.dir)?;
-        fs::write(me.path(), to_yaml_string(&me.instance).unwrap())?;
-        Ok(me)
-    }
-
-    fn path(&self) -> PathBuf {
-        self.dir
-            .join(format!("instance-{}.yaml", self.instance.pid))
-    }
-    #[cfg(test)]
-    pub fn port(&self) -> u16 {
-        self.instance.port
-    }
-
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.path());
-    }
-}
-
-/// Живые инстансы из реестра (list-instances; живость — TCP-коннект).
-/// Подчистка мёртвых — `cleanup()`: старт сервера и list-instances.
-pub fn discover() -> Vec<Instance> {
-    discover_in(&registry_dir())
-}
-
-/// Удаляет файлы мёртвых и битых инстансов.
-pub fn cleanup() {
-    cleanup_in(&registry_dir());
-}
-
-/// Сканирование реестра: (разбираемые записи, битые файлы). Живость тут
-/// не проверяется: TCP-проба — это подключение-клиент, а сервер принимает
-/// одного клиента за раз.
-fn scan(dir: &Path) -> (Vec<Instance>, Vec<PathBuf>) {
-    let mut records = Vec::new();
-    let mut broken = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return (records, broken);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
-            continue;
-        }
-        let Ok(yaml) = fs::read_to_string(&path) else {
-            broken.push(path);
-            continue;
-        };
-        match from_yaml_string::<Instance>(&yaml) {
-            Ok(inst) => records.push(inst),
-            Err(_) => broken.push(path),
-        }
-    }
-    records.sort_by_key(|i| i.pid);
-    (records, broken)
-}
-
-/// Живые из разбираемых записей.
-fn discover_in(dir: &Path) -> Vec<Instance> {
-    scan(dir).0.into_iter().filter(|i| i.alive()).collect()
-}
-
-/// Записи реестра без проверки живости — путь подключения: живость решает
-/// connect, мёртвая запись даст быстрый отказ.
-fn records_in(dir: &Path) -> Vec<Instance> {
-    scan(dir).0
-}
-
-fn cleanup_in(dir: &Path) {
-    let (records, mut stale) = scan(dir);
-    stale.extend(
-        records
-            .iter()
-            .filter(|i| !i.alive())
-            .map(|i| dir.join(format!("instance-{}.yaml", i.pid))),
-    );
-    for path in stale {
-        let _ = fs::remove_file(&path);
-    }
-}
-
 // --- Пре-парсинг argv ---
 
 enum Startup {
@@ -435,6 +299,142 @@ fn serve(stream: TcpStream, execute: &(dyn Fn(Vec<String>) -> Response + Send + 
     let _ = writeln!(writer, "{response}");
     let _ = writer.flush();
     // Выход закрывает оба handle сокета — клиент получает EOF.
+}
+
+fn registry_dir() -> PathBuf {
+    dirs::cache_dir()
+        .expect("cache dir is not defined")
+        .join("laps")
+}
+
+/// Сервер удалённого управления. Listener крутит отсоединённый
+/// accept-поток и обслуживает клиентов по очереди: один в обслуживании,
+/// остальные ждут в backlog. Поток умирает с процессом. Хендл держит
+/// запись в реестре: файл инстанса живёт ровно столько, сколько он.
+pub struct Server {
+    instance: Instance,
+    dir: PathBuf,
+}
+
+impl Server {
+    /// Поднимает listener на эфемерном порту 127.0.0.1 и регистрирует
+    /// инстанс. Команды целиком отдаёт `execute` — колбэку, который кладёт
+    /// команду GUI-потоку и будит его (иначе ответ ждал бы ближайшего
+    /// кадра egui).
+    pub fn start(
+        execute: Arc<dyn Fn(Vec<String>) -> Response + Send + Sync>,
+    ) -> IoResult<Self> {
+        cleanup();
+        let listener = TcpListener::bind((DEFAULT_HOST, 0))?;
+        let addr = listener.local_addr()?;
+        let server = Self::register_in(registry_dir(), addr.port())?;
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => serve(stream, execute.as_ref()),
+                    Err(e) => log::warn!("remote: accept failed: {e}"),
+                }
+            }
+        });
+        log::info!(
+            "instance started, remote control on {DEFAULT_HOST}:{} (pid {})",
+            addr.port(),
+            process::id()
+        );
+        Ok(server)
+    }
+
+    /// Пишет файл инстанса текущего процесса (без listener — шов для тестов).
+    fn register_in(dir: PathBuf, port: u16) -> IoResult<Self> {
+        let me = Self {
+            instance: Instance {
+                pid: process::id(),
+                port,
+            },
+            dir,
+        };
+        fs::create_dir_all(&me.dir)?;
+        fs::write(me.path(), to_yaml_string(&me.instance).unwrap())?;
+        Ok(me)
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir
+            .join(format!("instance-{}.yaml", self.instance.pid))
+    }
+    #[cfg(test)]
+    pub fn port(&self) -> u16 {
+        self.instance.port
+    }
+
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.path());
+    }
+}
+
+/// Живые инстансы из реестра (list-instances; живость — TCP-коннект).
+/// Подчистка мёртвых — `cleanup()`: старт сервера и list-instances.
+pub fn discover() -> Vec<Instance> {
+    discover_in(&registry_dir())
+}
+
+/// Удаляет файлы мёртвых и битых инстансов.
+pub fn cleanup() {
+    cleanup_in(&registry_dir());
+}
+
+/// Сканирование реестра: (разбираемые записи, битые файлы). Живость тут
+/// не проверяется: TCP-проба — это подключение-клиент, а сервер принимает
+/// одного клиента за раз.
+fn scan(dir: &Path) -> (Vec<Instance>, Vec<PathBuf>) {
+    let mut records = Vec::new();
+    let mut broken = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (records, broken);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+            continue;
+        }
+        let Ok(yaml) = fs::read_to_string(&path) else {
+            broken.push(path);
+            continue;
+        };
+        match from_yaml_string::<Instance>(&yaml) {
+            Ok(inst) => records.push(inst),
+            Err(_) => broken.push(path),
+        }
+    }
+    records.sort_by_key(|i| i.pid);
+    (records, broken)
+}
+
+/// Живые из разбираемых записей.
+fn discover_in(dir: &Path) -> Vec<Instance> {
+    scan(dir).0.into_iter().filter(|i| i.alive()).collect()
+}
+
+/// Записи реестра без проверки живости — путь подключения: живость решает
+/// connect, мёртвая запись даст быстрый отказ.
+fn records_in(dir: &Path) -> Vec<Instance> {
+    scan(dir).0
+}
+
+fn cleanup_in(dir: &Path) {
+    let (records, mut stale) = scan(dir);
+    stale.extend(
+        records
+            .iter()
+            .filter(|i| !i.alive())
+            .map(|i| dir.join(format!("instance-{}.yaml", i.pid))),
+    );
+    for path in stale {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

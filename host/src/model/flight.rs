@@ -30,11 +30,6 @@ impl JournalHeader {
 
 /// Журнал полёта: заголовок + события с метками мс, файл yaml-стрима.
 /// Метки — мс от момента создания (ноль шкалы — у производителя событий,
-/// сервиса; журнал метки только хранит). Файл открывается (`open_file`)
-/// только при старте гонки; до старта гонки журнал живёт в памяти, без
-/// гонки файл не создаётся.
-/// Журнал полёта — данные: заголовок + события с метками мс. Метки —
-/// мс от момента создания (ноль шкалы — у производителя событий,
 /// сервиса; журнал метки только хранит). Файлом журнал не владеет:
 /// запись — методы `snapshot`/`append_to`.
 pub struct Journal {
@@ -149,20 +144,6 @@ impl Journal {
             .collect();
         (header, events)
     }
-}
-
-/// Стем файлов записи (видео + журнал) по date_time старта.
-fn file_stem_of(date_time: OffsetDateTime) -> String {
-    use time::macros::format_description;
-    const FMT: &[time::format_description::FormatItem<'static>] =
-        format_description!("[year]-[month]-[day]-[hour]-[minute]-[second].[subsecond digits:3]");
-    date_time.format(&FMT).unwrap_or_else(|e| {
-        log::error!("flight journal: timestamp format failed: {e}");
-        "journal".to_owned()
-    })
-}
-
-impl Journal {
     /// Снапшот журнала в `dir/<stem>.yaml` (стем из date_time): полный
     /// стрим через tmp + rename. Первое создание файла и перезапись
     /// после правок — одна операция. Путь — для последующих append_to.
@@ -199,6 +180,18 @@ impl Journal {
             }
         }
     }
+}
+
+
+/// Стем файлов записи (видео + журнал) по date_time старта.
+fn file_stem_of(date_time: OffsetDateTime) -> String {
+    use time::macros::format_description;
+    const FMT: &[time::format_description::FormatItem<'static>] =
+        format_description!("[year]-[month]-[day]-[hour]-[minute]-[second].[subsecond digits:3]");
+    date_time.format(&FMT).unwrap_or_else(|e| {
+        log::error!("flight journal: timestamp format failed: {e}");
+        "journal".to_owned()
+    })
 }
 
 /// Полный контент во временный файл `<stem>.yaml~` рядом, затем

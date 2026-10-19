@@ -47,7 +47,7 @@ pub enum FrameError {
 /// приведённую к Instant.
 #[derive(Debug)]
 pub struct Frame {
-    pub timestamp: Instant,
+    pub at: Instant,
     pub data: FrameData,
 }
 

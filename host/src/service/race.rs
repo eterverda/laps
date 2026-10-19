@@ -68,11 +68,9 @@ pub enum RaceStage {
     /// REC включена, гонка не началась (первая запись — ядро рождается
     /// первым намерением сразу в этой фазе или в Countdown).
     Before,
-    Countdown {
-        start: Instant,
+    Countdown { start_at: Instant,
     },
-    Running {
-        start: Instant,
+    Running { start_at: Instant,
     },
     After {
         race: Duration,
@@ -99,7 +97,7 @@ impl RaceStage {
     pub fn race_elapsed(&self, now: Instant) -> Duration {
         match *self {
             RaceStage::After { race } => race,
-            RaceStage::Running { start } => now.saturating_duration_since(start),
+            RaceStage::Running { start_at } => now.saturating_duration_since(start_at),
             _ => Duration::ZERO,
         }
     }
@@ -168,8 +166,7 @@ impl RaceCore {
     pub fn initial_mode(first: Intent, now: Instant, rules: &RaceRules) -> RaceStage {
         match first {
             Intent::RecPressed => RaceStage::Before,
-            Intent::RacePressed => RaceStage::Countdown {
-                start: race_time_start(
+            Intent::RacePressed => RaceStage::Countdown { start_at: race_time_start(
                     now,
                     Duration::from_secs(PRE_BEEP_SECS)
                         + sample_start_delay(&rules.start_signal_delay),
@@ -247,8 +244,8 @@ impl RaceCore {
     /// Ближайший таймер ядра: конец отсчёта или лимит гонки.
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
-            RaceStage::Countdown { start } => Some(start),
-            RaceStage::Running { start } => self.rules.duration.map(|d| start + d),
+            RaceStage::Countdown { start_at } => Some(start_at),
+            RaceStage::Running { start_at } => self.rules.duration.map(|d| start_at + d),
             _ => None,
         }
     }
@@ -256,19 +253,19 @@ impl RaceCore {
     /// Перевод часов: конец отсчёта — в Running, лимит — в After.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
-            RaceStage::Countdown { start } if now >= start => {
+            RaceStage::Countdown { start_at } if now >= start_at => {
                 // Журнал появляется только если гонка состоялась:
                 // отложенная голова уходит в память, файл создаёт
                 // писатель (поток-обёртка) снапшотом на этом же тике.
                 self.flush_rec_deferred();
                 self.journal
-                    .push(self.ms(start), JournalRecord::RaceStarted {});
-                self.phase = RaceStage::Running { start };
+                    .push(self.ms(start_at), JournalRecord::RaceStarted {});
+                self.phase = RaceStage::Running { start_at };
                 self.raced = true;
                 Vec::new()
             }
-            RaceStage::Running { start } => {
-                let elapsed = now.saturating_duration_since(start);
+            RaceStage::Running { start_at } => {
+                let elapsed = now.saturating_duration_since(start_at);
                 if self.rules.duration.is_some_and(|limit| elapsed >= limit) {
                     self.journal.push(
                         self.ms(now),
@@ -321,8 +318,7 @@ impl RaceCore {
                 // Запись уже идёт (new = REC-on): отсчёт к ней.
                 let delay = self.countdown_delay();
                 self.defer_countdown(now);
-                self.phase = RaceStage::Countdown {
-                    start: race_time_start(now, delay, self.buzzer_len),
+                self.phase = RaceStage::Countdown { start_at: race_time_start(now, delay, self.buzzer_len),
                 };
                 vec![Effect::Countdown { delay }]
             }
@@ -333,9 +329,9 @@ impl RaceCore {
                 self.phase = RaceStage::Before;
                 vec![Effect::CancelAudio]
             }
-            RaceStage::Running { start } => {
+            RaceStage::Running { start_at } => {
                 // Финиш кнопкой — гудок, запись хвоста продолжается.
-                let race = now.saturating_duration_since(start);
+                let race = now.saturating_duration_since(start_at);
                 self.journal.push(
                     self.ms(now),
                     JournalRecord::RaceFinished { prematurely: true },

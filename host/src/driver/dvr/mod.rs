@@ -25,15 +25,18 @@ use mkv::MkvWriter;
 use mp4::IsobmffWriter;
 
 use crate::config::camera::ContainerConfig;
+use std::fs;
+use std::io::Error as IoError;
+use std::io::ErrorKind as IoErrorKind;
+use std::io::Result as IoResult;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::path::Path;
-use std::fs;
 use std::thread;
-use std::io::Result as IoResult;
-use std::io::Error as IoError;
-use std::io::ErrorKind as IoErrorKind;
+
+/// Каталог записей по умолчанию, относительно рабочей директории.
+pub const CAPTURES_DIR: &str = "captures";
 
 /// Состояние записи: жизненный цикл writer-потока.
 /// Idle → Preparing (файл создан) → Writing (первый кадр был — метка
@@ -101,23 +104,6 @@ pub trait VideoReader: Send {
     fn read_frame_into(&mut self, i: usize, buf: &mut [u8]) -> IoResult<(u64, usize)>;
 }
 
-/// Открыть читалку по расширению файла.
-pub fn open_reader(path: &Path) -> IoResult<Box<dyn VideoReader>> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("mkv") => Ok(Box::new(mkv::MkvReader::open(path)?)),
-        // MP4 и MOV читаются одним ридером ISOBMFF (бренды ftyp для
-        // чтения не важны).
-        Some("mp4") | Some("mov") => Ok(Box::new(mp4::IsobmffReader::open(path)?)),
-        other => Err(IoError::new(
-            IoErrorKind::InvalidInput,
-            format!("unsupported recording format: {other:?}"),
-        )),
-    }
-}
-
-/// Каталог записей по умолчанию, относительно рабочей директории.
-pub const CAPTURES_DIR: &str = "captures";
-
 /// Параметры записи одной камеры.
 #[derive(Debug, Clone)]
 pub struct RecordParams {
@@ -177,8 +163,7 @@ impl Record {
         };
         state.store(RecordState::Preparing);
         let writer_path = path.clone();
-        let (sender, receiver) =
-            crossbeam_channel::bounded::<(Arc<Frame>, u64)>(CHANNEL_CAP);
+        let (sender, receiver) = crossbeam_channel::bounded::<(Arc<Frame>, u64)>(CHANNEL_CAP);
         let state_clone = state.clone();
         let dropped = Arc::new(AtomicU64::new(0));
         let abort = Arc::new(AtomicBool::new(false));
@@ -203,7 +188,7 @@ impl Record {
                 // для журнала и UI (таймстемп кадра, не момент приёма).
                 if matches!(state_clone.load(), RecordState::Preparing) {
                     state_clone.store(RecordState::Writing {
-                        first_frame_at: frame.timestamp,
+                        first_frame_at: frame.at,
                         fps: 0.0,
                     });
                 }
@@ -327,8 +312,7 @@ impl Record {
         }
         if let Some(sender) = &self.sender {
             if sender.try_send((frame, ts)).is_err() {
-                self.dropped
-                    .fetch_add(1, Ordering::Relaxed);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
                 log::warn!("dvr: frame dropped (writer busy)");
             }
         }
@@ -350,6 +334,20 @@ pub fn epoch_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Открыть читалку по расширению файла.
+pub fn open_reader(path: &Path) -> IoResult<Box<dyn VideoReader>> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mkv") => Ok(Box::new(mkv::MkvReader::open(path)?)),
+        // MP4 и MOV читаются одним ридером ISOBMFF (бренды ftyp для
+        // чтения не важны).
+        Some("mp4") | Some("mov") => Ok(Box::new(mp4::IsobmffReader::open(path)?)),
+        other => Err(IoError::new(
+            IoErrorKind::InvalidInput,
+            format!("unsupported recording format: {other:?}"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -394,7 +392,7 @@ mod tests {
                 let pixels = vec![egui::Color32::BLACK; 64 * 48];
                 recorder.push(
                     Arc::new(Frame {
-                        timestamp: Instant::now(),
+                        at: Instant::now(),
                         data: FrameData::Rgba {
                             rgba: egui::ColorImage::new([64, 48], pixels),
                         },
@@ -446,10 +444,7 @@ mod tests {
         use crate::driver::dvr::encode;
 
         for container in [ContainerConfig::Mp4, ContainerConfig::Mov] {
-            let dir = temp_dir().join(format!(
-                "laps-dvr-test-{}-{container:?}",
-                process::id()
-            ));
+            let dir = temp_dir().join(format!("laps-dvr-test-{}-{container:?}", process::id()));
             fs::create_dir_all(&dir).unwrap();
             let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
             let mut camera = CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg);
@@ -485,7 +480,7 @@ mod tests {
                     let jpeg = &jpegs[i as usize % 2];
                     recorder.push(
                         Arc::new(Frame {
-                            timestamp: Instant::now(),
+                            at: Instant::now(),
                             data: FrameData::Jpeg {
                                 buf: jpeg.clone(),
                                 len: Some(jpeg.len()),
@@ -497,8 +492,7 @@ mod tests {
             } // drop: writer финализирует в фоне
 
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !matches!(state.load(), RecordState::Done) && Instant::now() < deadline
-            {
+            while !matches!(state.load(), RecordState::Done) && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(50));
             }
             assert_eq!(state.load(), RecordState::Done);
@@ -565,7 +559,7 @@ mod tests {
             let jpeg = encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
             recorder.push(
                 Arc::new(Frame {
-                    timestamp: Instant::now(),
+                    at: Instant::now(),
                     data: FrameData::Jpeg {
                         buf: jpeg.clone(),
                         len: Some(jpeg.len()),

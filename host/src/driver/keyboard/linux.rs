@@ -29,97 +29,11 @@ use std::io::ErrorKind as IoErrorKind;
 // is tied to the fd — closing it (thread end, process death) releases.
 nix::ioctl_write_int!(eviocgrab, b'E', 0x90);
 
-/// Probe the node: open read, then write (no create/truncate), close
-/// immediately. Returns (listenable, grabbable). EVIOCGRAB is never
-/// issued.
-pub fn probe(node: &Path) -> (bool, bool) {
-    let listenable = fs::OpenOptions::new().read(true).open(node).is_ok();
-    let grabbable = fs::OpenOptions::new().write(true).open(node).is_ok();
-    (listenable, grabbable)
-}
-
-/// sysfs id/bustype value of the serio bus (built-in AT keyboard).
-const BUS_SERIO: u16 = 0x0011;
-
-/// Show decision for an event node: a qualifying `-event-kbd` by-id
-/// symlink (HID Keyboard collection, `if01`-less) is sufficient on its
-/// own — this is what lets USB pedals/macro pads in and keeps mice and
-/// touchpads (mouse collections or no by-id) out. The fallback is the
-/// serio path: the built-in AT keyboard has no by-id but keycodes in
-/// the keyboard range.
-fn is_keyboard_node(has_kbd_by_id: bool, bustype: u16, keyboard_keys: bool) -> bool {
-    has_kbd_by_id || (bustype == BUS_SERIO && keyboard_keys)
-}
-
-/// Event node names (`eventN`) that have at least one by-id symlink
-/// ending in `-event-kbd` without `if01`. Missing by-id dir means an
-/// empty set (the serio fallback still covers the AT keyboard).
-fn kbd_nodes_by_id() -> HashSet<String> {
-    let mut nodes = HashSet::new();
-    let Ok(entries) = fs::read_dir("/dev/input/by-id") else {
-        return nodes;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(link) = name.to_str() else { continue };
-        if !link.ends_with("-event-kbd") || link.contains("if01") {
-            continue;
-        }
-        if let Ok(target) = fs::read_link(entry.path()) {
-            if let Some(node) = target.file_name().and_then(|n| n.to_str()) {
-                nodes.insert(node.to_owned());
-            }
-        }
-    }
-    nodes
-}
-
-/// sysfs capabilities/key is a hex bitmask, one u64 word (kernel
-/// unsigned long) per 64 keycodes, least significant bit first. A
-/// device counts as a keyboard if any bit in the keyboard keycode range
-/// 1..=0xE7 (KEY_ESC..=KEY_MICMUTE) is set; keycode 0 (KEY_RESERVED)
-/// does not count.
-fn has_keyboard_keys(caps: &str) -> bool {
-    caps.split_whitespace().enumerate().any(|(word, hex)| {
-        let bits = u64::from_str_radix(hex, 16).unwrap_or(0);
-        (0..64).any(|bit| {
-            bits & (1 << bit) != 0 && {
-                let code = word * 64 + bit;
-                (1..=0xE7).contains(&code)
-            }
-        })
-    })
-}
-
-/// Deterministic listing order: vid, pid, serial, name. Two keyboards
-/// equal in all four are indistinguishable — no further ordering.
-fn sort_key(k: &KeyboardInfo) -> (u16, u16, &Option<String>, &String) {
-    (k.vid, k.pid, &k.serial, &k.name)
-}
-
 /// A discovered keyboard plus its evdev node path. `KeyboardInfo` is
 /// platform-neutral and deliberately carries no path; attach needs it.
 struct Device {
     info: KeyboardInfo,
     node: PathBuf,
-}
-
-/// Enumerate keyboard devices (info + node path), sorted by `sort_key`.
-fn scan_devices() -> IoResult<Vec<Device>> {
-    let mut devices = Vec::new();
-    let kbd_by_id = kbd_nodes_by_id();
-    for entry in fs::read_dir("/dev/input")? {
-        let Ok(entry) = entry else { continue };
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let sys = Path::new("/sys/class/input").join(&name).join("device");
-        if let Some(device) = read_device(&sys, entry.path(), kbd_by_id.contains(&name)) {
-            devices.push(device);
-        }
-    }
-    devices.sort_by(|a, b| sort_key(&a.info).cmp(&sort_key(&b.info)));
-    Ok(devices)
 }
 
 /// Enumerate keyboards: event nodes in /dev/input passing
@@ -561,6 +475,92 @@ fn decode(buf: &[u8], tracker: &mut ModifierTracker, keyboard_id: &str) -> Vec<K
         });
     }
     events
+}
+
+/// Probe the node: open read, then write (no create/truncate), close
+/// immediately. Returns (listenable, grabbable). EVIOCGRAB is never
+/// issued.
+pub fn probe(node: &Path) -> (bool, bool) {
+    let listenable = fs::OpenOptions::new().read(true).open(node).is_ok();
+    let grabbable = fs::OpenOptions::new().write(true).open(node).is_ok();
+    (listenable, grabbable)
+}
+
+/// sysfs id/bustype value of the serio bus (built-in AT keyboard).
+const BUS_SERIO: u16 = 0x0011;
+
+/// Show decision for an event node: a qualifying `-event-kbd` by-id
+/// symlink (HID Keyboard collection, `if01`-less) is sufficient on its
+/// own — this is what lets USB pedals/macro pads in and keeps mice and
+/// touchpads (mouse collections or no by-id) out. The fallback is the
+/// serio path: the built-in AT keyboard has no by-id but keycodes in
+/// the keyboard range.
+fn is_keyboard_node(has_kbd_by_id: bool, bustype: u16, keyboard_keys: bool) -> bool {
+    has_kbd_by_id || (bustype == BUS_SERIO && keyboard_keys)
+}
+
+/// Event node names (`eventN`) that have at least one by-id symlink
+/// ending in `-event-kbd` without `if01`. Missing by-id dir means an
+/// empty set (the serio fallback still covers the AT keyboard).
+fn kbd_nodes_by_id() -> HashSet<String> {
+    let mut nodes = HashSet::new();
+    let Ok(entries) = fs::read_dir("/dev/input/by-id") else {
+        return nodes;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(link) = name.to_str() else { continue };
+        if !link.ends_with("-event-kbd") || link.contains("if01") {
+            continue;
+        }
+        if let Ok(target) = fs::read_link(entry.path()) {
+            if let Some(node) = target.file_name().and_then(|n| n.to_str()) {
+                nodes.insert(node.to_owned());
+            }
+        }
+    }
+    nodes
+}
+
+/// sysfs capabilities/key is a hex bitmask, one u64 word (kernel
+/// unsigned long) per 64 keycodes, least significant bit first. A
+/// device counts as a keyboard if any bit in the keyboard keycode range
+/// 1..=0xE7 (KEY_ESC..=KEY_MICMUTE) is set; keycode 0 (KEY_RESERVED)
+/// does not count.
+fn has_keyboard_keys(caps: &str) -> bool {
+    caps.split_whitespace().enumerate().any(|(word, hex)| {
+        let bits = u64::from_str_radix(hex, 16).unwrap_or(0);
+        (0..64).any(|bit| {
+            bits & (1 << bit) != 0 && {
+                let code = word * 64 + bit;
+                (1..=0xE7).contains(&code)
+            }
+        })
+    })
+}
+
+/// Deterministic listing order: vid, pid, serial, name. Two keyboards
+/// equal in all four are indistinguishable — no further ordering.
+fn sort_key(k: &KeyboardInfo) -> (u16, u16, &Option<String>, &String) {
+    (k.vid, k.pid, &k.serial, &k.name)
+}
+
+/// Enumerate keyboard devices (info + node path), sorted by `sort_key`.
+fn scan_devices() -> IoResult<Vec<Device>> {
+    let mut devices = Vec::new();
+    let kbd_by_id = kbd_nodes_by_id();
+    for entry in fs::read_dir("/dev/input")? {
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let sys = Path::new("/sys/class/input").join(&name).join("device");
+        if let Some(device) = read_device(&sys, entry.path(), kbd_by_id.contains(&name)) {
+            devices.push(device);
+        }
+    }
+    devices.sort_by(|a, b| sort_key(&a.info).cmp(&sort_key(&b.info)));
+    Ok(devices)
 }
 
 #[cfg(test)]

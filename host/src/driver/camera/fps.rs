@@ -105,7 +105,7 @@ impl FrameStats {
 
     /// Задержка от таймстемпа кадра до заданного момента (для тестов).
     pub fn on_frame_at(&mut self, frame: &Frame, now: Instant) {
-        self.on_process(now.saturating_duration_since(frame.timestamp));
+        self.on_process(now.saturating_duration_since(frame.at));
     }
 
     /// Длительность фазы обработки (декод/перекод) — НЕ латентность
@@ -255,7 +255,7 @@ mod tests {
         /// Кадр с заданным таймстемпом (контент для статистики не важен).
         fn frame_at(ts: Instant) -> Frame {
             Frame {
-                timestamp: ts,
+                at: ts,
                 data: FrameData::Rgba {
                     rgba: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
                 },

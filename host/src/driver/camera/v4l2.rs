@@ -720,7 +720,7 @@ fn open_session(path: &str, config: &CameraConfig) -> IoResult<V4l2Session> {
                     if valid {
                         pending =
                             extract_frame(&buffers, index, used, config.format).map(|data| Frame {
-                                timestamp: Instant::now(),
+                                at: Instant::now(),
                                 data,
                             });
                     } else {
@@ -818,7 +818,7 @@ impl CaptureSession for V4l2Session {
         unsafe { qbuf(self.fd, &mut buf) }
             .map_err(|e| FrameError::Recoverable(IoError::from(e).to_string()))?;
         Ok(Frame {
-            timestamp: buffer_timestamp(&buf, &self.mono_anchor),
+            at: buffer_timestamp(&buf, &self.mono_anchor),
             data,
         })
     }

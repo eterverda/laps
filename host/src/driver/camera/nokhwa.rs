@@ -15,24 +15,9 @@ use crate::driver::camera::capture::{
 };
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
-use std::io;
 use std::io::Error as IoError;
 use std::mem;
 use std::time::Instant;
-
-/// Map nokhwa's error onto CaptureError: open/stream failures are io,
-/// property (negotiation) rejections are Unsupported; everything else
-/// is passed through unaltered under Backend.
-fn capture_err(e: NokhwaError) -> Error {
-    use nokhwa::NokhwaError as E;
-    match e {
-        E::OpenDeviceError(_, msg) | E::OpenStreamError(msg) => Error::Io(IoError::other(msg)),
-        E::GetPropertyError { error, .. } | E::SetPropertyError { error, .. } => {
-            Error::Config(format!("unsupported: {error}"))
-        }
-        other => Error::Other(Box::new(other)),
-    }
-}
 
 pub struct NokhwaCapture;
 
@@ -227,6 +212,20 @@ fn list_formats_for_index(index: &CameraIndex) -> std::result::Result<Vec<Camera
     };
     sort_and_dedup(&mut formats);
     Ok(formats)
+}
+
+/// Map nokhwa's error onto CaptureError: open/stream failures are io,
+/// property (negotiation) rejections are Unsupported; everything else
+/// is passed through unaltered under Backend.
+fn capture_err(e: NokhwaError) -> Error {
+    use nokhwa::NokhwaError as E;
+    match e {
+        E::OpenDeviceError(_, msg) | E::OpenStreamError(msg) => Error::Io(IoError::other(msg)),
+        E::GetPropertyError { error, .. } | E::SetPropertyError { error, .. } => {
+            Error::Config(format!("unsupported: {error}"))
+        }
+        other => Error::Other(Box::new(other)),
+    }
 }
 
 #[cfg(test)]

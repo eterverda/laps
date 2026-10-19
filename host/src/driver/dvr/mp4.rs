@@ -17,9 +17,9 @@ use std::path::Path;
 
 use super::{VideoReader, VideoWriter};
 use crate::config::camera::ResolutionConfig;
-use std::io::Result as IoResult;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
+use std::io::Result as IoResult;
 
 /// Таймлайн в миллисекундах: дельты таймкодов пишем без округления.
 const TIMESCALE: u32 = 1000;
@@ -28,32 +28,6 @@ const BRAND_ISOM: [u8; 4] = *b"isom";
 const BRAND_ISO2: [u8; 4] = *b"iso2";
 const BRAND_MP41: [u8; 4] = *b"mp41";
 const BRAND_QT: [u8; 4] = *b"qt  ";
-
-// --- Бинарные примитивы ------------------------------------------------------
-
-fn be32(v: u32) -> [u8; 4] {
-    v.to_be_bytes()
-}
-
-fn be16(v: u16) -> [u8; 2] {
-    v.to_be_bytes()
-}
-
-/// Бокс: 32-битный size + тип + payload. Боксов больше 4 ГиБ у нас нет:
-/// mdat пишется largesize, moov — килобайты.
-fn push_box(out: &mut Vec<u8>, typ: &[u8; 4], payload: &[u8]) {
-    out.extend_from_slice(&be32(payload.len() as u32 + 8));
-    out.extend_from_slice(typ);
-    out.extend_from_slice(payload);
-}
-
-/// Новый payload FullBox с заданными version/flags.
-fn fullbox(version: u8, flags: u32) -> Vec<u8> {
-    let mut p = Vec::new();
-    p.push(version);
-    p.extend_from_slice(&flags.to_be_bytes()[1..]);
-    p
-}
 
 /// Единичная матрица трансформации трека (16.16 / 2.30 fixed point).
 const MATRIX: [u32; 9] = [
@@ -675,10 +649,7 @@ fn child_boxes(buf: &[u8]) -> IoResult<Vec<([u8; 4], usize, usize)>> {
     Ok(out)
 }
 
-fn find_box(
-    boxes: &[([u8; 4], usize, usize)],
-    typ: &[u8; 4],
-) -> IoResult<([u8; 4], usize, usize)> {
+fn find_box(boxes: &[([u8; 4], usize, usize)], typ: &[u8; 4]) -> IoResult<([u8; 4], usize, usize)> {
     boxes
         .iter()
         .find(|b| &b.0 == typ)
@@ -702,6 +673,31 @@ fn ru64(buf: &[u8], at: usize) -> IoResult<u64> {
 
 fn ru16(buf: &[u8], at: usize) -> IoResult<u16> {
     Ok(u16::from_be_bytes(slice(buf, at, 2)?.try_into().unwrap()))
+}
+
+// --- ISOBMFF-примитивы (связаны с IsobmffWriter) ---
+fn be32(v: u32) -> [u8; 4] {
+    v.to_be_bytes()
+}
+
+fn be16(v: u16) -> [u8; 2] {
+    v.to_be_bytes()
+}
+
+/// Бокс: 32-битный size + тип + payload. Боксов больше 4 ГиБ у нас нет:
+/// mdat пишется largesize, moov — килобайты.
+fn push_box(out: &mut Vec<u8>, typ: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(&be32(payload.len() as u32 + 8));
+    out.extend_from_slice(typ);
+    out.extend_from_slice(payload);
+}
+
+/// Новый payload FullBox с заданными version/flags.
+fn fullbox(version: u8, flags: u32) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.push(version);
+    p.extend_from_slice(&flags.to_be_bytes()[1..]);
+    p
 }
 
 /// Мини-парсер боксов для тестов семейства (mp4.rs, mov.rs).
@@ -775,7 +771,6 @@ mod tests {
     use std::iter::repeat_n;
     use std::path::PathBuf;
     use std::process;
-
 
     fn test_path(name: &str) -> PathBuf {
         temp_dir().join(format!("laps-mp4-test-{}-{name}.mp4", process::id()))
@@ -1073,8 +1068,7 @@ mod tests {
 
     #[test]
     fn test_reader_roundtrip_mov() {
-        let path =
-            temp_dir().join(format!("laps-mov-test-{}-reader.mov", process::id()));
+        let path = temp_dir().join(format!("laps-mov-test-{}-reader.mov", process::id()));
         let rel = [0u64, 40, 80];
         let frames = fake_frames(rel.len());
         let writer = Box::new(

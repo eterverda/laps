@@ -4,8 +4,8 @@
 //! который создаёт DvrSink и дёргает start/stop по командам UI.
 
 use super::{Record, RecordParams, RecordState, SharedRecordState, epoch_millis};
-use crate::driver::camera::capture::{CaptureFormat, Frame};
 use crate::config::camera::FrameRateConfig;
+use crate::driver::camera::capture::{CaptureFormat, Frame};
 use crate::driver::camera::capture::{FrameData, FrameSink};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,27 +20,6 @@ use std::time::{Duration, Instant};
 /// так, чтобы при ровном 60 fps источника записывался примерно каждый
 /// второй кадр, то есть ~30 fps, не боясь пограничного джиттера.
 const RECORD_THROTTLE_MIN_INTERVAL: Duration = Duration::from_millis(25);
-
-/// Возвращает true, если кадр нужно отправить в DVR. Для эффективного
-/// fps записи ≤ 30 дропаем кадры, пришедшие раньше 25 мс после последнего
-/// записанного; при fps > 30 каждый кадр проходит. Сравниваются ДЕЛЬТЫ
-/// таймстемпов кадров (не Instant::now()): сегодня штампы — время прихода
-/// (nokhwa), бэкенды с device time (V4L2) автоматически дадут пейсинг по
-/// сетке устройства, без пакетной выдачи буферов в решениях.
-fn should_record_frame(
-    fps: FrameRateConfig,
-    frame_ts: Instant,
-    next_eligible: &mut Instant,
-) -> bool {
-    if fps.0 > 30 {
-        return true;
-    }
-    if frame_ts < *next_eligible {
-        return false;
-    }
-    *next_eligible = frame_ts + RECORD_THROTTLE_MIN_INTERVAL;
-    true
-}
 
 /// Держит Record, троттлит избыточный поток (HARD HACK выше),
 /// конвертирует Instant→epoch millis якорем. Record живёт независимо от
@@ -60,11 +39,7 @@ pub struct DvrSink {
 }
 
 impl DvrSink {
-    pub fn new(
-        fps: FrameRateConfig,
-        negotiated: CaptureFormat,
-        state: SharedRecordState,
-    ) -> Self {
+    pub fn new(fps: FrameRateConfig, negotiated: CaptureFormat, state: SharedRecordState) -> Self {
         Self {
             recorder: None,
             fps,
@@ -117,10 +92,10 @@ impl FrameSink for DvrSink {
         let Some(recorder) = &self.recorder else {
             return;
         };
-        if !should_record_frame(self.fps, frame.timestamp, &mut self.next_eligible) {
+        if !should_record_frame(self.fps, frame.at, &mut self.next_eligible) {
             return;
         }
-        let ts = self.epoch_millis(frame.timestamp);
+        let ts = self.epoch_millis(frame.at);
         match &frame.data {
             // Известные к записи варианты; буфер не копируется (P4).
             FrameData::Jpeg { .. } | FrameData::Rgba { .. } => recorder.push(frame, ts),
@@ -133,4 +108,25 @@ impl FrameSink for DvrSink {
     fn on_stop(&mut self) {
         self.stop();
     }
+}
+
+/// Возвращает true, если кадр нужно отправить в DVR. Для эффективного
+/// fps записи ≤ 30 дропаем кадры, пришедшие раньше 25 мс после последнего
+/// записанного; при fps > 30 каждый кадр проходит. Сравниваются ДЕЛЬТЫ
+/// таймстемпов кадров (не Instant::now()): сегодня штампы — время прихода
+/// (nokhwa), бэкенды с device time (V4L2) автоматически дадут пейсинг по
+/// сетке устройства, без пакетной выдачи буферов в решениях.
+fn should_record_frame(
+    fps: FrameRateConfig,
+    frame_ts: Instant,
+    next_eligible: &mut Instant,
+) -> bool {
+    if fps.0 > 30 {
+        return true;
+    }
+    if frame_ts < *next_eligible {
+        return false;
+    }
+    *next_eligible = frame_ts + RECORD_THROTTLE_MIN_INTERVAL;
+    true
 }

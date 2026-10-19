@@ -112,10 +112,10 @@ pub const CAPTURES_DIR: &str = "captures";
 pub struct RecordParams {
     pub dir: PathBuf,
     /// Стем имени файла целиком (журнал полёта + camera_id + порядковый
-    /// номер сессии записи) — Recorder добавляет только `-mjpeg.<ext>`.
+    /// номер сессии записи) — Record добавляет только `-mjpeg.<ext>`.
     pub stem: String,
     /// Справочно: для логов и отчёта. Размеры для записи авторитетны
-    /// из согласованного формата, см. Recorder::start.
+    /// из согласованного формата, см. Record::start.
     pub camera: crate::config::camera::CameraConfig,
 }
 
@@ -128,7 +128,7 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// writer финализирует файл в фоне (джойна намеренно нет — fsync
 /// многогигабайтного файла дохлый для UI, устройство камеры writer
 /// не держит, detach безопасен).
-pub struct Recorder {
+pub struct Record {
     state: SharedRecordState,
     sender: Option<
         crossbeam_channel::Sender<(std::sync::Arc<crate::driver::camera::capture::Frame>, u64)>,
@@ -142,7 +142,7 @@ pub struct Recorder {
     abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-impl Recorder {
+impl Record {
     pub fn start(
         params: &RecordParams,
         negotiated: &crate::driver::camera::capture::CaptureFormat,
@@ -328,7 +328,7 @@ impl Recorder {
     }
 }
 
-impl Drop for Recorder {
+impl Drop for Record {
     fn drop(&mut self) {
         self.sender.take(); // разрыв канала → writer finalize'ит файл
         // Джойн намеренно отсутствует: finalize + sync_all идут в фоне,
@@ -351,7 +351,7 @@ mod tests {
     /// умолчанию (MKV); REC гаснет по выходу writer-потока.
     #[test]
     fn yuyv_reencode_records_to_container() {
-        use super::{RecordState, SharedRecordState, RecordParams, Recorder, epoch_millis};
+        use super::{RecordState, SharedRecordState, RecordParams, Record, epoch_millis};
         use crate::config::camera::{CameraConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -373,7 +373,7 @@ mod tests {
             format: PixelConfig::Yuyv,
         };
         {
-            let recorder = Recorder::start(&params, &negotiated, &state).unwrap();
+            let recorder = Record::start(&params, &negotiated, &state).unwrap();
             for _ in 0..3 {
                 let pixels = vec![egui::Color32::BLACK; 64 * 48];
                 recorder.push(
@@ -417,12 +417,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Recorder → mp4/mov → open_reader: контейнеры семейства ISOBMFF
+    /// Record → mp4/mov → open_reader: контейнеры семейства ISOBMFF
     /// читаются обратно (индекс, кадры побайтово, таймкоды). Кадры —
     /// настоящие JPEG (как из MJPEG-потока), чтобы путь был полным.
     #[test]
     fn records_isobmff_and_reads_back() {
-        use super::{RecordState, SharedRecordState, open_reader, RecordParams, Recorder, epoch_millis};
+        use super::{RecordState, SharedRecordState, open_reader, RecordParams, Record, epoch_millis};
         use crate::config::camera::{CameraConfig, ContainerConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -462,7 +462,7 @@ mod tests {
             }
             let base = 8_000_000u64;
             {
-                let recorder = Recorder::start(&params, &negotiated, &state).unwrap();
+                let recorder = Record::start(&params, &negotiated, &state).unwrap();
                 for i in 0..6u64 {
                     let jpeg = &jpegs[i as usize % 2];
                     recorder.push(
@@ -514,7 +514,7 @@ mod tests {
     /// Abort: файл финализируется и удаляется (запись вне гонки).
     #[test]
     fn abort_recording_deletes_file() {
-        use super::{RecordState, SharedRecordState, RecordParams, Recorder, epoch_millis};
+        use super::{RecordState, SharedRecordState, RecordParams, Record, epoch_millis};
         use crate::config::camera::{CameraConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -538,7 +538,7 @@ mod tests {
         // Стем полный (camera_id уже в нём — см. RecordParams).
         let path = dir.join("abort-stem-mjpeg.mkv");
         {
-            let recorder = Recorder::start(&params, &negotiated, &state).unwrap();
+            let recorder = Record::start(&params, &negotiated, &state).unwrap();
             let rgba: Vec<u8> =
                 egui::ColorImage::new([64, 48], vec![egui::Color32::BLACK; 64 * 48])
                     .pixels

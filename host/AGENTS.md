@@ -166,7 +166,7 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
   - `VideoWriter` trait in `dvr/mod.rs` (`write_frame` / `sync_data` /
     `finalize(self: Box<Self>)`) — implemented by both writers; `create`
     stays inherent per writer, selection is a `match` on
-    `ContainerConfig` in `Recorder::start` (mkv → MkvWriter, mov/mp4 →
+    `ContainerConfig` in `Record::start` (mkv → MkvWriter, mov/mp4 →
     IsobmffWriter::create_mov/create_mp4)
 - One file per recording start; **no segment rotation** (documented gap)
 - Стем имён файлов — `date_time` первого события журнала (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
@@ -191,11 +191,11 @@ first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
   молча снимаются при коммите (GUI рисует Error для камер без
   VideoAttached)
 - Writer thread + bounded channel (64): overflow = dropped frame + warn
-- Abort записи: `Recorder::abort()` (команда `Camera::abort_recording`, sink `DvrSink::abort()`) ставит флаг; writer после finalize **удаляет файл** (`RecordParams.stem` — полный стем с camera_id и номером сессии). Flight: `stop_recording_all(commit)`, commit = `race_started()` — записи вне гонки удаляются, гоночные остаются
+- Abort записи: `Record::abort()` (команда `Camera::abort_recording`, sink `DvrSink::abort()`) ставит флаг; writer после finalize **удаляет файл** (`RecordParams.stem` — полный стем с camera_id и номером сессии). Flight: `stop_recording_all(commit)`, commit = `race_started()` — записи вне гонки удаляются, гоночные остаются
   (capture outranks recording); periodic sync every 5 s; `Drop` detaches
   the thread intentionally (finalize+sync_all in background, no join —
-  don't "fix" without reading the comment in `Recorder::drop`)
-- File created in `Recorder::start` on the caller's thread, so disk errors
+  don't "fix" without reading the comment in `Record::drop`)
+- File created in `Record::start` on the caller's thread, so disk errors
   reach the UI; unrecoverable write errors move `RecordState` to
   `Failed` and the UI shows REC error
 - Timestamp prefix for file names: `time` crate,

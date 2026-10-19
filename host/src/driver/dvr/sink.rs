@@ -1,9 +1,9 @@
-//! DVR-sink: реализация `FrameSink` над Recorder. Контракт `FrameSink`
+//! DVR-sink: реализация `FrameSink` над Record. Контракт `FrameSink`
 //! живёт в `camera::capture` (трейт), реализация — здесь, в dvr, рядом
-//! с Recorder и политикой троттлинга; композиция — в pipeline camera,
+//! с Record и политикой троттлинга; композиция — в pipeline camera,
 //! который создаёт DvrSink и дёргает start/stop по командам UI.
 
-use super::{RecordParams, Recorder, SharedRecordState, epoch_millis};
+use super::{RecordParams, Record, SharedRecordState, epoch_millis};
 use crate::config::camera::FrameRateConfig;
 use crate::driver::camera::capture::{Frame, FrameData, FrameSink};
 use std::sync::Arc;
@@ -41,11 +41,11 @@ fn should_record_frame(
     true
 }
 
-/// Держит Recorder, троттлит избыточный поток (HARD HACK выше),
-/// конвертирует Instant→epoch millis якорем. Recorder живёт независимо от
+/// Держит Record, троттлит избыточный поток (HARD HACK выше),
+/// конвертирует Instant→epoch millis якорем. Record живёт независимо от
 /// жизни pipeline: drop sink'а отпускает writer в фоновую финализацию.
 pub struct DvrSink {
-    recorder: Option<Recorder>,
+    recorder: Option<Record>,
     /// Эффективный fps записи (dvr.frame-rate, иначе camera.frame-rate).
     fps: FrameRateConfig,
     /// Момент, с которого следующий кадр можно писать (последний
@@ -83,7 +83,7 @@ impl DvrSink {
     pub fn start(&mut self, params: &RecordParams) {
         self.set_fps(FrameRateConfig(params.camera.dvr_frame_rate().0));
         self.next_eligible = Instant::now(); // первый кадр записи проходит всегда
-        match Recorder::start(params, &self.negotiated, &self.state) {
+        match Record::start(params, &self.negotiated, &self.state) {
             Ok(recorder) => self.recorder = Some(recorder),
             Err(e) => {
                 log::error!("dvr: recording unavailable: {}", e);

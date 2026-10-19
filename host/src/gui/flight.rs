@@ -23,7 +23,7 @@ use crate::model::flight::{Journal, RaceClip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::Response;
-use crate::service::race::{self, Intent, Notice, Race};
+use crate::service::race::{Notice, Race, RaceStage};
 use crate::service::transport::{Circle, Transport};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -83,7 +83,7 @@ struct Live {
     /// Гоночный поток: намерения туда, уведомления оттуда.
     race: Race,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
-    state: race::RaceStage,
+    state: RaceStage,
     rules: RaceRules,
     webcams: HashMap<String, Camera>,
     /// Подавление сна: держится ради Drop (inhibit снимается при
@@ -268,8 +268,9 @@ impl Flight {
     }
 
     /// Idle → Live по первому REC/RACE: рождается гоночный поток (ядро
-    /// стартует сразу с этим намерением — born), keepawake.
-    fn enter_live(&mut self, first: Intent) {
+    /// рождается REC'ом; RACE-рождение — намерением сразу после spawn),
+    /// keepawake.
+    fn enter_live(&mut self, ctx: &egui::Context, start_race: bool) {
         if !matches!(self.phase, Mode::Idle(_)) {
             return;
         }
@@ -296,8 +297,12 @@ impl Flight {
             .iter()
             .map(|(id, camera)| (id.clone(), camera.recorder()))
             .collect();
-        let state = race::RaceCore::initial_mode(first, Instant::now(), &self.rules);
-        let race = race::spawn(
+        // Пробуждение GUI по уведомлениям потока: без него state
+        // обновлялся бы только по кадрам камер (мертвый эфир висел бы
+        // в Before до первого repaint).
+        let wake_ctx = ctx.clone();
+        let wake = Arc::new(move || wake_ctx.request_repaint());
+        let race = Race::spawn(
             self.rules,
             PathBuf::from(CAPTURES_DIR),
             self.setup.pads.clone(),
@@ -307,13 +312,17 @@ impl Flight {
             HashMap::new(),
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(HashSet::new())),
-            Arc::new(|| {}),
-            first,
+            wake,
             self.audio.clone(),
         );
+        // Рождение кнопкой RACE: отсчёт стартует сразу (намерение ждёт
+        // поток в очереди на рождение).
+        if start_race {
+            race.race_pressed();
+        }
         self.phase = Mode::Live(Live {
             race,
-            state,
+            state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
             awake,
@@ -403,8 +412,7 @@ impl Flight {
                 .values()
                 .any(|w| w.capture_state() == CaptureState::Live);
             if !streaming
-                && (l.state.countdown_active()
-                    || matches!(l.state, race::RaceStage::Running { .. }))
+                && (l.state.countdown_active() || matches!(l.state, RaceStage::Running { .. }))
             {
                 // Самовзвод перерисовок счётчика гонки — только в живых
                 // фазах без кадров (в DVR кадры гонят перерисовки сами).
@@ -538,7 +546,7 @@ impl Flight {
     ) -> FrameContents {
         let state = l.state;
         let rec_on = state.rec_on();
-        let race_on = state.countdown_active() || matches!(state, race::RaceStage::Running { .. });
+        let race_on = state.countdown_active() || matches!(state, RaceStage::Running { .. });
         let now = Instant::now();
         let pads = Self::prepare_pads(&mut l.webcams, setup, assignments, shown_cameras, alt);
         let fps_lines = if alt {
@@ -551,7 +559,7 @@ impl Flight {
         let duration = l.rules.duration;
         let race_hint = if alt {
             match (state, duration) {
-                (race::RaceStage::Running { start_at }, Some(duration)) => Some(format!(
+                (RaceStage::Running { start_at }, Some(duration)) => Some(format!(
                     "-{}",
                     mmss(duration.saturating_sub(start_at.elapsed()))
                 )),
@@ -564,7 +572,7 @@ impl Flight {
         // Счётчик гонки: мигание последней секунды отсчёта, нули пристыжены.
         let (text, dim) = {
             let blink_off = match state {
-                race::RaceStage::Countdown { start_at } => {
+                RaceStage::Countdown { start_at } => {
                     start_at.saturating_duration_since(now).as_millis() as u64 % 1000 >= 500
                 }
                 _ => false,
@@ -842,7 +850,8 @@ impl Flight {
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
         enum Action {
             Exit,
-            Intent(Intent),
+            Rec,
+            Race,
             None,
         }
         let mut action = Action::None;
@@ -1275,7 +1284,7 @@ impl Flight {
                 );
                 badge(ui, rec_rect, &frame.rec.rec.badge);
                 if rec_response.as_ref().is_some_and(|r| r.clicked()) {
-                    action = Action::Intent(Intent::RecPressed);
+                    action = Action::Rec;
                 }
 
                 let race_response = if frame.rec.race.enabled {
@@ -1297,7 +1306,7 @@ impl Flight {
                 );
                 badge(ui, race_rect, &frame.rec.race.badge);
                 if race_response.as_ref().is_some_and(|r| r.clicked()) {
-                    action = Action::Intent(Intent::RacePressed);
+                    action = Action::Race;
                 }
 
                 // TIMER: в live-фазах — счётчик гонки (цвет с учётом
@@ -1335,17 +1344,24 @@ impl Flight {
                 // Ядро доводит гонку до целостности (финиш/abort),
                 // экран закрываем не дожидаясь.
                 if let Mode::Live(l) = &self.phase {
-                    l.race.intent(Intent::Exit);
+                    l.race.exit();
                 }
                 navigator.goto(menu::Menu::new())
             }
-            Action::Intent(intent) => {
-                // Первое нажатие в Idle рождает поток (ядро — с этим
-                // намерением); в Live уходит в ядро как есть.
+            Action::Rec => {
+                // Первое нажатие в Idle рождает поток; в Live уходит
+                // в ядро как есть.
                 if matches!(self.phase, Mode::Idle(_)) {
-                    self.enter_live(intent);
+                    self.enter_live(ui.ctx(), false);
                 } else if let Mode::Live(l) = &self.phase {
-                    l.race.intent(intent);
+                    l.race.rec_pressed();
+                }
+            }
+            Action::Race => {
+                if matches!(self.phase, Mode::Idle(_)) {
+                    self.enter_live(ui.ctx(), true);
+                } else if let Mode::Live(l) = &self.phase {
+                    l.race.race_pressed();
                 }
             }
             Action::None => {}
@@ -1561,23 +1577,23 @@ impl Flight {
         let head = command.first()?.as_str();
         let ok = |message: String| Some(Response { message, code: 0 });
         match (&head, &mut self.phase) {
-            (&"rec", _) => {
-                if matches!(self.phase, Mode::Idle(_)) {
-                    self.enter_live(Intent::RecPressed);
-                } else if let Mode::Live(l) = &self.phase {
-                    if l.state.rec_available() {
-                        l.race.intent(Intent::RecPressed);
-                    }
+            (&"rec", Mode::Idle(_)) => {
+                self.enter_live(ctx, false);
+                ok(String::new())
+            }
+            (&"rec", Mode::Live(l)) => {
+                if l.state.rec_available() {
+                    l.race.rec_pressed();
                 }
                 ok(String::new())
             }
-            (&"race", _) => {
-                if matches!(self.phase, Mode::Idle(_)) {
-                    self.enter_live(Intent::RacePressed);
-                } else if let Mode::Live(l) = &self.phase {
-                    if l.state.race_available() {
-                        l.race.intent(Intent::RacePressed);
-                    }
+            (&"race", Mode::Idle(_)) => {
+                self.enter_live(ctx, true);
+                ok(String::new())
+            }
+            (&"race", Mode::Live(l)) => {
+                if l.state.race_available() {
+                    l.race.race_pressed();
                 }
                 ok(String::new())
             }
@@ -1589,17 +1605,11 @@ impl Flight {
                 }
                 ok(String::new())
             }
-            (&"play", _) => ok(String::new()),
-            (&"ff", Mode::Review(d)) => {
+            (&"ff" | &"rew", Mode::Review(d)) => {
                 let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
-                let step = SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
+                let dir: i64 = if head == "ff" { 1 } else { -1 };
+                let step = dir * SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
                 Self::seek_by(d, &clip, step);
-                ok(String::new())
-            }
-            (&"rew", Mode::Review(d)) => {
-                let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
-                let step = SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
-                Self::seek_by(d, &clip, -step);
                 ok(String::new())
             }
             (&"seek", Mode::Review(d)) => {
@@ -1609,17 +1619,20 @@ impl Flight {
                 d.transport.seek(ms);
                 ok(String::new())
             }
-            (&"ff" | &"rew" | &"seek", _) => ok(String::new()),
-            (&"exit", _) => {
-                // Ядру — немедленно (инварианты целостности), флаг —
-                // только для навигации (нужен Navigator из update).
-                if let Mode::Live(l) = &self.phase {
-                    l.race.intent(Intent::Exit);
-                }
+            (&"exit", Mode::Live(l)) => {
+                // Ядру — немедленно (инварианты целостности).
+                l.race.exit();
                 self.exit_requested = true;
                 ctx.request_repaint();
                 ok(String::new())
             }
+            (&"exit", Mode::Idle(_) | Mode::Review(_)) => {
+                self.exit_requested = true;
+                ctx.request_repaint();
+                ok(String::new())
+            }
+            // Команда неприменима к фазе — молча принята.
+            (&"rec" | &"race" | &"play" | &"ff" | &"rew" | &"seek", _) => ok(String::new()),
             _ => None,
         }
     }

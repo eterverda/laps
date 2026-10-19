@@ -4,23 +4,23 @@
 //! GUI. Правила гонки (сигнал старта, отсчёт, длительность) — в
 //! `model::rules`. Модуль: `service::race`.
 
-use crossbeam_channel as crossbeam;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::mem;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use crate::config::camera::{CameraConfig, ContainerConfig as CameraConfigContainer};
 use crate::config::setup::PadConfig;
 use crate::driver::audio::{Audio, Sound};
-use crate::driver::dvr::{RecordParams, RecordState};
 use crate::driver::camera::Recorder;
+use crate::driver::dvr::{RecordParams, RecordState};
 use crate::driver::keyboard::KeyEvent;
-use crate::model::flight::{JournalRecord, Journal};
+use crate::model::flight::{Journal, JournalRecord};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
+use crossbeam_channel as crossbeam;
+use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::mem;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Интервал поллинга record_state (first_frame_at) и крышка сна
 /// recv_timeout: события первых кадров заметны не позже этого.
@@ -68,9 +68,11 @@ pub enum RaceStage {
     /// REC включена, гонка не началась (первая запись — ядро рождается
     /// первым намерением сразу в этой фазе или в Countdown).
     Before,
-    Countdown { start_at: Instant,
+    Countdown {
+        start_at: Instant,
     },
-    Running { start_at: Instant,
+    Running {
+        start_at: Instant,
     },
     After {
         race: Duration,
@@ -84,7 +86,10 @@ impl RaceStage {
     pub fn rec_on(&self) -> bool {
         matches!(
             self,
-            RaceStage::Before | RaceStage::Countdown { .. } | RaceStage::Running { .. } | RaceStage::After { .. }
+            RaceStage::Before
+                | RaceStage::Countdown { .. }
+                | RaceStage::Running { .. }
+                | RaceStage::After { .. }
         )
     }
 
@@ -132,7 +137,7 @@ impl RaceStage {
 /// возвращаются эффектами, IO исполняет поток-обёртка. Ядро — единственный
 /// писатель журнала; порядок «журнал раньше уведомления GUI» обеспечивает
 /// обёртка (эффекты применяются после записи в журнал).
-pub struct RaceCore {
+struct RaceCore {
     phase: RaceStage,
     rules: RaceRules,
     journal: Journal,
@@ -161,22 +166,6 @@ pub struct RaceCore {
 }
 
 impl RaceCore {
-    /// Фаза, в которой окажется ядро после new с этим намерением —
-    /// GUI ставит её в Live на кадр рождения, до первого Notice::State.
-    pub fn initial_mode(first: Intent, now: Instant, rules: &RaceRules) -> RaceStage {
-        match first {
-            Intent::RecPressed => RaceStage::Before,
-            Intent::RacePressed => RaceStage::Countdown { start_at: race_time_start(
-                    now,
-                    Duration::from_secs(PRE_BEEP_SECS)
-                        + sample_start_delay(&rules.start_signal_delay),
-                    Sound::BUZZER.duration(),
-                ),
-            },
-            Intent::Exit => RaceStage::Finished,
-        }
-    }
-
     /// Конструктор = REC нажали: ядро рождается с записью (Before) —
     /// журнал, ноль меток, сессии записи и отложенный RecordStarted
     /// стартуют от этого момента (файлы называются временем первой
@@ -281,8 +270,18 @@ impl RaceCore {
         }
     }
 
-    /// Намерение REC (ядро рождено — см. born).
-    pub fn rec_pressed(&mut self, now: Instant) -> Vec<Effect> {
+    /// Намерение → эффекты: единственная точка входа ядра (поток-обёртка
+    /// и тесты). Разбор по вариантам — в приватных обработчиках ниже.
+    pub fn intent(&mut self, intent: Intent, now: Instant) -> Vec<Effect> {
+        match intent {
+            Intent::RecPressed => self.rec_pressed(now),
+            Intent::RacePressed => self.race_pressed(now),
+            Intent::Exit => self.exit(now),
+        }
+    }
+
+    /// Намерение REC (ядро живо).
+    fn rec_pressed(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
             RaceStage::Before | RaceStage::Countdown { .. } => {
                 // REC-off до старта гонки: отмена сессии. Поток увидит
@@ -311,14 +310,15 @@ impl RaceCore {
         }
     }
 
-    /// Намерение RACE (ядро рождено — см. born).
-    pub fn race_pressed(&mut self, now: Instant) -> Vec<Effect> {
+    /// Намерение RACE (ядро живо).
+    fn race_pressed(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
             RaceStage::Before => {
                 // Запись уже идёт (new = REC-on): отсчёт к ней.
                 let delay = self.countdown_delay();
                 self.defer_countdown(now);
-                self.phase = RaceStage::Countdown { start_at: race_time_start(now, delay, self.buzzer_len),
+                self.phase = RaceStage::Countdown {
+                    start_at: race_time_start(now, delay, self.buzzer_len),
                 };
                 vec![Effect::Countdown { delay }]
             }
@@ -346,7 +346,7 @@ impl RaceCore {
     /// Выход с экрана: инварианты целостности — race-started всегда с
     /// парным race-finished, записи вне гонки не остаются на диске.
     /// Ядро после вызова уничтожается — состояние не переводим.
-    pub fn exit(&mut self, now: Instant) -> Vec<Effect> {
+    fn exit(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
             RaceStage::Running { .. } => {
                 self.journal.push(
@@ -476,10 +476,10 @@ impl RaceCore {
 
 #[cfg(test)]
 mod tests {
-    use std::env::temp_dir;
     use super::*;
     use crate::config::camera::PixelConfig;
     use crate::model::rules::StartSignalDelay;
+    use std::env::temp_dir;
 
     /// Длительность гонки для сценариев.
     const DURATION: Duration = Duration::from_secs(60);
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn full_race_cycle() {
         let mut clock = FakeClock::new();
-        // born с RecPressed — запись головы уже включена (REC до гонки).
+        // new = REC-on: запись головы уже включена (REC до гонки).
         let mut core = test_core(&clock);
         assert!(core.phase().rec_on() && !core.phase().race_started());
 
@@ -560,7 +560,7 @@ mod tests {
         assert!(journal_marks(&core).is_empty());
 
         // RACE: отсчёт, запись продолжается (та же сессия).
-        let effects = core.race_pressed(clock.now);
+        let effects = core.intent(Intent::RacePressed, clock.now);
         let delay = match effects.as_slice() {
             [Effect::Countdown { delay }] => *delay,
             other => panic!("expected countdown, got {other:?}"),
@@ -606,7 +606,7 @@ mod tests {
 
         // REC после гонки — коммит и закрытие сессии.
         assert!(matches!(
-            core.rec_pressed(clock.now).as_slice(),
+            core.intent(Intent::RecPressed, clock.now).as_slice(),
             [Effect::StopRecording { commit: true }]
         ));
         let marks = journal_marks(&core);
@@ -625,13 +625,13 @@ mod tests {
     #[test]
     fn cancel_countdown_race_button() {
         let clock = FakeClock::new();
-        // born с RecPressed — запись уже идёт.
+        // new = REC-on: запись уже идёт.
         let mut core = test_core(&clock);
         let t = clock.now;
-        core.race_pressed(t);
+        core.intent(Intent::RacePressed, t);
         assert!(core.phase().countdown_active());
         assert!(matches!(
-            core.race_pressed(t).as_slice(),
+            core.intent(Intent::RacePressed, t).as_slice(),
             [Effect::CancelAudio]
         ));
         assert!(!core.phase().countdown_active());
@@ -643,12 +643,12 @@ mod tests {
     #[test]
     fn cancel_countdown_rec_aborts() {
         let mut clock = FakeClock::new();
-        // born с RecPressed — запись уже идёт.
+        // new = REC-on: запись уже идёт.
         let mut core = test_core(&clock);
         core.note_frame("camera-1", Some(clock.advance(300)));
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         assert!(matches!(
-            core.rec_pressed(clock.now).as_slice(),
+            core.intent(Intent::RecPressed, clock.now).as_slice(),
             [Effect::CancelAudio, Effect::StopRecording { commit: false }]
         ));
         assert!(journal_marks(&core).is_empty(), "голова не журналирована");
@@ -659,14 +659,14 @@ mod tests {
     fn rec_stop_mid_race_finishes() {
         let mut clock = FakeClock::new();
         let mut core = test_core(&clock);
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
         // Камера пишет — иначе файла не будет (сессия снимется молча).
         core.note_frame("camera-1", Some(clock.advance(1)));
         let t_rec = clock.advance(20_000);
         assert!(matches!(
-            core.rec_pressed(t_rec).as_slice(),
+            core.intent(Intent::RecPressed, t_rec).as_slice(),
             [Effect::Buzzer, Effect::StopRecording { commit: true }]
         ));
         let marks = journal_marks(&core);
@@ -683,11 +683,14 @@ mod tests {
     fn race_button_finishes_to_tail() {
         let mut clock = FakeClock::new();
         let mut core = test_core(&clock);
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
         let t = clock.advance(12_345);
-        assert!(matches!(core.race_pressed(t).as_slice(), [Effect::Buzzer]));
+        assert!(matches!(
+            core.intent(Intent::RacePressed, t).as_slice(),
+            [Effect::Buzzer]
+        ));
         let marks = journal_marks(&core);
         assert_eq!(marks.last(), Some(&(15_345, "finish-user")), "{marks:?}");
         assert!(core.phase().rec_on(), "хвост продолжается");
@@ -700,14 +703,14 @@ mod tests {
         // Из Race: гудок + финиш + коммит.
         let mut clock = FakeClock::new();
         let mut core = test_core(&clock);
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
         // Камера пишет — иначе файла не будет (сессия снимется молча).
         core.note_frame("camera-1", Some(clock.advance(1)));
         let t = clock.advance(5_000);
         assert!(matches!(
-            core.exit(t).as_slice(),
+            core.intent(Intent::Exit, t).as_slice(),
             [Effect::Buzzer, Effect::StopRecording { commit: true }]
         ));
         assert_eq!(
@@ -719,26 +722,26 @@ mod tests {
         // Из After: только коммит (финиш уже в журнале).
         let mut clock = FakeClock::new();
         let mut core = test_core(&clock);
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
         core.note_frame("camera-1", Some(clock.advance(1)));
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         assert!(matches!(
-            core.exit(clock.now).as_slice(),
+            core.intent(Intent::Exit, clock.now).as_slice(),
             [Effect::StopRecording { commit: true }]
         ));
 
         // Из Before/Countdown: cancel + abort, без гонки файла нет.
         for race_first in [false, true] {
             let clock = FakeClock::new();
-            // born с RecPressed — ядро уже в Before.
+            // new = REC-on: ядро уже в Before.
             let mut core = test_core(&clock);
             if race_first {
-                core.race_pressed(clock.now);
+                core.intent(Intent::RacePressed, clock.now);
             }
             assert!(matches!(
-                core.exit(clock.now).as_slice(),
+                core.intent(Intent::Exit, clock.now).as_slice(),
                 [Effect::CancelAudio, Effect::StopRecording { commit: false }]
             ));
             assert!(
@@ -769,14 +772,14 @@ mod tests {
             cameras,
         )
         .0;
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
         // Первая камера пишет, вторая — нет: note_frame для неё не дёргаем.
         core.note_frame("camera-1", Some(clock.advance(100)));
         let t_rec = clock.advance(20_000);
         assert!(matches!(
-            core.rec_pressed(t_rec).as_slice(),
+            core.intent(Intent::RecPressed, t_rec).as_slice(),
             [Effect::Buzzer, Effect::StopRecording { commit: true }]
         ));
         let marks = journal_marks(&core);
@@ -811,7 +814,7 @@ mod tests {
             HashMap::from([("camera-1".to_owned(), test_camera())]),
         )
         .0;
-        core.race_pressed(clock.now);
+        core.intent(Intent::RacePressed, clock.now);
         let t_start = clock.advance(Duration::from_secs(PRE_BEEP_SECS).as_millis() as u64);
         core.tick(t_start);
         // Час гонки — никакого авто-финиша.
@@ -824,21 +827,21 @@ mod tests {
         assert!(!core.phase().race_started() || matches!(core.phase(), RaceStage::Running { .. }));
         // Пользователь завершает кнопкой.
         assert!(matches!(
-            core.race_pressed(t_later).as_slice(),
+            core.intent(Intent::RacePressed, t_later).as_slice(),
             [Effect::Buzzer]
         ));
     }
 
     /// REC-off до старта гонки завершает сессию: cancel + abort,
     /// журнал пуст (на диск он не попадал — снапшот только со старта
-    /// гонки). Новая сессия — новое ядро (born), новый стем.
+    /// гонки). Новая сессия — новое ядро (new), новый стем.
     #[test]
     fn rec_off_before_race_finishes_session() {
         let mut clock = FakeClock::new();
         let mut core = test_core(&clock);
         core.note_frame("camera-1", Some(clock.advance(300)));
         assert!(matches!(
-            core.rec_pressed(clock.now).as_slice(),
+            core.intent(Intent::RecPressed, clock.now).as_slice(),
             [Effect::CancelAudio, Effect::StopRecording { commit: false }]
         ));
         assert!(core.phase().finished());
@@ -869,33 +872,41 @@ pub struct Race {
 }
 
 impl Race {
-    pub fn intent(&self, intent: Intent) {
-        let _ = self.intents.try_send(intent);
+    /// Намерения в ядро — типизированные обёртки над каналом.
+    pub fn rec_pressed(&self) {
+        let _ = self.intents.try_send(Intent::RecPressed);
     }
-}
 
-pub fn spawn(
-    rules: RaceRules,
-    captures_dir: PathBuf,
-    pads: BTreeMap<String, PadConfig>,
-    assignments: HashMap<String, Pilot>,
-    cameras: HashMap<String, CameraConfig>,
-    recorders: HashMap<String, Recorder>,
-    mut keyboards: HashMap<String, crossbeam::Receiver<KeyEvent>>,
-    key_events: Arc<Mutex<Vec<KeyEvent>>>,
-    key_dead: Arc<Mutex<HashSet<String>>>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-    first: Intent,
-    audio: Audio,
-) -> Race {
-    let (intent_tx, intent_rx) = crossbeam::bounded(16);
-    let (notice_tx, notice_rx) = crossbeam::bounded(64);
-    thread::spawn(move || {
-        // new = REC нажали: журнал и ноль меток — от этого момента.
-        // Жизнь потока — сессия REC: REC-off до старта гонки отменяет
-        // её (ядро дропается, GUI — в Idle), после финиша отдаём журнал
-        // в DVR. Первое действие RACE — обычный race_pressed поверх new.
-        let (mut core, mut effects) = RaceCore::new(
+    pub fn race_pressed(&self) {
+        let _ = self.intents.try_send(Intent::RacePressed);
+    }
+
+    pub fn exit(&self) {
+        let _ = self.intents.try_send(Intent::Exit);
+    }
+
+    /// Рождает гоночный поток и возвращает хэндл. new = REC нажали:
+    /// журнал и ноль меток — от этого момента. Жизнь потока — сессия
+    /// REC: REC-off до старта гонки отменяет её (ядро дропается,
+    /// GUI — в Idle), после финиша отдаём журнал в DVR. Рождение
+    /// кнопкой RACE: GUI досылает намерение RACE сразу после
+    /// spawn — поток стартует с ним в очереди.
+    pub fn spawn(
+        rules: RaceRules,
+        captures_dir: PathBuf,
+        pads: BTreeMap<String, PadConfig>,
+        assignments: HashMap<String, Pilot>,
+        cameras: HashMap<String, CameraConfig>,
+        recorders: HashMap<String, Recorder>,
+        mut keyboards: HashMap<String, crossbeam::Receiver<KeyEvent>>,
+        key_events: Arc<Mutex<Vec<KeyEvent>>>,
+        key_dead: Arc<Mutex<HashSet<String>>>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        audio: Audio,
+    ) -> Race {
+        let (intent_tx, intent_rx) = crossbeam::bounded(16);
+        let (notice_tx, notice_rx) = crossbeam::bounded(64);
+        let (core, effects) = RaceCore::new(
             Instant::now(),
             rules,
             captures_dir.clone(),
@@ -904,138 +915,132 @@ pub fn spawn(
             assignments,
             cameras,
         );
-        if first == Intent::RacePressed {
-            effects.extend(core.race_pressed(Instant::now()));
-        }
-        apply(&effects, &recorders, &audio);
-        let mut last_air = core.phase();
-        let _ = notice_tx.try_send(Notice::State(last_air));
-        // Журнал на диске: снапшот на старте гонки, дальше дописываем.
-        // Путь и счётчик дописанных событий держит писатель (этот цикл).
-        let mut journal_path: Option<PathBuf> = None;
-        let mut journal_written = 0usize;
-        let sync_journal = |active: &RaceCore,
-                            journal_path: &mut Option<PathBuf>,
-                            journal_written: &mut usize| {
-            // Гейт — факт старта гонки, не фаза: аварийное отжатие
-            // уходит в Finished без гонки (has_raced == false), и писать
-            // пустую шапку на диск не нужно.
-            if !active.has_raced() {
-                return;
-            }
-            let journal = active.journal();
-            match journal_path {
-                None => match journal.snapshot(&captures_dir) {
-                    Ok(path) => {
-                        log::info!("flight journal: stream opened at {path:?}");
-                        *journal_written = journal.event_count();
-                        *journal_path = Some(path);
-                    }
-                    Err(e) => log::error!("flight journal: snapshot failed: {e}"),
-                },
-                Some(path) => {
-                    if let Err(e) = journal.append_to(path, journal_written) {
-                        log::error!("flight journal: append failed: {e}");
-                    }
-                }
-            }
-        };
-
-        loop {
-            let now = Instant::now();
-            let until_deadline = core
-                .next_deadline()
-                .map(|d| d.saturating_duration_since(now))
-                .unwrap_or(POLL);
-            let effects = match intent_rx.recv_timeout(until_deadline.min(POLL)) {
-                Ok(Intent::RecPressed) => core.rec_pressed(Instant::now()),
-                Ok(Intent::RacePressed) => core.race_pressed(Instant::now()),
-                Ok(Intent::Exit) => {
-                    let effects = core.exit(Instant::now());
-                    apply(&effects, &recorders, &audio);
-                    // Финальный коммит — на диск до ухода.
-                    sync_journal(&core, &mut journal_path, &mut journal_written);
-                    break;
-                }
-                Err(crossbeam::RecvTimeoutError::Timeout) => core.tick(Instant::now()),
-                Err(crossbeam::RecvTimeoutError::Disconnected) => break,
-            };
+        thread::spawn(move || {
+            let mut core = core;
             apply(&effects, &recorders, &audio);
-
-            // Клавиатуры: дрен каналов в общую очередь для GUI. Обрыв
-            // канала — id в dead-сет. Будим UI только когда что-то пришло.
-            if !keyboards.is_empty() {
-                let mut got = false;
-                let mut dead_now = Vec::new();
-                for (id, rx) in keyboards.iter_mut() {
-                    loop {
-                        match rx.try_recv() {
-                            Ok(event) => {
-                                key_events.lock().expect("key events").push(event);
-                                got = true;
-                            }
-                            Err(crossbeam::TryRecvError::Disconnected) => {
-                                dead_now.push(id.clone());
-                                break;
-                            }
-                            Err(crossbeam::TryRecvError::Empty) => break,
+            let mut last_air = core.phase();
+            let _ = notice_tx.try_send(Notice::State(last_air));
+            wake();
+            // Журнал на диске: снапшот на старте гонки, дальше дописываем.
+            // Путь и счётчик дописанных событий держит писатель (этот цикл).
+            let mut journal_path: Option<PathBuf> = None;
+            let mut journal_written = 0usize;
+            let sync_journal = |active: &RaceCore,
+                                journal_path: &mut Option<PathBuf>,
+                                journal_written: &mut usize| {
+                // Гейт — факт старта гонки, не фаза: аварийное отжатие
+                // уходит в Finished без гонки (has_raced == false), и писать
+                // пустую шапку на диск не нужно.
+                if !active.has_raced() {
+                    return;
+                }
+                let journal = active.journal();
+                match journal_path {
+                    None => match journal.snapshot(&captures_dir) {
+                        Ok(path) => {
+                            log::info!("flight journal: stream opened at {path:?}");
+                            *journal_written = journal.event_count();
+                            *journal_path = Some(path);
+                        }
+                        Err(e) => log::error!("flight journal: snapshot failed: {e}"),
+                    },
+                    Some(path) => {
+                        if let Err(e) = journal.append_to(path, journal_written) {
+                            log::error!("flight journal: append failed: {e}");
                         }
                     }
                 }
-                for id in dead_now {
-                    keyboards.remove(&id);
-                    key_dead.lock().expect("key dead").insert(id);
-                    got = true;
+            };
+
+            loop {
+                let now = Instant::now();
+                let until_deadline = core
+                    .next_deadline()
+                    .map(|d| d.saturating_duration_since(now))
+                    .unwrap_or(POLL);
+                let effects = match intent_rx.recv_timeout(until_deadline.min(POLL)) {
+                    Ok(intent) => core.intent(intent, Instant::now()),
+                    Err(crossbeam::RecvTimeoutError::Timeout) => core.tick(Instant::now()),
+                    Err(crossbeam::RecvTimeoutError::Disconnected) => break,
+                };
+                apply(&effects, &recorders, &audio);
+
+                // Клавиатуры: дрен каналов в общую очередь для GUI. Обрыв
+                // канала — id в dead-сет. Будим UI только когда что-то пришло.
+                if !keyboards.is_empty() {
+                    let mut got = false;
+                    let mut dead_now = Vec::new();
+                    for (id, rx) in keyboards.iter_mut() {
+                        loop {
+                            match rx.try_recv() {
+                                Ok(event) => {
+                                    key_events.lock().expect("key events").push(event);
+                                    got = true;
+                                }
+                                Err(crossbeam::TryRecvError::Disconnected) => {
+                                    dead_now.push(id.clone());
+                                    break;
+                                }
+                                Err(crossbeam::TryRecvError::Empty) => break,
+                            }
+                        }
+                    }
+                    for id in dead_now {
+                        keyboards.remove(&id);
+                        key_dead.lock().expect("key dead").insert(id);
+                        got = true;
+                    }
+                    if got {
+                        wake();
+                    }
                 }
-                if got {
+
+                // Поллинг first_frame_at: edge-детект — в ядре.
+                for (id, recorder) in &recorders {
+                    let first_frame_at = match recorder.record_state() {
+                        RecordState::Writing { first_frame_at, .. } => Some(first_frame_at),
+                        _ => None,
+                    };
+                    core.note_frame(id, first_frame_at);
+                }
+                sync_journal(&core, &mut journal_path, &mut journal_written);
+
+                // State — только при изменении: опрос каждые POLL не должен
+                // гнать уведомления.
+                let air = core.phase();
+                if air != last_air {
+                    last_air = air;
+                    let _ = notice_tx.try_send(Notice::State(air));
                     wake();
                 }
-            }
-
-            // Поллинг first_frame_at: edge-детект — в ядре.
-            for (id, recorder) in &recorders {
-                let first_frame_at = match recorder.record_state() {
-                    RecordState::Writing { first_frame_at, .. } => {
-                        Some(first_frame_at)
+                if air.finished() {
+                    if core.has_raced() {
+                        // Финализация writer'ов (Cues, патчи, sync) — до
+                        // того, как GUI (тёплый Review) откроет файлы на чтение.
+                        for recorder in recorders.values() {
+                            recorder.wait_finalized(Duration::from_secs(5));
+                        }
+                        let _ = notice_tx.try_send(Notice::EnterReview {
+                            journal: core.into_journal(),
+                        });
+                        wake();
+                    } else {
+                        // REC-off/EXIT до старта гонки: сессия отменена,
+                        // файлы удаляются в фоне, GUI их не читает — ждать
+                        // нечего: BackToIdle немедленно, кнопки оживают в
+                        // Idle без провисания в мёртвом Finished.
+                        drop(core);
+                        let _ = notice_tx.try_send(Notice::BackToIdle);
+                        wake();
                     }
-                    _ => None,
-                };
-                core.note_frame(id, first_frame_at);
-            }
-            sync_journal(&core, &mut journal_path, &mut journal_written);
-
-            // State — только при изменении: опрос каждые POLL не должен
-            // гнать уведомления.
-            let air = core.phase();
-            if air != last_air {
-                last_air = air;
-                let _ = notice_tx.try_send(Notice::State(air));
-            }
-            if air.finished() {
-                if core.has_raced() {
-                    // Финализация writer'ов (Cues, патчи, sync) — до
-                    // того, как GUI (тёплый Review) откроет файлы на чтение.
-                    for recorder in recorders.values() {
-                        recorder.wait_finalized(Duration::from_secs(5));
-                    }
-                    let _ = notice_tx.try_send(Notice::EnterReview {
-                        journal: core.into_journal(),
-                    });
-                } else {
-                    // REC-off до старта гонки: сессия отменена, файлы
-                    // удаляются в фоне, GUI их не читает — ждать нечего:
-                    // BackToIdle немедленно, кнопки оживают в Idle без
-                    // провисания в мёртвом Finished.
-                    drop(core);
-                    let _ = notice_tx.try_send(Notice::BackToIdle);
+                    break;
                 }
-                break;
             }
+        });
+        Race {
+            intents: intent_tx,
+            notices: notice_rx,
         }
-    });
-    Race {
-        intents: intent_tx,
-        notices: notice_rx,
     }
 }
 

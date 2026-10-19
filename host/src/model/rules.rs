@@ -56,7 +56,7 @@ pub const PRE_BEEP_SECS: u64 = 3;
 
 /// Пауза для конкретного старта: равномерный выбор в [min_delay,
 /// max_delay); вырожденный случай (min == max) — само значение.
-pub(crate) fn sample_start_delay(signal: &StartSignalDelay) -> Duration {
+pub fn sample_start_delay(signal: &StartSignalDelay) -> Duration {
     let min = signal.min();
     let span = signal.max().saturating_sub(min).as_millis() as u64;
     if span == 0 {
@@ -67,7 +67,7 @@ pub(crate) fn sample_start_delay(signal: &StartSignalDelay) -> Duration {
 
 /// Момент фактического старта гонки: конец отсчёта + длина гудка
 /// (счётчик стартует, когда гудок доиграл).
-pub(crate) fn race_time_start(start: Instant, delay: Duration, buzzer_len: Duration) -> Instant {
+pub fn race_time_start(start: Instant, delay: Duration, buzzer_len: Duration) -> Instant {
     start + delay + buzzer_len
 }
 

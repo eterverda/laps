@@ -1,14 +1,16 @@
+use crate::config::camera::{CameraConfig, ViewportConfig};
+use crate::config::keyboard::{KeyBind, KeyboardConfig};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Setup {
-    pub cameras: BTreeMap<String, super::camera::CameraConfig>,
+    pub cameras: BTreeMap<String, CameraConfig>,
     pub pads: BTreeMap<String, PadConfig>,
     // Attached by `laps debug-keyboards`; parsed here so setup files can
     // carry keyboards already.
     #[serde(default)]
-    pub keyboards: BTreeMap<String, super::keyboard::KeyboardConfig>,
+    pub keyboards: BTreeMap<String, KeyboardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -19,7 +21,7 @@ pub struct PadConfig {
     /// Клавиши настроенных клавиатур, привязанные к паду (пусто —
     /// пад без клавиатурных биндов).
     #[serde(default)]
-    pub keybinds: Vec<super::keyboard::KeyBind>,
+    pub keybinds: Vec<KeyBind>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -27,7 +29,7 @@ pub struct FpvConfig {
     #[serde(rename = "camera-id")]
     pub camera_id: String,
     #[serde(default)]
-    pub viewport: super::camera::ViewportConfig,
+    pub viewport: ViewportConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

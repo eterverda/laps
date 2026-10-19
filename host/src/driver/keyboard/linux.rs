@@ -10,8 +10,9 @@
 //! EVIOCGRAB is never issued here — access is probed
 //! by a plain open/close of the node.
 
-use super::{AttachError, KeyAction, KeyEvent, KeyboardInfo, ModifierTracker};
 use crate::config::keyboard::{KeyboardConfig, KeyboardMode};
+use crate::driver::keyboard::{AttachError, KeyAction, KeyEvent, KeyboardInfo, ModifierTracker};
+use crossbeam_channel as crossbeam;
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -442,10 +443,7 @@ const EVDEV_TO_HID: [Option<u8>; 256] = [
 /// `Listen`), spawn the reader thread. The returned channel
 /// disconnects when the device goes away: a read error ends the
 /// thread, the fd close releases the grab.
-pub fn open(
-    id: &str,
-    cfg: &KeyboardConfig,
-) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
+pub fn open(id: &str, cfg: &KeyboardConfig) -> Result<crossbeam::Receiver<KeyEvent>, AttachError> {
     let devices = scan_devices().map_err(AttachError::Io)?;
     let matched: Vec<&Device> = devices.iter().filter(|d| cfg.matches(&d.info)).collect();
     let device = match matched.len() {
@@ -471,7 +469,7 @@ pub fn open(
         unsafe { libc::close(fd) };
         return Err(AttachError::Io(err));
     }
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam::unbounded();
     let keyboard_id = id.to_owned();
     std::thread::spawn(move || read_events(fd, keyboard_id, tx));
     Ok(rx)
@@ -492,7 +490,7 @@ fn open_node(path: &Path, flags: libc::c_int) -> io::Result<RawFd> {
 /// pushed into the channel. EINTR retries; any other read error
 /// (ENODEV on unplug, EIO) ends the stream — the fd close also releases
 /// the grab, and the dropped sender disconnects the receiver.
-fn read_events(fd: RawFd, keyboard_id: String, tx: crossbeam_channel::Sender<KeyEvent>) {
+fn read_events(fd: RawFd, keyboard_id: String, tx: crossbeam::Sender<KeyEvent>) {
     let mut tracker = ModifierTracker::default();
     let mut buf = [0u8; INPUT_EVENT_SIZE * 64];
     let mut tail = 0usize;

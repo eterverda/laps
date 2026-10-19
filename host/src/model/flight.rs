@@ -289,6 +289,8 @@ pub fn race_clip<'a>(events: impl IntoIterator<Item = (u64, &'a FlightEvent)>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::camera::ViewportConfig;
+    use crate::config::setup::{ColorConfig, FpvConfig};
 
     fn sample_journal() -> Journal {
         let date_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
@@ -297,10 +299,10 @@ mod tests {
             "pad-1".to_owned(),
             PadConfig {
                 label: "A1".to_owned(),
-                color: crate::config::setup::ColorConfig::Red,
-                fpv: crate::config::setup::FpvConfig {
+                color: ColorConfig::Red,
+                fpv: FpvConfig {
                     camera_id: "camera-1".to_owned(),
-                    viewport: crate::config::camera::ViewportConfig::default(),
+                    viewport: ViewportConfig::default(),
                 },
                 keybinds: Vec::new(),
             },

@@ -4,15 +4,19 @@
 //! EXIT в меню. Гоночное состояние живёт в потоке ядра
 //! (model::rules + service::race), экран — намерения и рендер снапшотов.
 
-use super::ruler::{self, IntoRuler};
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
-use crate::driver::camera::CaptureState;
+use crate::driver::audio::Audio;
+use crate::driver::camera::{Camera, CaptureState};
+use crate::driver::dvr::{CAPTURES_DIR, RecordState};
 use crate::driver::player::{Player, PlayerState};
+use crate::gui::measure_text;
+use crate::gui::ruler::{self, IntoRuler};
 use crate::model::flight::{Journal, RaceClip, race_clip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
+use crate::remote::Response;
 use crate::service::race::{self, Intent, Notice, Race};
 use crate::service::transport::{Circle, Transport};
 use std::collections::HashMap;
@@ -54,7 +58,7 @@ enum Phase {
 /// Данные Idle-эфира: только захваты (как в Live, но без race, state
 /// и keepawake).
 struct Idle {
-    webcams: HashMap<String, crate::driver::camera::Camera>,
+    webcams: HashMap<String, Camera>,
 }
 
 /// Данные эфира: гоночный поток, последний снапшот его состояния,
@@ -67,7 +71,7 @@ struct Live {
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: race::Phase,
     rules: RaceRules,
-    webcams: HashMap<String, crate::driver::camera::Camera>,
+    webcams: HashMap<String, Camera>,
     /// Подавление сна: держится ради Drop (inhibit снимается при
     /// разрушении), чтений нет.
     #[allow(dead_code)]
@@ -194,7 +198,7 @@ pub struct Flight {
     /// Аудио-плеер: уровень приложения (поток-плеер живёт, пока жив
     /// хэндл), гоночные сессии получают клон — без переоткрытия
     /// устройства на каждый REC.
-    audio: crate::driver::audio::Audio,
+    audio: Audio,
     /// Показываемые камеры: пады с пилотами (сейчас ≤ MAX_PADS) → их
     /// камеры, дедуп по camera_id (несколько падов смотрят в одну).
     /// Материализованы ради owned-среза для гоночного потока и дедупа
@@ -232,17 +236,14 @@ impl Flight {
         // продедуплена по camera_id — открываем захват по одному на камеру.
         let mut webcams = HashMap::new();
         for (id, camera) in &shown_cameras {
-            webcams.insert(
-                id.clone(),
-                crate::driver::camera::Camera::open(camera.clone(), ctx.clone()),
-            );
+            webcams.insert(id.clone(), Camera::open(camera.clone(), ctx.clone()));
         }
         log::info!("flight: webcams starting: {}", webcams.len());
         Self {
             setup,
             assignments,
             rules,
-            audio: crate::driver::audio::Audio::spawn(),
+            audio: Audio::spawn(),
             shown_cameras,
             captures,
             res: None,
@@ -284,7 +285,7 @@ impl Flight {
         let state = race::born_state(first, Instant::now(), &self.rules);
         let race = race::spawn(
             self.rules,
-            std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR),
+            std::path::PathBuf::from(CAPTURES_DIR),
             self.setup.pads.clone(),
             self.assignments.clone(),
             self.shown_cameras.clone(),
@@ -334,7 +335,7 @@ impl Flight {
     ) -> Self {
         // Холодный вход: последний журнал из captures/ → DVR; журнала
         // нет — деградация на последние записи камер (пустая рамка).
-        let journal = scrub::latest_journal(std::path::Path::new(crate::driver::dvr::CAPTURES_DIR))
+        let journal = scrub::latest_journal(std::path::Path::new(CAPTURES_DIR))
             .and_then(|path| std::fs::read_to_string(&path).ok())
             .and_then(|yaml| {
                 let (header, events) = Journal::parse_stream(&yaml);
@@ -359,7 +360,7 @@ impl Flight {
             setup,
             assignments,
             rules: RaceRules::default(),
-            audio: crate::driver::audio::Audio::spawn(),
+            audio: Audio::spawn(),
             shown_cameras,
             captures: Some(captures),
             res: None,
@@ -420,7 +421,7 @@ impl Flight {
     /// target — целевой fps (dvr.frame-rate, иначе camera); «error» при
     /// мёртвом потоке и при провале записи в REC-он.
     fn fps_lines(
-        webcams: &HashMap<String, crate::driver::camera::Camera>,
+        webcams: &HashMap<String, Camera>,
         shown_cameras: &HashMap<String, CameraConfig>,
         rec_on: bool,
     ) -> Vec<String> {
@@ -433,17 +434,11 @@ impl Flight {
                     Some(w) if w.capture_state() == CaptureState::Dead => {
                         "\u{f03d} error".to_owned()
                     }
-                    Some(w)
-                        if rec_on
-                            && matches!(
-                                w.record_state(),
-                                crate::driver::dvr::RecordState::Failed
-                            ) =>
-                    {
+                    Some(w) if rec_on && matches!(w.record_state(), RecordState::Failed) => {
                         "\u{f16df} error".to_owned()
                     }
                     Some(w) => match w.record_state() {
-                        crate::driver::dvr::RecordState::Writing { fps, .. } if fps > 0.0 => {
+                        RecordState::Writing { fps, .. } if fps > 0.0 => {
                             format!("\u{f16df} {:.0}fps", fps)
                         }
                         _ => format!("\u{f16df} {target}"),
@@ -457,7 +452,7 @@ impl Flight {
     /// разрешений (только для камер активных падов). Рендерятся все пады
     /// (неназначенные — пустые рамки).
     fn prepare_pads(
-        webcams: &mut HashMap<String, crate::driver::camera::Camera>,
+        webcams: &mut HashMap<String, Camera>,
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
@@ -1079,7 +1074,7 @@ impl Flight {
                     let row = ruler::CELL_SIZE.y;
                     let w = lines
                         .iter()
-                        .map(|l| super::measure_text(ui.ctx(), style::FONT_REGULAR, l).x)
+                        .map(|l| measure_text(ui.ctx(), style::FONT_REGULAR, l).x)
                         .fold(0.0f32, f32::max);
                     let text = egui::Rect::from_min_max(
                         egui::pos2(rect.center().x - w / 2.0, rect.top() - row * 2.0),
@@ -1326,7 +1321,7 @@ impl Flight {
                 // мигания/нулей), в DVR — позиция.
                 let timer_pos = egui::pos2(egui::Rect::from(ruler).right() + ruler::cell_x(2), y);
                 let timer_icon = "\u{f43a}";
-                let icon_w = super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
+                let icon_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
                 let timer_color = if frame.timer.dim {
                     TRANSPORT_ACTIVE.gamma_multiply(0.2)
                 } else {
@@ -1581,13 +1576,9 @@ impl Flight {
     /// Команда удалённого управления — нажатия кнопок экрана: rec, race,
     /// play, ff, rew, exit повторяют клики по кнопкам, seek <ms> —
     /// абсолютную перемотку всех плееров. Some — обработана.
-    pub fn handle_remote(
-        &mut self,
-        ctx: &egui::Context,
-        command: &[String],
-    ) -> Option<crate::remote::Response> {
+    pub fn handle_remote(&mut self, ctx: &egui::Context, command: &[String]) -> Option<Response> {
         let head = command.first()?.as_str();
-        let ok = |message: String| Some(crate::remote::Response { message, code: 0 });
+        let ok = |message: String| Some(Response { message, code: 0 });
         match (&head, &mut self.phase) {
             (&"rec", _) => {
                 if matches!(self.phase, Phase::Idle(_)) {
@@ -1673,7 +1664,7 @@ impl Review {
         });
         let clip = race_clip(journal.iter_ms());
         let mut players = HashMap::new();
-        let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
+        let dir = std::path::Path::new(CAPTURES_DIR);
         let mut opened = 0;
         for (camera_id, (filename, _)) in &clip.files {
             let path = dir.join(filename);

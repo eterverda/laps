@@ -6,6 +6,9 @@ mod model;
 mod remote;
 mod service;
 
+#[cfg(target_os = "linux")]
+use crossbeam_channel as crossbeam;
+
 #[derive(clap::Parser)]
 #[command(name = "laps")]
 struct Cli {
@@ -192,7 +195,7 @@ fn debug_keyboards() -> ! {
     }
     // Fan every stream into one channel; each event already carries its
     // keyboard_id, so the printer needs no per-stream bookkeeping.
-    let (tx, rx) = crossbeam_channel::unbounded::<driver::keyboard::KeyEvent>();
+    let (tx, rx) = crossbeam::unbounded::<driver::keyboard::KeyEvent>();
     for stream in streams {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -229,7 +232,7 @@ fn debug_keyboards() -> ! {
 }
 
 #[cfg(test)]
-mod keyboard_tests {
+mod tests {
     use super::*;
 
     #[test]

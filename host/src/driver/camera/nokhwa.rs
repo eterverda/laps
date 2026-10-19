@@ -8,11 +8,11 @@
 //! Правило слоя: бэкенд не импортирует pipeline-части модуля camera
 //! (mod.rs) — только контракты из capture.rs.
 
-use super::Error;
-use super::capture::{
+use crate::config::camera::{CameraConfig, PixelConfig};
+use crate::driver::camera;
+use crate::driver::camera::capture::{
     Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
 };
-use crate::config::camera::CameraConfig;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 use std::time::Instant;
@@ -20,16 +20,16 @@ use std::time::Instant;
 /// Map nokhwa's error onto CaptureError: open/stream failures are io,
 /// property (negotiation) rejections are Unsupported; everything else
 /// is passed through unaltered under Backend.
-fn capture_err(e: nokhwa::NokhwaError) -> Error {
+fn capture_err(e: nokhwa::NokhwaError) -> camera::Error {
     use nokhwa::NokhwaError as E;
     match e {
         E::OpenDeviceError(_, msg) | E::OpenStreamError(msg) => {
-            Error::Io(std::io::Error::other(msg))
+            camera::Error::Io(std::io::Error::other(msg))
         }
         E::GetPropertyError { error, .. } | E::SetPropertyError { error, .. } => {
-            Error::Config(format!("unsupported: {error}"))
+            camera::Error::Config(format!("unsupported: {error}"))
         }
-        other => Error::Other(Box::new(other)),
+        other => camera::Error::Other(Box::new(other)),
     }
 }
 
@@ -43,7 +43,7 @@ pub struct NokhwaSession {
 impl Capture for NokhwaCapture {
     type Session = NokhwaSession;
 
-    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, Error> {
+    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, camera::Error> {
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
             Ok(cameras) => cameras,
             Err(e) => return Err(capture_err(e)),
@@ -63,7 +63,7 @@ impl Capture for NokhwaCapture {
         Ok(devices)
     }
 
-    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, Error> {
+    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, camera::Error> {
         // Open directly with the requested Exact format, trying matching
         // devices in enumeration order — the first openable one wins.
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
@@ -71,7 +71,7 @@ impl Capture for NokhwaCapture {
             Err(e) => return Err(capture_err(e)),
         };
         let needle = config.name.to_lowercase();
-        let mut last_err = Error::Config(format!("camera not found: {}", config.name));
+        let mut last_err = camera::Error::Config(format!("camera not found: {}", config.name));
         for cam in &cameras {
             // Та же семантика, что в CameraConfig::matches: точное имя
             // или contains (case-insensitive).
@@ -100,7 +100,7 @@ impl Capture for NokhwaCapture {
             let negotiated = match to_capture_format(&camera.camera_format()) {
                 Some(format) => format,
                 None => {
-                    return Err(Error::Config(
+                    return Err(camera::Error::Config(
                         "negotiated pixel format unsupported".to_string(),
                     ));
                 }
@@ -128,11 +128,11 @@ impl CaptureSession for NokhwaSession {
         // Буфер может быть больше самого кадра (ёмкость буфера vs
         // длина кадра) — длина jpeg (SOI..EOI) вычисляется здесь.
         let data = match self.negotiated.format {
-            crate::config::camera::PixelConfig::Mjpeg => FrameData::Jpeg {
+            PixelConfig::Mjpeg => FrameData::Jpeg {
                 len: jpeg_len(&buf),
                 buf,
             },
-            crate::config::camera::PixelConfig::Yuyv => FrameData::Yuyv { buf },
+            PixelConfig::Yuyv => FrameData::Yuyv { buf },
         };
         Ok(Frame { timestamp, data })
     }
@@ -175,10 +175,10 @@ fn to_capture_format(f: &CameraFormat) -> Option<CaptureFormat> {
     })
 }
 
-fn to_frame_format(f: crate::config::camera::PixelConfig) -> FrameFormat {
+fn to_frame_format(f: PixelConfig) -> FrameFormat {
     match f {
-        crate::config::camera::PixelConfig::Yuyv => FrameFormat::YUYV,
-        crate::config::camera::PixelConfig::Mjpeg => FrameFormat::MJPEG,
+        PixelConfig::Yuyv => FrameFormat::YUYV,
+        PixelConfig::Mjpeg => FrameFormat::MJPEG,
     }
 }
 

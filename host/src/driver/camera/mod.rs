@@ -23,8 +23,9 @@ use nokhwa::NokhwaCapture as Backend;
 #[cfg(target_os = "linux")]
 use v4l2::V4l2Capture as Backend;
 
-use crate::config::camera::{CameraConfig, PixelConfig};
+use crate::config::camera::{CameraConfig, PixelConfig, ResolutionConfig};
 use crate::driver::dvr::{DvrSink, RecordParams, RecordState, SharedRecordState};
+use crossbeam_channel as crossbeam;
 use crossbeam_utils::atomic::AtomicCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -142,7 +143,7 @@ pub fn list_cameras() -> std::result::Result<Vec<CameraConfig>, Error> {
 #[derive(Clone)]
 pub struct Recorder {
     record_state: SharedRecordState,
-    commands: crossbeam_channel::Sender<RecordCommand>,
+    commands: crossbeam::Sender<RecordCommand>,
 }
 
 impl Recorder {
@@ -187,9 +188,7 @@ impl Recorder {
     /// RecordState.done (централизовано, отдельной ячейки нет).
     pub fn wait_finalized(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        while !matches!(self.record_state.load(), RecordState::Done)
-            && Instant::now() < deadline
-        {
+        while !matches!(self.record_state.load(), RecordState::Done) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         if !matches!(self.record_state.load(), RecordState::Done) {
@@ -208,7 +207,7 @@ pub struct Camera {
     capture_state: SharedCaptureState,
     record_state: SharedRecordState,
     /// Команды записи в capture-поток.
-    commands: crossbeam_channel::Sender<RecordCommand>,
+    commands: crossbeam::Sender<RecordCommand>,
     /// Латентность live на выходе: пишет UI-поток, логает capture-поток
     /// в конце сеанса.
     ui_latency: Arc<Mutex<fps::FrameStats>>,
@@ -217,7 +216,7 @@ pub struct Camera {
     /// Неготиированное разрешение потока: пишет capture-поток после
     /// открытия сессии, UI читает (подсказки, эффективное разрешение
     /// вьюпортов).
-    resolution: Arc<AtomicCell<Option<crate::config::camera::ResolutionConfig>>>,
+    resolution: Arc<AtomicCell<Option<ResolutionConfig>>>,
     /// Останов и join capture-потока (Drop).
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -235,9 +234,8 @@ impl Camera {
         let slot: ImageSlot = Arc::default();
         let running = Arc::new(AtomicBool::new(true));
         let capture_state: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
-        let record_state: SharedRecordState =
-            Arc::new(AtomicCell::new(RecordState::Idle));
-        let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
+        let record_state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
+        let (commands_tx, commands_rx) = crossbeam::bounded(4);
         let ui_latency = Arc::new(Mutex::new(fps::FrameStats::default()));
         // 1×1-пустышка: id валиден с рождения, размер возьмёт первый кадр
         // (set перезаписывает мету). Контент не отрисовывается: до первого
@@ -286,7 +284,7 @@ impl Camera {
 
     /// Неготиированное разрешение захвата; None, пока сессия не
     /// открылась (или поток умер раньше открытия).
-    pub fn resolution(&self) -> Option<crate::config::camera::ResolutionConfig> {
+    pub fn resolution(&self) -> Option<ResolutionConfig> {
         self.resolution.load()
     }
 
@@ -348,9 +346,9 @@ fn capture_loop(
     capture_state: SharedCaptureState,
     record_state: SharedRecordState,
     running: Arc<AtomicBool>,
-    commands_rx: crossbeam_channel::Receiver<RecordCommand>,
+    commands_rx: crossbeam::Receiver<RecordCommand>,
     ui_latency: Arc<Mutex<fps::FrameStats>>,
-    resolution: Arc<AtomicCell<Option<crate::config::camera::ResolutionConfig>>>,
+    resolution: Arc<AtomicCell<Option<ResolutionConfig>>>,
     on_frame: impl Fn() + Send + Sync + 'static,
 ) {
     let (mut session, matched) = match open_session(&desc) {
@@ -628,6 +626,20 @@ fn dispatch_frame(
     true
 }
 
+impl Drop for Camera {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        // Джойним capture-поток: он ждёт текущий кадр и stop_stream.
+        // Финализация контейнера не входит в это ожидание — recorder уже
+        // отпущен детачем и дописывает файл в фоне.
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                log::error!("capture thread panicked");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,9 +697,7 @@ mod tests {
         // Writing ставит worker по факту первого кадра (асинхронно) —
         // ждём, а не проверяем немедленно.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !matches!(state.load(), RecordState::Writing { .. })
-            && Instant::now() < deadline
-        {
+        while !matches!(state.load(), RecordState::Writing { .. }) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(
@@ -750,19 +760,5 @@ mod tests {
         };
         assert!(mkv, "dvr sink must write the container");
         std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
-impl Drop for Camera {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        // Джойним capture-поток: он ждёт текущий кадр и stop_stream.
-        // Финализация контейнера не входит в это ожидание — recorder уже
-        // отпущен детачем и дописывает файл в фоне.
-        if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() {
-                log::error!("capture thread panicked");
-            }
-        }
     }
 }

@@ -3,6 +3,7 @@
 //! an empty filter matches nothing, so a missing filter can never attach
 //! every keyboard (fail-closed).
 
+use crate::driver::keyboard::{KeyboardInfo, key_name, key_usage};
 /// How the driver attaches the device. Grab is exclusive (the system
 /// and other apps see nothing); listen is passive. Serialized lowercase
 /// (`mode: grab`). Required — a missing mode is an error, never a
@@ -55,7 +56,7 @@ impl KeyboardConfig {
     /// Mirror of `CameraConfig::matches`: name is a case-insensitive
     /// substring, vid/pid/serial are exact when set. Requires at least
     /// one criterion — an empty config matches nothing.
-    pub fn matches(&self, info: &crate::driver::keyboard::KeyboardInfo) -> bool {
+    pub fn matches(&self, info: &KeyboardInfo) -> bool {
         let has_criterion = self.name.is_some()
             || self.vid.is_some()
             || self.pid.is_some()
@@ -107,14 +108,12 @@ fn de_key_usage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error>
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u32, E> {
-            crate::driver::keyboard::key_usage(v)
-                .ok_or_else(|| E::custom(format!("unknown key name: {v}")))
+            key_usage(v).ok_or_else(|| E::custom(format!("unknown key name: {v}")))
         }
 
         fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u32, E> {
             let name = v.to_string();
-            crate::driver::keyboard::key_usage(&name)
-                .ok_or_else(|| E::custom(format!("unknown key number: {v}")))
+            key_usage(&name).ok_or_else(|| E::custom(format!("unknown key number: {v}")))
         }
     }
 
@@ -122,7 +121,7 @@ fn de_key_usage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error>
 }
 
 fn ser_key_usage<S: serde::Serializer>(usage: &u32, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&crate::driver::keyboard::key_name(*usage))
+    s.serialize_str(&key_name(*usage))
 }
 
 /// vid/pid are 0x-prefixed hex scalars in setup files (`vid: 0x8089`):
@@ -286,61 +285,58 @@ mod tests {
         }
     }
 
-    mod matching {
-        use super::*;
-        use crate::driver::keyboard::KeyboardInfo;
+    use crate::driver::keyboard::KeyboardInfo;
 
-        fn info(name: &str, vid: u16, pid: u16, serial: Option<&str>) -> KeyboardInfo {
-            KeyboardInfo {
-                name: name.to_owned(),
-                vid,
-                pid,
-                serial: serial.map(str::to_owned),
-                listenable: true,
-                grabbable: true,
-            }
+    fn info(name: &str, vid: u16, pid: u16, serial: Option<&str>) -> KeyboardInfo {
+        KeyboardInfo {
+            name: name.to_owned(),
+            vid,
+            pid,
+            serial: serial.map(str::to_owned),
+            listenable: true,
+            grabbable: true,
         }
+    }
 
-        #[test]
-        fn name_is_case_insensitive_substring() {
-            let cfg: KeyboardConfig = serde_yaml::from_str("name: red\nmode: listen\n").unwrap();
-            assert!(cfg.matches(&info("SayoDevice RED", 0x8089, 0x000c, None)));
-            assert!(cfg.matches(&info("sayoDevice red", 0x8089, 0x000c, None)));
-            assert!(!cfg.matches(&info("SayoDevice BLUE", 0x8089, 0x000c, None)));
-        }
+    #[test]
+    fn name_is_case_insensitive_substring() {
+        let cfg: KeyboardConfig = serde_yaml::from_str("name: red\nmode: listen\n").unwrap();
+        assert!(cfg.matches(&info("SayoDevice RED", 0x8089, 0x000c, None)));
+        assert!(cfg.matches(&info("sayoDevice red", 0x8089, 0x000c, None)));
+        assert!(!cfg.matches(&info("SayoDevice BLUE", 0x8089, 0x000c, None)));
+    }
 
-        #[test]
-        fn exact_fields_when_set() {
-            let cfg: KeyboardConfig =
-                serde_yaml::from_str("vid: 0x8089\npid: 0x000c\nmode: grab\n").unwrap();
-            assert!(cfg.matches(&info("SayoDevice RED", 0x8089, 0x000c, None)));
-            assert!(cfg.matches(&info("SayoDevice BLUE", 0x8089, 0x000c, None)));
-            assert!(!cfg.matches(&info("SayoDevice 2x3B", 0x8089, 0x0008, None)));
-            // Serial distinguishes two keyboards with the same vid:pid.
-            let cfg: KeyboardConfig = serde_yaml::from_str(
-                "vid: 0x8089\nserial: 03CDAB114071BC4FA8FFFFFFFF00\nmode: listen\n",
-            )
-            .unwrap();
-            assert!(cfg.matches(&info(
-                "SayoDevice RED",
-                0x8089,
-                0x000c,
-                Some("03CDAB114071BC4FA8FFFFFFFF00")
-            )));
-            assert!(!cfg.matches(&info(
-                "SayoDevice BLUE",
-                0x8089,
-                0x000c,
-                Some("03CDABE24071BC20A9FFFFFFFF00")
-            )));
-            // Device without serial never matches a serial criterion.
-            assert!(!cfg.matches(&info("Some Keyboard", 0x8089, 0x000c, None)));
-        }
+    #[test]
+    fn exact_fields_when_set() {
+        let cfg: KeyboardConfig =
+            serde_yaml::from_str("vid: 0x8089\npid: 0x000c\nmode: grab\n").unwrap();
+        assert!(cfg.matches(&info("SayoDevice RED", 0x8089, 0x000c, None)));
+        assert!(cfg.matches(&info("SayoDevice BLUE", 0x8089, 0x000c, None)));
+        assert!(!cfg.matches(&info("SayoDevice 2x3B", 0x8089, 0x0008, None)));
+        // Serial distinguishes two keyboards with the same vid:pid.
+        let cfg: KeyboardConfig = serde_yaml::from_str(
+            "vid: 0x8089\nserial: 03CDAB114071BC4FA8FFFFFFFF00\nmode: listen\n",
+        )
+        .unwrap();
+        assert!(cfg.matches(&info(
+            "SayoDevice RED",
+            0x8089,
+            0x000c,
+            Some("03CDAB114071BC4FA8FFFFFFFF00")
+        )));
+        assert!(!cfg.matches(&info(
+            "SayoDevice BLUE",
+            0x8089,
+            0x000c,
+            Some("03CDABE24071BC20A9FFFFFFFF00")
+        )));
+        // Device without serial never matches a serial criterion.
+        assert!(!cfg.matches(&info("Some Keyboard", 0x8089, 0x000c, None)));
+    }
 
-        #[test]
-        fn empty_config_matches_nothing() {
-            let cfg = KeyboardConfig::default();
-            assert!(!cfg.matches(&info("SayoDevice RED", 0x8089, 0x000c, Some("x"))));
-        }
+    #[test]
+    fn empty_config_matches_nothing() {
+        let cfg = KeyboardConfig::default();
+        assert!(!cfg.matches(&info("SayoDevice RED", 0x8089, 0x000c, Some("x"))));
     }
 }

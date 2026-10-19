@@ -14,11 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel as crossbeam;
 use crossbeam_utils::atomic::AtomicCell;
 
 use crate::driver::camera::decode::decode_pixels_mjpeg_into;
 use crate::driver::camera::fps::FrameStats;
-use crate::driver::dvr::{VideoReader, open_reader};
+use crate::driver::dvr::{Resolution, VideoReader, open_reader};
 
 /// Клапан показа: на высоких скоростях due-кадры идут чаще, чем успевает
 /// декодер — чаще одного показа за это время не декодируем вообще, индекс
@@ -52,7 +53,7 @@ pub struct Meta {
     /// кадр «держится» на экране столько же, сколько предпоследний —
     /// для расчёта гэпов покрытие файла = duration + last_step.
     pub last_step: u64,
-    pub resolution: crate::driver::dvr::Resolution,
+    pub resolution: Resolution,
 }
 
 /// Состояние + метаданные: одна блокировка на холодные данные.
@@ -85,7 +86,7 @@ pub struct Player {
     /// Единственная горячая ячейка: пишет worker при публикации кадра,
     /// читает UI каждый кадр.
     shown: Arc<AtomicCell<u64>>,
-    commands: crossbeam_channel::Sender<Command>,
+    commands: crossbeam::Sender<Command>,
     /// Останов и join worker-потока (Drop).
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -104,7 +105,7 @@ impl Player {
         // Очередь синков с запасом: UI шлёт их каждый кадр (~60/с),
         // worker забирает по дедлайну; рывок UI-цикла не должен
         // дропать свежий синк (try_send, очередь полна — пропуск).
-        let (commands, command_rx) = crossbeam_channel::bounded::<Command>(256);
+        let (commands, command_rx) = crossbeam::bounded::<Command>(256);
         let running = Arc::new(AtomicBool::new(true));
         // 1×1-пустышка, как у Camera: id валиден с рождения, размер
         // возьмёт первый кадр. Контент не отрисовывается: до первого
@@ -171,7 +172,7 @@ impl Player {
     }
 
     /// Разрешение файла; None, пока идёт open.
-    pub fn resolution(&self) -> Option<crate::driver::dvr::Resolution> {
+    pub fn resolution(&self) -> Option<Resolution> {
         let meta = self.inner.lock().unwrap().meta;
         meta.and_then(|m| (m.resolution.height > 0).then_some(m.resolution))
     }
@@ -210,7 +211,7 @@ fn playback_loop(
     inner: Arc<Mutex<Inner>>,
     shown: Arc<AtomicCell<u64>>,
     running: Arc<AtomicBool>,
-    commands: crossbeam_channel::Receiver<Command>,
+    commands: crossbeam::Receiver<Command>,
 ) {
     /// Состояние воспроизведения: существует только внутри потока.
     struct Playback {
@@ -226,7 +227,7 @@ fn playback_loop(
         jpeg: Vec<u8>,
         /// Пиксельный буфер кадра; в слот уходит Arc-клон.
         image: Arc<egui::ColorImage>,
-        dims: crate::driver::dvr::Resolution,
+        dims: Resolution,
         /// Сейчас на экране (индекс в pts).
         shown_idx: usize,
         /// Транспортный синк: позиция (файл) на sync_at со скоростью;
@@ -493,7 +494,7 @@ fn playback_loop(
         }
 
         /// Цикл: дедлайн кадра или синк — что раньше.
-        fn run(&mut self, commands: &crossbeam_channel::Receiver<Command>, running: &AtomicBool) {
+        fn run(&mut self, commands: &crossbeam::Receiver<Command>, running: &AtomicBool) {
             loop {
                 if !running.load(Ordering::Relaxed) {
                     break;
@@ -501,8 +502,8 @@ fn playback_loop(
                 let wait = self.tick().unwrap_or(IDLE_WAIT);
                 match commands.recv_timeout(wait) {
                     Ok(Command::Sync { position, speed }) => self.command_sync(position, speed),
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    Err(crossbeam::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam::RecvTimeoutError::Disconnected) => break,
                 }
             }
         }

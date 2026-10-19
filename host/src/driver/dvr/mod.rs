@@ -12,6 +12,7 @@ mod sink;
 
 pub use sink::DvrSink;
 
+use crossbeam_channel as crossbeam;
 use crossbeam_utils::atomic::AtomicCell;
 use std::io;
 use std::path::PathBuf;
@@ -21,7 +22,9 @@ use std::time::{Duration, Instant};
 use mkv::MkvWriter;
 use mp4::IsobmffWriter;
 
-use crate::config::camera::ContainerConfig;
+use crate::config::camera::{CameraConfig, ContainerConfig};
+use crate::driver::camera::capture::{CaptureFormat, Frame};
+use crate::driver::camera::fps::{FpsCounter, FrameStats};
 
 /// Состояние записи: жизненный цикл writer-потока.
 /// Idle → Preparing (файл создан) → Writing (первый кадр был — метка
@@ -116,7 +119,7 @@ pub struct RecordParams {
     pub stem: String,
     /// Справочно: для логов и отчёта. Размеры для записи авторитетны
     /// из согласованного формата, см. Recorder::start.
-    pub camera: crate::config::camera::CameraConfig,
+    pub camera: CameraConfig,
 }
 
 const CHANNEL_CAP: usize = 64;
@@ -130,9 +133,7 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// не держит, detach безопасен).
 pub struct Recorder {
     state: SharedRecordState,
-    sender: Option<
-        crossbeam_channel::Sender<(std::sync::Arc<crate::driver::camera::capture::Frame>, u64)>,
-    >,
+    sender: Option<crossbeam::Sender<(std::sync::Arc<Frame>, u64)>>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// Дропы в канале (try_send failed), считает push, читает
     /// writer-поток для отчёта.
@@ -145,7 +146,7 @@ pub struct Recorder {
 impl Recorder {
     pub fn start(
         params: &RecordParams,
-        negotiated: &crate::driver::camera::capture::CaptureFormat,
+        negotiated: &CaptureFormat,
         state: &SharedRecordState,
     ) -> io::Result<Self> {
         use crate::driver::camera::capture::FrameData;
@@ -168,10 +169,7 @@ impl Recorder {
         };
         state.store(RecordState::Preparing);
         let writer_path = path.clone();
-        let (sender, receiver) = crossbeam_channel::bounded::<(
-            std::sync::Arc<crate::driver::camera::capture::Frame>,
-            u64,
-        )>(CHANNEL_CAP);
+        let (sender, receiver) = crossbeam::bounded::<(std::sync::Arc<Frame>, u64)>(CHANNEL_CAP);
         let state_clone = state.clone();
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -184,12 +182,12 @@ impl Recorder {
             let mut last_sync = Instant::now();
             // Замер пишущихся кадров для UI: второй, независимый от
             // capture-потока счётчик — отражает потери в канале.
-            let mut fps_counter = crate::driver::camera::fps::FpsCounter::default();
+            let mut fps_counter = FpsCounter::default();
             // Латентность кадра: от его таймстемпа до окончания записи
             // в файл (включая ожидание в канале). Один лог при финализации.
-            let mut latency = crate::driver::camera::fps::FrameStats::default();
+            let mut latency = FrameStats::default();
             // Длительность перекодирования rgba→jpeg (фаза, не латентность).
-            let mut encode = crate::driver::camera::fps::FrameStats::default();
+            let mut encode = FrameStats::default();
             // Канал закрывается по Drop отправителя → finalize и выход.
             while let Ok((frame, ts)) = receiver.recv() {
                 // Первый принятый кадр — запись началась: метка старта
@@ -311,7 +309,7 @@ impl Recorder {
     /// просто выбрасывается (состояние уже отражено в RecordState, UI
     /// показал). Переполнение канала = дроп кадра + warn (захват важнее
     /// записи).
-    pub fn push(&self, frame: std::sync::Arc<crate::driver::camera::capture::Frame>, ts: u64) {
+    pub fn push(&self, frame: std::sync::Arc<Frame>, ts: u64) {
         if !matches!(
             self.state.load(),
             RecordState::Preparing | RecordState::Writing { .. }
@@ -347,6 +345,9 @@ pub fn epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::camera::{FrameRateConfig, ResolutionConfig};
+    use crate::driver::camera::capture::{CaptureFormat, Frame, FrameData};
+
     /// YUYV: RGBA перекодируется в JPEG и пишется в контейнер по
     /// умолчанию (MKV); REC гаснет по выходу writer-потока.
     #[test]
@@ -364,12 +365,12 @@ mod tests {
             stem: "test-stem".to_owned(),
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Yuyv),
         };
-        let negotiated = crate::driver::camera::capture::CaptureFormat {
-            resolution: crate::config::camera::ResolutionConfig {
+        let negotiated = CaptureFormat {
+            resolution: ResolutionConfig {
                 width: 64,
                 height: 48,
             },
-            frame_rate: crate::config::camera::FrameRateConfig(30),
+            frame_rate: FrameRateConfig(30),
             format: PixelConfig::Yuyv,
         };
         {
@@ -377,9 +378,9 @@ mod tests {
             for _ in 0..3 {
                 let pixels = vec![egui::Color32::BLACK; 64 * 48];
                 recorder.push(
-                    std::sync::Arc::new(crate::driver::camera::capture::Frame {
+                    std::sync::Arc::new(Frame {
                         timestamp: std::time::Instant::now(),
-                        data: crate::driver::camera::capture::FrameData::Rgba {
+                        data: FrameData::Rgba {
                             rgba: egui::ColorImage::new([64, 48], pixels),
                         },
                     }),
@@ -441,12 +442,12 @@ mod tests {
                 stem: "test-stem".to_owned(),
                 camera,
             };
-            let negotiated = crate::driver::camera::capture::CaptureFormat {
-                resolution: crate::config::camera::ResolutionConfig {
+            let negotiated = CaptureFormat {
+                resolution: ResolutionConfig {
                     width: 64,
                     height: 48,
                 },
-                frame_rate: crate::config::camera::FrameRateConfig(30),
+                frame_rate: FrameRateConfig(30),
                 format: PixelConfig::Mjpeg,
             };
             // Два разных по содержимому JPEG-кадра: читаемость проверяем
@@ -466,9 +467,9 @@ mod tests {
                 for i in 0..6u64 {
                     let jpeg = &jpegs[i as usize % 2];
                     recorder.push(
-                        std::sync::Arc::new(crate::driver::camera::capture::Frame {
+                        std::sync::Arc::new(Frame {
                             timestamp: std::time::Instant::now(),
-                            data: crate::driver::camera::capture::FrameData::Jpeg {
+                            data: FrameData::Jpeg {
                                 buf: jpeg.clone(),
                                 len: Some(jpeg.len()),
                             },
@@ -479,8 +480,7 @@ mod tests {
             } // drop: writer финализирует в фоне
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !matches!(state.load(), RecordState::Done)
-                && std::time::Instant::now() < deadline
+            while !matches!(state.load(), RecordState::Done) && std::time::Instant::now() < deadline
             {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -527,12 +527,12 @@ mod tests {
             stem: "abort-stem".to_owned(),
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg),
         };
-        let negotiated = crate::driver::camera::capture::CaptureFormat {
-            resolution: crate::config::camera::ResolutionConfig {
+        let negotiated = CaptureFormat {
+            resolution: ResolutionConfig {
                 width: 64,
                 height: 48,
             },
-            frame_rate: crate::config::camera::FrameRateConfig(30),
+            frame_rate: FrameRateConfig(30),
             format: PixelConfig::Mjpeg,
         };
         // Стем полный (camera_id уже в нём — см. RecordParams).
@@ -547,9 +547,9 @@ mod tests {
                     .collect();
             let jpeg = super::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
             recorder.push(
-                Arc::new(crate::driver::camera::capture::Frame {
+                Arc::new(Frame {
                     timestamp: std::time::Instant::now(),
-                    data: crate::driver::camera::capture::FrameData::Jpeg {
+                    data: FrameData::Jpeg {
                         buf: jpeg.clone(),
                         len: Some(jpeg.len()),
                     },

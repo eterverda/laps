@@ -7,6 +7,7 @@
 //! держит последнее известное значение. В тестах время подаётся снаружи
 //! через on_frame_at.
 
+use crate::driver::camera::capture::Frame;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -97,12 +98,12 @@ impl Default for FrameStats {
 
 impl FrameStats {
     /// Штатная точка входа: задержка от таймстемпа кадра до «сейчас».
-    pub fn on_frame(&mut self, frame: &crate::driver::camera::capture::Frame) {
+    pub fn on_frame(&mut self, frame: &Frame) {
         self.on_frame_at(frame, Instant::now());
     }
 
     /// Задержка от таймстемпа кадра до заданного момента (для тестов).
-    pub fn on_frame_at(&mut self, frame: &crate::driver::camera::capture::Frame, now: Instant) {
+    pub fn on_frame_at(&mut self, frame: &Frame, now: Instant) {
         self.on_process(now.saturating_duration_since(frame.timestamp));
     }
 
@@ -241,118 +242,113 @@ mod tests {
         assert_eq!(counter.fps(), None);
     }
 
-    mod frame_stats {
-        use super::*;
-        use crate::driver::camera::capture::{Frame, FrameData};
-        use crate::driver::camera::fps::FrameStats;
+    use crate::driver::camera::capture::{Frame, FrameData};
+    use crate::driver::camera::fps::FrameStats;
 
-        fn ms(n: u64) -> Duration {
-            Duration::from_millis(n)
-        }
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
 
-        /// Кадр с заданным таймстемпом (контент для статистики не важен).
-        fn frame_at(ts: Instant) -> Frame {
-            Frame {
-                timestamp: ts,
-                data: FrameData::Rgba {
-                    rgba: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
-                },
-            }
+    /// Кадр с заданным таймстемпом (контент для статистики не важен).
+    fn frame_at(ts: Instant) -> Frame {
+        Frame {
+            timestamp: ts,
+            data: FrameData::Rgba {
+                rgba: egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            },
         }
+    }
 
-        fn render(stats: &mut FrameStats) -> String {
-            stats.snapshot().map(|s| s.to_string()).unwrap_or_default()
-        }
+    fn render(stats: &mut FrameStats) -> String {
+        stats.snapshot().map(|s| s.to_string()).unwrap_or_default()
+    }
 
-        #[test]
-        fn empty_returns_none() {
-            let mut stats = FrameStats::default();
-            assert!(stats.snapshot().is_none());
-        }
+    #[test]
+    fn empty_stats_returns_none() {
+        let mut stats = FrameStats::default();
+        assert!(stats.snapshot().is_none());
+    }
 
-        #[test]
-        fn single_record_all_equal() {
-            let base = Instant::now();
-            let mut stats = FrameStats::default();
-            stats.on_frame_at(&frame_at(base), base + ms(42));
-            assert_eq!(
-                render(&mut stats),
-                "{num: 1, min: 42ms, avg: 42.0ms, max: 42ms, p90: 42ms}"
-            );
-        }
+    #[test]
+    fn single_record_all_equal() {
+        let base = Instant::now();
+        let mut stats = FrameStats::default();
+        stats.on_frame_at(&frame_at(base), base + ms(42));
+        assert_eq!(
+            render(&mut stats),
+            "{num: 1, min: 42ms, avg: 42.0ms, max: 42ms, p90: 42ms}"
+        );
+    }
 
-        #[test]
-        fn min_avg_max_track_values() {
-            let base = Instant::now();
-            let mut stats = FrameStats::default();
-            for lat in [10, 20, 30, 40] {
-                stats.on_frame_at(&frame_at(base), base + ms(lat));
-            }
-            // p90 на 4 замерах нестабилен — проверяем только min/avg/max.
-            assert!(
-                render(&mut stats).starts_with("{num: 4, min: 10ms, avg: 25.0ms, max: 40ms, p90: ")
-            );
+    #[test]
+    fn min_avg_max_track_values() {
+        let base = Instant::now();
+        let mut stats = FrameStats::default();
+        for lat in [10, 20, 30, 40] {
+            stats.on_frame_at(&frame_at(base), base + ms(lat));
         }
+        // p90 на 4 замерах нестабилен — проверяем только min/avg/max.
+        assert!(
+            render(&mut stats).starts_with("{num: 4, min: 10ms, avg: 25.0ms, max: 40ms, p90: ")
+        );
+    }
 
-        #[test]
-        fn avg_has_tenths() {
-            let base = Instant::now();
-            let mut stats = FrameStats::default();
-            stats.on_frame_at(&frame_at(base), base + ms(10));
-            stats.on_frame_at(&frame_at(base), base + ms(11));
-            assert!(render(&mut stats).contains("avg: 10.5ms"));
-        }
+    #[test]
+    fn avg_has_tenths() {
+        let base = Instant::now();
+        let mut stats = FrameStats::default();
+        stats.on_frame_at(&frame_at(base), base + ms(10));
+        stats.on_frame_at(&frame_at(base), base + ms(11));
+        assert!(render(&mut stats).contains("avg: 10.5ms"));
+    }
 
-        #[test]
-        fn on_process_records_phase_duration() {
-            // Длительность фазы — НЕ латентность от начала кадра:
-            // on_process берёт готовый Duration и кладёт его как есть.
-            let mut stats = FrameStats::default();
-            stats.on_process(ms(4));
-            stats.on_process(ms(8));
-            let s = render(&mut stats);
-            assert!(s.starts_with("{num: 2, min: 4ms, avg: 6.0ms, max: 8ms, p90: "));
-        }
+    #[test]
+    fn on_process_records_phase_duration() {
+        // Длительность фазы — НЕ латентность от начала кадра:
+        // on_process берёт готовый Duration и кладёт его как есть.
+        let mut stats = FrameStats::default();
+        stats.on_process(ms(4));
+        stats.on_process(ms(8));
+        let s = render(&mut stats);
+        assert!(s.starts_with("{num: 2, min: 4ms, avg: 6.0ms, max: 8ms, p90: "));
+    }
 
-        #[test]
-        fn p90_close_to_empirical_quantile() {
-            let base = Instant::now();
-            let mut stats = FrameStats::default();
-            // 100 замеров 10..=109 мс: эмпирический p90 ≈ 99-100 мс.
-            for i in 0..100 {
-                stats.on_frame_at(&frame_at(base), base + ms(10 + i));
-            }
-            let p90 = render(&mut stats);
-            let p90: u64 = p90
-                .strip_prefix("{num: 100, min: 10ms, avg: 59.5ms, max: 109ms, p90: ")
-                .unwrap()
-                .trim_end_matches("ms}")
-                .parse()
-                .unwrap();
-            assert!((95..=104).contains(&p90), "p90 out of tolerance: {p90}");
+    #[test]
+    fn p90_close_to_empirical_quantile() {
+        let base = Instant::now();
+        let mut stats = FrameStats::default();
+        // 100 замеров 10..=109 мс: эмпирический p90 ≈ 99-100 мс.
+        for i in 0..100 {
+            stats.on_frame_at(&frame_at(base), base + ms(10 + i));
         }
+        let p90 = render(&mut stats);
+        let p90: u64 = p90
+            .strip_prefix("{num: 100, min: 10ms, avg: 59.5ms, max: 109ms, p90: ")
+            .unwrap()
+            .trim_end_matches("ms}")
+            .parse()
+            .unwrap();
+        assert!((95..=104).contains(&p90), "p90 out of tolerance: {p90}");
+    }
 
-        #[test]
-        fn record_at_measures_until_given_now() {
-            let base = Instant::now();
-            let mut stats = FrameStats::default();
-            stats.on_frame_at(&frame_at(base), base + ms(7));
-            stats.on_frame_at(&frame_at(base), base + ms(9));
-            assert!(
-                render(&mut stats).starts_with("{num: 2, min: 7ms, avg: 8.0ms, max: 9ms, p90: ")
-            );
-        }
+    #[test]
+    fn record_at_measures_until_given_now() {
+        let base = Instant::now();
+        let mut stats = FrameStats::default();
+        stats.on_frame_at(&frame_at(base), base + ms(7));
+        stats.on_frame_at(&frame_at(base), base + ms(9));
+        assert!(render(&mut stats).starts_with("{num: 2, min: 7ms, avg: 8.0ms, max: 9ms, p90: "));
+    }
 
-        #[test]
-        fn snapshot_does_not_consume() {
-            let base = Instant::now();
-            let mut stats = FrameStats::default();
-            stats.on_frame_at(&frame_at(base), base + ms(5));
-            assert!(stats.snapshot().is_some());
-            // Накопитель жив: продолжаем писать после снимка.
-            stats.on_frame_at(&frame_at(base), base + ms(15));
-            assert!(render(&mut stats).starts_with("{num: 2, min: 5ms,"));
-            assert!(render(&mut stats).contains("max: 15ms"));
-        }
+    #[test]
+    fn snapshot_does_not_consume() {
+        let base = Instant::now();
+        let mut stats = FrameStats::default();
+        stats.on_frame_at(&frame_at(base), base + ms(5));
+        assert!(stats.snapshot().is_some());
+        // Накопитель жив: продолжаем писать после снимка.
+        stats.on_frame_at(&frame_at(base), base + ms(15));
+        assert!(render(&mut stats).starts_with("{num: 2, min: 5ms,"));
+        assert!(render(&mut stats).contains("max: 15ms"));
     }
 }

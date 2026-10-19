@@ -1,5 +1,6 @@
-use super::ruler::{self, IntoRuler};
-use super::{State, header, view};
+use super::State;
+use crate::gui::ruler::{self, IntoRuler};
+use crate::gui::{header, view};
 
 pub struct Menu {
     header: header::Header,
@@ -55,14 +56,9 @@ impl Menu {
                         .into_ruler()
                         .extrude(w, ruler::cell_y(2))
                         .into();
-                let response = view::TransportButton::new(
-                    label,
-                    true,
-                    false,
-                    START_IDLE,
-                    START_ACTIVE,
-                )
-                .interact(ui, start_rect, ui.make_persistent_id("menu_start"));
+                let response =
+                    view::TransportButton::new(label, true, false, START_IDLE, START_ACTIVE)
+                        .interact(ui, start_rect, ui.make_persistent_id("menu_start"));
                 view::TransportButton::new(
                     label,
                     true,

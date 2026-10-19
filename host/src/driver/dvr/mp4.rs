@@ -998,7 +998,7 @@ mod tests {
     /// таймкоды, random access. Общая проверка для MP4 и MOV.
     fn reader_roundtrip(
         path: &std::path::Path,
-        writer: Box<dyn super::VideoWriter>,
+        writer: Box<dyn VideoWriter>,
         frames: &[Vec<u8>],
         rel: &[u64],
         w: u32,
@@ -1012,7 +1012,7 @@ mod tests {
             }
             writer.finalize().unwrap();
         }
-        let mut reader = super::IsobmffReader::open(path).unwrap();
+        let mut reader = IsobmffReader::open(path).unwrap();
         assert_eq!(reader.frame_count(), frames.len());
         assert_eq!(reader.resolution().width, w);
         assert_eq!(reader.resolution().height, h);
@@ -1091,7 +1091,7 @@ mod tests {
         // Не-ISOBMFF файл — ошибка, не паника.
         let path = test_path("reader-foreign");
         std::fs::write(&path, b"not a movie at all").unwrap();
-        let err = super::IsobmffReader::open(&path).err().unwrap();
+        let err = IsobmffReader::open(&path).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_file(&path).ok();
     }

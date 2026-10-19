@@ -1,4 +1,4 @@
-use super::ruler::{self, IntoRuler};
+use crate::gui::ruler::{self, IntoRuler};
 use super::{State, header, view};
 
 pub struct Menu {

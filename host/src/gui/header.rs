@@ -1,6 +1,6 @@
-use super::ruler::{IntoRuler, cell_x, cell_y};
-use super::style;
-use super::view::{self, Corner};
+use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
+use crate::gui::style;
+use crate::gui::view::{self, Corner};
 use time::format_description::{Component, FormatItem};
 
 /// Фон плашки LAPS и даты — голубой в логике catppuccin (blue mocha,

@@ -3,7 +3,7 @@
 //! с Recorder и политикой троттлинга; композиция — в pipeline camera,
 //! который создаёт DvrSink и дёргает start/stop по командам UI.
 
-use super::{RecordParams, Recorder, SharedRecordState};
+use super::{RecordParams, Recorder, SharedRecordState, epoch_millis};
 use crate::config::camera::FrameRateConfig;
 use crate::driver::camera::capture::{Frame, FrameData, FrameSink};
 use std::sync::Arc;
@@ -70,7 +70,7 @@ impl DvrSink {
             next_eligible: Instant::now(),
             negotiated,
             state,
-            anchor: (Instant::now(), super::epoch_millis()),
+            anchor: (Instant::now(), epoch_millis()),
         }
     }
 

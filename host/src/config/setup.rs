@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Setup {
-    pub cameras: BTreeMap<String, super::camera::CameraConfig>,
+    pub cameras: BTreeMap<String, crate::config::camera::CameraConfig>,
     pub pads: BTreeMap<String, PadConfig>,
     // Attached by `laps debug-keyboards`; parsed here so setup files can
     // carry keyboards already.
     #[serde(default)]
-    pub keyboards: BTreeMap<String, super::keyboard::KeyboardConfig>,
+    pub keyboards: BTreeMap<String, crate::config::keyboard::KeyboardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -19,7 +19,7 @@ pub struct PadConfig {
     /// Клавиши настроенных клавиатур, привязанные к паду (пусто —
     /// пад без клавиатурных биндов).
     #[serde(default)]
-    pub keybinds: Vec<super::keyboard::KeyBind>,
+    pub keybinds: Vec<crate::config::keyboard::KeyBind>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -27,7 +27,7 @@ pub struct FpvConfig {
     #[serde(rename = "camera-id")]
     pub camera_id: String,
     #[serde(default)]
-    pub viewport: super::camera::ViewportConfig,
+    pub viewport: crate::config::camera::ViewportConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -63,7 +63,7 @@ mod tests {
         let fpv: FpvConfig = serde_yaml::from_str("camera-id: camera-1\n").unwrap();
         assert_eq!(
             fpv.viewport,
-            super::super::camera::ViewportConfig {
+            crate::config::camera::ViewportConfig {
                 left: 0.0,
                 top: 0.0,
                 right: 1.0,
@@ -89,7 +89,7 @@ mod tests {
         assert_eq!(setup.keyboards["pad-1"].name.as_deref(), Some("RED"));
         assert_eq!(
             setup.keyboards["pad-1"].mode,
-            super::super::keyboard::KeyboardMode::Grab
+            crate::config::keyboard::KeyboardMode::Grab
         );
     }
 

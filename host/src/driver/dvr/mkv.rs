@@ -349,7 +349,7 @@ pub struct MkvReader {
     file: File,
     frames: Vec<FrameRec>,
     max_frame: usize,
-    resolution: super::Resolution,
+    resolution: Resolution,
 }
 
 impl MkvReader {
@@ -387,7 +387,7 @@ impl MkvReader {
             match id {
                 TRACKS_ID => {
                     let (w, h) = parse_tracks(&mut r, size)?;
-                    resolution = Some(super::Resolution {
+                    resolution = Some(Resolution {
                         width: w,
                         height: h,
                     });
@@ -438,7 +438,7 @@ impl crate::driver::dvr::VideoReader for MkvReader {
         self.max_frame
     }
 
-    fn resolution(&self) -> super::Resolution {
+    fn resolution(&self) -> Resolution {
         self.resolution
     }
 

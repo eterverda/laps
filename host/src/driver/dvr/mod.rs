@@ -351,7 +351,7 @@ mod tests {
     /// умолчанию (MKV); REC гаснет по выходу writer-потока.
     #[test]
     fn yuyv_reencode_records_to_container() {
-        use super::{RecordState, SharedRecordState};
+        use super::{RecordState, SharedRecordState, RecordParams, Recorder, epoch_millis};
         use crate::config::camera::{CameraConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -359,7 +359,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("laps-dvr-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
-        let params = super::RecordParams {
+        let params = RecordParams {
             dir: dir.clone(),
             stem: "test-stem".to_owned(),
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Yuyv),
@@ -373,7 +373,7 @@ mod tests {
             format: PixelConfig::Yuyv,
         };
         {
-            let recorder = super::Recorder::start(&params, &negotiated, &state).unwrap();
+            let recorder = Recorder::start(&params, &negotiated, &state).unwrap();
             for _ in 0..3 {
                 let pixels = vec![egui::Color32::BLACK; 64 * 48];
                 recorder.push(
@@ -383,7 +383,7 @@ mod tests {
                             rgba: egui::ColorImage::new([64, 48], pixels),
                         },
                     }),
-                    super::epoch_millis(),
+                    epoch_millis(),
                 );
             }
         } // drop: writer дописывает файл в фоне
@@ -422,7 +422,7 @@ mod tests {
     /// настоящие JPEG (как из MJPEG-потока), чтобы путь был полным.
     #[test]
     fn records_isobmff_and_reads_back() {
-        use super::{RecordState, SharedRecordState, open_reader};
+        use super::{RecordState, SharedRecordState, open_reader, RecordParams, Recorder, epoch_millis};
         use crate::config::camera::{CameraConfig, ContainerConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -436,7 +436,7 @@ mod tests {
             let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
             let mut camera = CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg);
             camera.dvr.container = container;
-            let params = super::RecordParams {
+            let params = RecordParams {
                 dir: dir.clone(),
                 stem: "test-stem".to_owned(),
                 camera,
@@ -458,11 +458,11 @@ mod tests {
                     .iter()
                     .flat_map(|c| c.to_array())
                     .collect();
-                jpegs.push(super::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap());
+                jpegs.push(crate::driver::dvr::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap());
             }
             let base = 8_000_000u64;
             {
-                let recorder = super::Recorder::start(&params, &negotiated, &state).unwrap();
+                let recorder = Recorder::start(&params, &negotiated, &state).unwrap();
                 for i in 0..6u64 {
                     let jpeg = &jpegs[i as usize % 2];
                     recorder.push(
@@ -514,7 +514,7 @@ mod tests {
     /// Abort: файл финализируется и удаляется (запись вне гонки).
     #[test]
     fn abort_recording_deletes_file() {
-        use super::{RecordState, SharedRecordState};
+        use super::{RecordState, SharedRecordState, RecordParams, Recorder, epoch_millis};
         use crate::config::camera::{CameraConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -522,7 +522,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("laps-dvr-abort-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
-        let params = super::RecordParams {
+        let params = RecordParams {
             dir: dir.clone(),
             stem: "abort-stem".to_owned(),
             camera: CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg),
@@ -538,14 +538,14 @@ mod tests {
         // Стем полный (camera_id уже в нём — см. RecordParams).
         let path = dir.join("abort-stem-mjpeg.mkv");
         {
-            let recorder = super::Recorder::start(&params, &negotiated, &state).unwrap();
+            let recorder = Recorder::start(&params, &negotiated, &state).unwrap();
             let rgba: Vec<u8> =
                 egui::ColorImage::new([64, 48], vec![egui::Color32::BLACK; 64 * 48])
                     .pixels
                     .iter()
                     .flat_map(|c| c.to_array())
                     .collect();
-            let jpeg = super::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
+            let jpeg = crate::driver::dvr::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
             recorder.push(
                 Arc::new(crate::driver::camera::capture::Frame {
                     timestamp: std::time::Instant::now(),

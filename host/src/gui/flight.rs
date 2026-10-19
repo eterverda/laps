@@ -4,7 +4,7 @@
 //! EXIT в меню. Гоночное состояние живёт в потоке ядра
 //! (model::rules + service::race), экран — намерения и рендер снапшотов.
 
-use super::ruler::{self, IntoRuler};
+use crate::gui::ruler::{self, IntoRuler};
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
@@ -41,9 +41,9 @@ pub fn viewfinder_cols(count: usize) -> isize {
 }
 
 /// Машина состояний экрана: данные фаз инкапсулированы в вариантах.
-/// Гоночные фазы эфира живут в ядре (service::race::Phase) — здесь
+/// Гоночные фазы эфира живут в ядре (service::race::RaceStage) — здесь
 /// только разделение «эфир vs DVR».
-enum Phase {
+enum Mode {
     /// Эфир без гоночного потока: захваты живы, REC/RACE ещё не нажаты.
     /// Журнал и ядро рождаются первым намерением (Idle → Live).
     Idle(Idle),
@@ -65,7 +65,7 @@ struct Live {
     /// Гоночный поток: намерения туда, уведомления оттуда.
     race: Race,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
-    state: race::Phase,
+    state: race::RaceStage,
     rules: RaceRules,
     webcams: HashMap<String, crate::driver::camera::Camera>,
     /// Подавление сна: держится ради Drop (inhibit снимается при
@@ -208,7 +208,7 @@ pub struct Flight {
     /// сразу, флаг — для навигации в меню из update (нужен Navigator).
     exit_requested: bool,
     header: header::Header,
-    phase: Phase,
+    phase: Mode,
 }
 
 impl From<Box<Flight>> for State {
@@ -248,19 +248,19 @@ impl Flight {
             res: None,
             exit_requested: false,
             header: header::Header::new(),
-            phase: Phase::Idle(Idle { webcams }),
+            phase: Mode::Idle(Idle { webcams }),
         }
     }
 
     /// Idle → Live по первому REC/RACE: рождается гоночный поток (ядро
     /// стартует сразу с этим намерением — born), keepawake.
     fn enter_live(&mut self, first: Intent) {
-        if !matches!(self.phase, Phase::Idle(_)) {
+        if !matches!(self.phase, Mode::Idle(_)) {
             return;
         }
-        let Phase::Idle(idle) = std::mem::replace(
+        let Mode::Idle(idle) = std::mem::replace(
             &mut self.phase,
-            Phase::Idle(Idle {
+            Mode::Idle(Idle {
                 webcams: HashMap::new(),
             }),
         ) else {
@@ -296,7 +296,7 @@ impl Flight {
             first,
             self.audio.clone(),
         );
-        self.phase = Phase::Live(Live {
+        self.phase = Mode::Live(Live {
             race,
             state,
             rules: self.rules,
@@ -308,18 +308,18 @@ impl Flight {
     /// Live → Idle: REC-off до старта гонки (ядро дропнуто потоком,
     /// журнала на диске нет). Остаются только захваты.
     fn back_to_idle(&mut self) {
-        if !matches!(self.phase, Phase::Live(_)) {
+        if !matches!(self.phase, Mode::Live(_)) {
             return;
         }
-        let Phase::Live(live) = std::mem::replace(
+        let Mode::Live(live) = std::mem::replace(
             &mut self.phase,
-            Phase::Idle(Idle {
+            Mode::Idle(Idle {
                 webcams: HashMap::new(),
             }),
         ) else {
             unreachable!()
         };
-        self.phase = Phase::Idle(Idle {
+        self.phase = Mode::Idle(Idle {
             webcams: live.webcams,
         });
     }
@@ -348,7 +348,7 @@ impl Flight {
                 })
             });
         let shown_cameras = filter_cameras(&setup, &assignments);
-        let phase = Phase::Review(Review::open(
+        let phase = Mode::Review(Review::open(
             ctx,
             journal,
             &setup,
@@ -375,7 +375,7 @@ impl Flight {
         // Уведомления гонки (Live) и переход в DVR по закрытию.
         let mut enter_review = None;
         let mut back_to_idle = false;
-        if let Phase::Live(l) = &mut self.phase {
+        if let Mode::Live(l) = &mut self.phase {
             while let Ok(notice) = l.race.notices.try_recv() {
                 match notice {
                     Notice::State(state) => l.state = state,
@@ -388,7 +388,7 @@ impl Flight {
                 .values()
                 .any(|w| w.capture_state() == CaptureState::Live);
             if !streaming
-                && (l.state.countdown_active() || matches!(l.state, race::Phase::Running { .. }))
+                && (l.state.countdown_active() || matches!(l.state, race::RaceStage::Running { .. }))
             {
                 // Самовзвод перерисовок счётчика гонки — только в живых
                 // фазах без кадров (в DVR кадры гонят перерисовки сами).
@@ -405,13 +405,13 @@ impl Flight {
             self.back_to_idle();
         }
         match &mut self.phase {
-            Phase::Idle(i) => {
+            Mode::Idle(i) => {
                 Self::prepare_idle(i, &self.setup, &self.assignments, &self.shown_cameras, alt)
             }
-            Phase::Live(l) => {
+            Mode::Live(l) => {
                 Self::prepare_live(l, &self.setup, &self.assignments, &self.shown_cameras, alt)
             }
-            Phase::Review(d) => Self::prepare_dvr(d, &self.setup, &self.assignments, ctx, alt),
+            Mode::Review(d) => Self::prepare_dvr(d, &self.setup, &self.assignments, ctx, alt),
         }
     }
 
@@ -528,7 +528,7 @@ impl Flight {
     ) -> FrameContents {
         let state = l.state;
         let rec_on = state.rec_on();
-        let race_on = state.countdown_active() || matches!(state, race::Phase::Running { .. });
+        let race_on = state.countdown_active() || matches!(state, race::RaceStage::Running { .. });
         let now = Instant::now();
         let pads = Self::prepare_pads(&mut l.webcams, setup, assignments, shown_cameras, alt);
         let fps_lines = if alt {
@@ -541,7 +541,7 @@ impl Flight {
         let duration = l.rules.duration;
         let race_hint = if alt {
             match (state, duration) {
-                (race::Phase::Running { start }, Some(duration)) => Some(format!(
+                (race::RaceStage::Running { start }, Some(duration)) => Some(format!(
                     "-{}",
                     mmss(duration.saturating_sub(start.elapsed()))
                 )),
@@ -554,7 +554,7 @@ impl Flight {
         // Счётчик гонки: мигание последней секунды отсчёта, нули пристыжены.
         let (text, dim) = {
             let blink_off = match state {
-                race::Phase::Countdown { start } => {
+                race::RaceStage::Countdown { start } => {
                     start.saturating_duration_since(now).as_millis() as u64 % 1000 >= 500
                 }
                 _ => false,
@@ -912,7 +912,7 @@ impl Flight {
                         .window
                         .map(|(lo, hi)| (to_frac(lo), to_frac(hi.min(t.end))));
                     let marker = t.marker.map(to_frac);
-                    if let Phase::Review(d) = &mut self.phase {
+                    if let Mode::Review(d) = &mut self.phase {
                         let (response, events) = d.scrub.timeline.show(
                             ui,
                             timeline_rect,
@@ -1079,7 +1079,7 @@ impl Flight {
                     let row = ruler::CELL_SIZE.y;
                     let w = lines
                         .iter()
-                        .map(|l| super::measure_text(ui.ctx(), style::FONT_REGULAR, l).x)
+                        .map(|l| measure_text(ui.ctx(), style::FONT_REGULAR, l).x)
                         .fold(0.0f32, f32::max);
                     let text = egui::Rect::from_min_max(
                         egui::pos2(rect.center().x - w / 2.0, rect.top() - row * 2.0),
@@ -1159,7 +1159,7 @@ impl Flight {
                         TRANSPORT_ACTIVE,
                     ),
                 ];
-                if let Phase::Review(d) = &mut self.phase {
+                if let Mode::Review(d) = &mut self.phase {
                     let clip = Some(race_clip(d.journal.iter_ms()));
                     let mut responses: Vec<Option<egui::Response>> = Vec::new();
                     for (content, rect, id, icon, idle, lit) in &transport {
@@ -1326,7 +1326,7 @@ impl Flight {
                 // мигания/нулей), в DVR — позиция.
                 let timer_pos = egui::pos2(egui::Rect::from(ruler).right() + ruler::cell_x(2), y);
                 let timer_icon = "\u{f43a}";
-                let icon_w = super::measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
+                let icon_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
                 let timer_color = if frame.timer.dim {
                     TRANSPORT_ACTIVE.gamma_multiply(0.2)
                 } else {
@@ -1356,7 +1356,7 @@ impl Flight {
             Action::Exit => {
                 // Ядро доводит гонку до целостности (финиш/abort),
                 // экран закрываем не дожидаясь.
-                if let Phase::Live(l) = &self.phase {
+                if let Mode::Live(l) = &self.phase {
                     l.race.intent(Intent::Exit);
                 }
                 navigator.goto(menu::Menu::new())
@@ -1364,9 +1364,9 @@ impl Flight {
             Action::Intent(intent) => {
                 // Первое нажатие в Idle рождает поток (ядро — с этим
                 // намерением); в Live уходит в ядро как есть.
-                if matches!(self.phase, Phase::Idle(_)) {
+                if matches!(self.phase, Mode::Idle(_)) {
                     self.enter_live(intent);
-                } else if let Phase::Live(l) = &self.phase {
+                } else if let Mode::Live(l) = &self.phase {
                     l.race.intent(intent);
                 }
             }
@@ -1384,7 +1384,7 @@ impl Flight {
             &self.shown_cameras,
             self.captures.clone(),
         );
-        self.phase = Phase::Review(dvr);
+        self.phase = Mode::Review(dvr);
     }
 
     /// Часы DVR в журнальном домене: (старт, позиция, конец). Полоска
@@ -1590,9 +1590,9 @@ impl Flight {
         let ok = |message: String| Some(crate::remote::Response { message, code: 0 });
         match (&head, &mut self.phase) {
             (&"rec", _) => {
-                if matches!(self.phase, Phase::Idle(_)) {
+                if matches!(self.phase, Mode::Idle(_)) {
                     self.enter_live(Intent::RecPressed);
-                } else if let Phase::Live(l) = &self.phase {
+                } else if let Mode::Live(l) = &self.phase {
                     if l.state.rec_available() {
                         l.race.intent(Intent::RecPressed);
                     }
@@ -1600,16 +1600,16 @@ impl Flight {
                 ok(String::new())
             }
             (&"race", _) => {
-                if matches!(self.phase, Phase::Idle(_)) {
+                if matches!(self.phase, Mode::Idle(_)) {
                     self.enter_live(Intent::RacePressed);
-                } else if let Phase::Live(l) = &self.phase {
+                } else if let Mode::Live(l) = &self.phase {
                     if l.state.race_available() {
                         l.race.intent(Intent::RacePressed);
                     }
                 }
                 ok(String::new())
             }
-            (&"play", Phase::Review(d)) => {
+            (&"play", Mode::Review(d)) => {
                 if d.transport.is_running() {
                     d.transport.pause();
                 } else {
@@ -1618,19 +1618,19 @@ impl Flight {
                 ok(String::new())
             }
             (&"play", _) => ok(String::new()),
-            (&"ff", Phase::Review(d)) => {
+            (&"ff", Mode::Review(d)) => {
                 let clip = Some(race_clip(d.journal.iter_ms()));
                 let step = scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
                 Self::seek_by(d, &clip, step);
                 ok(String::new())
             }
-            (&"rew", Phase::Review(d)) => {
+            (&"rew", Mode::Review(d)) => {
                 let clip = Some(race_clip(d.journal.iter_ms()));
                 let step = scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
                 Self::seek_by(d, &clip, -step);
                 ok(String::new())
             }
-            (&"seek", Phase::Review(d)) => {
+            (&"seek", Mode::Review(d)) => {
                 // Абсолютная позиция в домене сессии (мс от нуля
                 // журнала); транспорт клампит к шкале.
                 let ms: u64 = command.get(1).and_then(|a| a.parse().ok())?;
@@ -1641,7 +1641,7 @@ impl Flight {
             (&"exit", _) => {
                 // Ядру — немедленно (инварианты целостности), флаг —
                 // только для навигации (нужен Navigator из update).
-                if let Phase::Live(l) = &self.phase {
+                if let Mode::Live(l) = &self.phase {
                     l.race.intent(Intent::Exit);
                 }
                 self.exit_requested = true;

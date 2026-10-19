@@ -6,7 +6,7 @@
 //! S_FMT): switching a device into another mode before the real open
 //! can leave the following stream in a throttled state.
 
-use super::capture::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
+use crate::driver::camera::capture::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
 use super::Error;
 use crate::config::camera::{CameraConfig, PixelConfig};
 use std::ffi::CString;

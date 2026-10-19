@@ -66,7 +66,7 @@ pub enum Effect {
 /// After → Finished; отмена до старта (REC-off из Before/Countdown) —
 /// тоже Finished, но без гонки (ядро дропается, GUI в Idle).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Phase {
+pub enum RaceStage {
     /// REC включена, гонка не началась (первая запись — ядро рождается
     /// первым намерением сразу в этой фазе или в Countdown).
     Before,
@@ -83,39 +83,39 @@ pub enum Phase {
     Finished,
 }
 
-impl Phase {
+impl RaceStage {
     /// REC активна (индикатор/цвет кнопки).
     pub fn rec_on(&self) -> bool {
         matches!(
             self,
-            Phase::Before | Phase::Countdown { .. } | Phase::Running { .. } | Phase::After { .. }
+            RaceStage::Before | RaceStage::Countdown { .. } | RaceStage::Running { .. } | RaceStage::After { .. }
         )
     }
 
     /// Идёт отсчёт (мигание счётчика).
     pub fn countdown_active(&self) -> bool {
-        matches!(self, Phase::Countdown { .. })
+        matches!(self, RaceStage::Countdown { .. })
     }
 
     /// Время гонки для счётчика: бежит в Race, заморожено после.
     pub fn race_elapsed(&self, now: Instant) -> Duration {
         match *self {
-            Phase::After { race } => race,
-            Phase::Running { start } => now.saturating_duration_since(start),
+            RaceStage::After { race } => race,
+            RaceStage::Running { start } => now.saturating_duration_since(start),
             _ => Duration::ZERO,
         }
     }
 
     /// REC кликабельна: с эфира до конца хвоста.
     pub fn rec_available(&self) -> bool {
-        !matches!(self, Phase::Finished)
+        !matches!(self, RaceStage::Finished)
     }
 
     /// RACE кликабельна: нажатие до старта, отжатие в Countdown/Race.
     pub fn race_available(&self) -> bool {
         matches!(
             self,
-            Phase::Before | Phase::Countdown { .. } | Phase::Running { .. }
+            RaceStage::Before | RaceStage::Countdown { .. } | RaceStage::Running { .. }
         )
     }
 
@@ -123,28 +123,28 @@ impl Phase {
     pub fn race_started(&self) -> bool {
         matches!(
             self,
-            Phase::Running { .. } | Phase::After { .. } | Phase::Finished
+            RaceStage::Running { .. } | RaceStage::After { .. } | RaceStage::Finished
         )
     }
 
     pub fn finished(&self) -> bool {
-        matches!(self, Phase::Finished)
+        matches!(self, RaceStage::Finished)
     }
 }
 
 /// Фаза, в которой окажется ядро после born с этим намерением —
 /// GUI ставит её в Live на кадр рождения, до первого Notice::State.
-pub fn born_state(first: Intent, now: Instant, rules: &RaceRules) -> Phase {
+pub fn born_state(first: Intent, now: Instant, rules: &RaceRules) -> RaceStage {
     match first {
-        Intent::RecPressed => Phase::Before,
-        Intent::RacePressed => Phase::Countdown {
+        Intent::RecPressed => RaceStage::Before,
+        Intent::RacePressed => RaceStage::Countdown {
             start: race_time_start(
                 now,
                 Duration::from_secs(PRE_BEEP_SECS) + sample_start_delay(&rules.start_signal_delay),
                 BUZZER.duration(),
             ),
         },
-        Intent::Exit => Phase::Finished,
+        Intent::Exit => RaceStage::Finished,
     }
 }
 
@@ -153,7 +153,7 @@ pub fn born_state(first: Intent, now: Instant, rules: &RaceRules) -> Phase {
 /// писатель журнала; порядок «журнал раньше уведомления GUI» обеспечивает
 /// обёртка (эффекты применяются после записи в журнал).
 pub struct RaceCore {
-    phase: Phase,
+    phase: RaceStage,
     rules: RaceRules,
     journal: Journal,
     captures_dir: PathBuf,
@@ -200,7 +200,7 @@ impl RaceCore {
             time::OffsetDateTime::now_utc()
         });
         let mut core = Self {
-            phase: Phase::Before,
+            phase: RaceStage::Before,
             rules,
             journal: Journal::new(date_time, pads, assignments),
             captures_dir,
@@ -225,7 +225,7 @@ impl RaceCore {
         at.saturating_duration_since(self.started).as_millis() as u64
     }
 
-    pub fn phase(&self) -> Phase {
+    pub fn phase(&self) -> RaceStage {
         self.phase
     }
 
@@ -248,8 +248,8 @@ impl RaceCore {
     /// Ближайший таймер ядра: конец отсчёта или лимит гонки.
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
-            Phase::Countdown { start } => Some(start),
-            Phase::Running { start } => self.rules.duration.map(|d| start + d),
+            RaceStage::Countdown { start } => Some(start),
+            RaceStage::Running { start } => self.rules.duration.map(|d| start + d),
             _ => None,
         }
     }
@@ -257,25 +257,25 @@ impl RaceCore {
     /// Перевод часов: конец отсчёта — в Running, лимит — в After.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
-            Phase::Countdown { start } if now >= start => {
+            RaceStage::Countdown { start } if now >= start => {
                 // Журнал появляется только если гонка состоялась:
                 // отложенная голова уходит в память, файл создаёт
                 // писатель (поток-обёртка) снапшотом на этом же тике.
                 self.flush_rec_deferred();
                 self.journal
                     .push(self.ms(start), FlightEvent::RaceStarted {});
-                self.phase = Phase::Running { start };
+                self.phase = RaceStage::Running { start };
                 self.raced = true;
                 Vec::new()
             }
-            Phase::Running { start } => {
+            RaceStage::Running { start } => {
                 let elapsed = now.saturating_duration_since(start);
                 if self.rules.duration.is_some_and(|limit| elapsed >= limit) {
                     self.journal.push(
                         self.ms(now),
                         FlightEvent::RaceFinished { prematurely: false },
                     );
-                    self.phase = Phase::After { race: elapsed };
+                    self.phase = RaceStage::After { race: elapsed };
                     vec![Effect::Buzzer]
                 } else {
                     Vec::new()
@@ -288,63 +288,63 @@ impl RaceCore {
     /// Намерение REC (ядро рождено — см. born).
     pub fn rec_pressed(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
-            Phase::Before | Phase::Countdown { .. } => {
+            RaceStage::Before | RaceStage::Countdown { .. } => {
                 // REC-off до старта гонки: отмена сессии. Поток увидит
                 // Finished без raced и дропнет ядро (GUI — в Idle).
                 self.rec_deferred.clear();
                 self.rec_pending.clear();
-                self.phase = Phase::Finished;
+                self.phase = RaceStage::Finished;
                 vec![Effect::CancelAudio, Effect::StopRecording { commit: false }]
             }
-            Phase::Running { .. } => {
+            RaceStage::Running { .. } => {
                 // REC гасит запись посреди гонки — гонка финиширует здесь.
                 self.journal.push(
                     self.ms(now),
                     FlightEvent::RaceFinished { prematurely: false },
                 );
                 self.finish_recording(now);
-                self.phase = Phase::Finished;
+                self.phase = RaceStage::Finished;
                 vec![Effect::Buzzer, Effect::StopRecording { commit: true }]
             }
-            Phase::After { .. } => {
+            RaceStage::After { .. } => {
                 self.finish_recording(now);
-                self.phase = Phase::Finished;
+                self.phase = RaceStage::Finished;
                 vec![Effect::StopRecording { commit: true }]
             }
-            Phase::Finished => Vec::new(),
+            RaceStage::Finished => Vec::new(),
         }
     }
 
     /// Намерение RACE (ядро рождено — см. born).
     pub fn race_pressed(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
-            Phase::Before => {
+            RaceStage::Before => {
                 // Запись уже идёт (new = REC-on): отсчёт к ней.
                 let delay = self.countdown_delay();
                 self.defer_countdown(now);
-                self.phase = Phase::Countdown {
+                self.phase = RaceStage::Countdown {
                     start: race_time_start(now, delay, self.buzzer_len),
                 };
                 vec![Effect::Countdown { delay }]
             }
-            Phase::Countdown { .. } => {
+            RaceStage::Countdown { .. } => {
                 // Отмена: отложенный отсчёт не состоялся — выбрасываем.
                 self.rec_deferred
                     .retain(|(_, ev)| !matches!(ev, FlightEvent::RaceCountdown {}));
-                self.phase = Phase::Before;
+                self.phase = RaceStage::Before;
                 vec![Effect::CancelAudio]
             }
-            Phase::Running { start } => {
+            RaceStage::Running { start } => {
                 // Финиш кнопкой — гудок, запись хвоста продолжается.
                 let race = now.saturating_duration_since(start);
                 self.journal.push(
                     self.ms(now),
                     FlightEvent::RaceFinished { prematurely: true },
                 );
-                self.phase = Phase::After { race };
+                self.phase = RaceStage::After { race };
                 vec![Effect::Buzzer]
             }
-            Phase::After { .. } | Phase::Finished => Vec::new(),
+            RaceStage::After { .. } | RaceStage::Finished => Vec::new(),
         }
     }
 
@@ -353,7 +353,7 @@ impl RaceCore {
     /// Ядро после вызова уничтожается — состояние не переводим.
     pub fn exit(&mut self, now: Instant) -> Vec<Effect> {
         match self.phase {
-            Phase::Running { .. } => {
+            RaceStage::Running { .. } => {
                 self.journal.push(
                     self.ms(now),
                     FlightEvent::RaceFinished { prematurely: true },
@@ -361,16 +361,16 @@ impl RaceCore {
                 self.finish_recording(now);
                 vec![Effect::Buzzer, Effect::StopRecording { commit: true }]
             }
-            Phase::After { .. } => {
+            RaceStage::After { .. } => {
                 self.finish_recording(now);
                 vec![Effect::StopRecording { commit: true }]
             }
-            Phase::Before | Phase::Countdown { .. } => {
+            RaceStage::Before | RaceStage::Countdown { .. } => {
                 self.rec_deferred.clear();
                 self.rec_pending.clear();
                 vec![Effect::CancelAudio, Effect::StopRecording { commit: false }]
             }
-            Phase::Finished => Vec::new(),
+            RaceStage::Finished => Vec::new(),
         }
     }
 
@@ -821,10 +821,10 @@ mod tests {
         let t_later = clock.advance(3_600_000);
         assert!(core.tick(t_later).is_empty());
         assert!(
-            matches!(core.phase(), Phase::Running { .. }),
+            matches!(core.phase(), RaceStage::Running { .. }),
             "гонка без лимита жива"
         );
-        assert!(!core.phase().race_started() || matches!(core.phase(), Phase::Running { .. }));
+        assert!(!core.phase().race_started() || matches!(core.phase(), RaceStage::Running { .. }));
         // Пользователь завершает кнопкой.
         assert!(matches!(
             core.race_pressed(t_later).as_slice(),
@@ -856,7 +856,7 @@ mod tests {
 /// Сообщения ядра → GUI.
 pub enum Notice {
     /// Состояние эфира изменилось (GUI держит последний).
-    State(Phase),
+    State(RaceStage),
     /// Гонка закрыта: журнал переходит GUI (открытие плееров — GUI,
     /// там egui::Context). Поток после этого завершается.
     EnterReview { journal: Journal },

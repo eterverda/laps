@@ -1,5 +1,5 @@
 use crate::gui::measure_text;
-use crate::gui::ruler;
+use crate::gui::ruler::{self, cell_x, cell_y};
 use crate::gui::style;
 
 pub struct Letterbox {
@@ -292,7 +292,7 @@ pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
         })
         .sum();
     if words.len() > 1 {
-        width += ruler::cell_x(1) * (words.len() - 1) as f32;
+        width += cell_x(1) * (words.len() - 1) as f32;
     }
     width
 }
@@ -383,8 +383,8 @@ fn stripe(
             let cut: egui::Rect = rect
                 .right_top()
                 .into_ruler()
-                .translate(-ruler::cell_x(rows), 0.0)
-                .extrude(ruler::cell_x(rows), ruler::cell_y(rows))
+                .translate(-cell_x(rows), 0.0)
+                .extrude(cell_x(rows), cell_y(rows))
                 .into();
             (cut, rect.with_max_x(cut.left()))
         }
@@ -392,7 +392,7 @@ fn stripe(
             let cut: egui::Rect = rect
                 .left_top()
                 .into_ruler()
-                .extrude(ruler::cell_x(rows), ruler::cell_y(rows))
+                .extrude(cell_x(rows), cell_y(rows))
                 .into();
             (cut, rect.with_min_x(cut.right()))
         }
@@ -422,8 +422,8 @@ fn stripe(
     // Контент: по клетке поля слева и справа от текста; по вертикали
     // отступов нет.
     plate
-        .with_min_x(plate.min.x + ruler::cell_x(1))
-        .with_max_x(plate.max.x - ruler::cell_x(1))
+        .with_min_x(plate.min.x + cell_x(1))
+        .with_max_x(plate.max.x - cell_x(1))
 }
 
 /// Кнопка транспорта (scrub): залитый прямоугольник 3 клетки высотой,
@@ -488,7 +488,7 @@ impl<T: AsRef<str>> TransportButton<T> {
         let w = content_width(ui.ctx(), text);
         let mut pos = egui::pos2(rect.center().x - w / 2.0, rect.bottom());
         for word in text.split(' ').filter(|word| !word.is_empty()) {
-            pos.x += paint_word(ui, pos, word, icon_color) + ruler::cell_x(1);
+            pos.x += paint_word(ui, pos, word, icon_color) + cell_x(1);
         }
     }
 }
@@ -505,8 +505,8 @@ pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]
         .iter()
         .map(|line| measure_text(ui.ctx(), style::FONT_REGULAR, line).x)
         .fold(0.0f32, f32::max);
-    let right = anchor.right() - ruler::cell_x(1);
-    let bottom = anchor.bottom() - ruler::cell_y(1);
+    let right = anchor.right() - cell_x(1);
+    let bottom = anchor.bottom() - cell_y(1);
     let text = egui::Rect::from_min_max(
         egui::pos2(right - width, bottom - row),
         egui::pos2(right, bottom),

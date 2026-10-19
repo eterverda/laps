@@ -371,17 +371,17 @@ const KEY_NAMES: [Option<&str>; 0xE8] = [
 const _: () = assert!(KEY_NAMES.len() == 0xE8);
 
 /// Canonical key name for a HID usage; unknown codes render as "0xNN".
-pub fn key_name(keycode: u32) -> String {
+pub fn keycode_to_str(keycode: u32) -> String {
     match KEY_NAMES.get(keycode as usize).copied().flatten() {
         Some(name) => name.to_owned(),
         None => format!("0x{keycode:02X}"),
     }
 }
 
-/// Reverse of `key_name`: the HID usage for a canonical name, exact
-/// case, no folding ("1" -> 0x1E, "F21" -> 0x70). Anything `key_name`
+/// Reverse of `keycode_to_str`: the HID usage for a canonical name, exact
+/// case, no folding ("1" -> 0x1E, "F21" -> 0x70). Anything `keycode_to_str`
 /// would not produce ("a", "0x1E") is rejected.
-pub fn key_usage(name: &str) -> Option<u32> {
+pub fn keycode_from_str(name: &str) -> Option<u32> {
     KEY_NAMES
         .iter()
         .position(|entry| *entry == Some(name))
@@ -454,15 +454,15 @@ mod tests {
 
     #[test]
     fn key_names_use_hid_names_with_doc_abbreviations() {
-        assert_eq!(key_name(0x70), "F21");
-        assert_eq!(key_name(0x04), "A"); // "Keyboard a and A" collapsed
-        assert_eq!(key_name(0x52), "UpArrow");
-        assert_eq!(key_name(0xE0), "LeftControl");
-        assert_eq!(key_name(0x2C), "Spacebar");
+        assert_eq!(keycode_to_str(0x70), "F21");
+        assert_eq!(keycode_to_str(0x04), "A"); // "Keyboard a and A" collapsed
+        assert_eq!(keycode_to_str(0x52), "UpArrow");
+        assert_eq!(keycode_to_str(0xE0), "LeftControl");
+        assert_eq!(keycode_to_str(0x2C), "Spacebar");
         // Unknown / reserved usages render as 0xNN.
-        assert_eq!(key_name(0x00), "0x00");
-        assert_eq!(key_name(0xA5), "0xA5");
-        assert_eq!(key_name(0xE8), "0xE8");
+        assert_eq!(keycode_to_str(0x00), "0x00");
+        assert_eq!(keycode_to_str(0xA5), "0xA5");
+        assert_eq!(keycode_to_str(0xE8), "0xE8");
     }
 
     #[test]
@@ -489,21 +489,21 @@ mod tests {
 
     #[test]
     fn key_usage_reverses_key_name() {
-        assert_eq!(key_usage("1"), Some(0x1E));
-        assert_eq!(key_usage("F21"), Some(0x70));
-        assert_eq!(key_usage("UpArrow"), Some(0x52));
-        assert_eq!(key_usage("LeftControl"), Some(0xE0));
+        assert_eq!(keycode_from_str("1"), Some(0x1E));
+        assert_eq!(keycode_from_str("F21"), Some(0x70));
+        assert_eq!(keycode_from_str("UpArrow"), Some(0x52));
+        assert_eq!(keycode_from_str("LeftControl"), Some(0xE0));
         // Round trip over the whole table.
         for usage in 0..=0xE7u32 {
             if let Some(name) = KEY_NAMES[usage as usize] {
-                assert_eq!(key_usage(name), Some(usage));
+                assert_eq!(keycode_from_str(name), Some(usage));
             }
         }
         // Non-canonical spellings are rejected: no folding, no 0xNN.
-        assert_eq!(key_usage("a"), None);
-        assert_eq!(key_usage("f21"), None);
-        assert_eq!(key_usage("0x1E"), None);
-        assert_eq!(key_usage("nope"), None);
+        assert_eq!(keycode_from_str("a"), None);
+        assert_eq!(keycode_from_str("f21"), None);
+        assert_eq!(keycode_from_str("0x1E"), None);
+        assert_eq!(keycode_from_str("nope"), None);
     }
 
     #[test]

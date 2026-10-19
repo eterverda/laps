@@ -206,7 +206,7 @@ fn debug_keyboards() -> ! {
     while let Ok(event) = rx.recv() {
         // Mod+Mod+Key spelling: modifiers prefix the key, joined by "+".
         let modifiers = driver::keyboard::modifier_names(event.modifiers);
-        let key = driver::keyboard::key_name(event.keycode);
+        let key = driver::keyboard::keycode_to_str(event.keycode);
         let combo = if modifiers.is_empty() {
             key
         } else {

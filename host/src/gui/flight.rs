@@ -9,6 +9,7 @@ use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
 use crate::driver::camera::CaptureState;
+use crate::driver::dvr::CAPTURES_DIR;
 use crate::driver::player::{Player, PlayerState};
 use crate::model::flight::{Journal, RaceClip, race_clip};
 use crate::model::pilot::Pilot;
@@ -284,7 +285,7 @@ impl Flight {
         let state = race::born_state(first, Instant::now(), &self.rules);
         let race = race::spawn(
             self.rules,
-            std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR),
+            std::path::PathBuf::from(CAPTURES_DIR),
             self.setup.pads.clone(),
             self.assignments.clone(),
             self.shown_cameras.clone(),
@@ -334,7 +335,7 @@ impl Flight {
     ) -> Self {
         // Холодный вход: последний журнал из captures/ → DVR; журнала
         // нет — деградация на последние записи камер (пустая рамка).
-        let journal = scrub::latest_journal(std::path::Path::new(crate::driver::dvr::CAPTURES_DIR))
+        let journal = scrub::latest_journal(std::path::Path::new(CAPTURES_DIR))
             .and_then(|path| std::fs::read_to_string(&path).ok())
             .and_then(|yaml| {
                 let (header, events) = Journal::parse_stream(&yaml);
@@ -1673,7 +1674,7 @@ impl Review {
         });
         let clip = race_clip(journal.iter_ms());
         let mut players = HashMap::new();
-        let dir = std::path::Path::new(crate::driver::dvr::CAPTURES_DIR);
+        let dir = std::path::Path::new(CAPTURES_DIR);
         let mut opened = 0;
         for (camera_id, (filename, _)) in &clip.files {
             let path = dir.join(filename);

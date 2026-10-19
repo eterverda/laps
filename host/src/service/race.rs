@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel as crossbeam;
+
+use crate::assets::BUZZER_WAV;
+use crate::model::flight;
 
 use crate::config::camera::{CameraConfig, ContainerConfig as CameraConfigContainer};
 use crate::config::setup::PadConfig;
@@ -20,7 +23,7 @@ use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
 
 /// Гудок старт/стоп.
-const BUZZER: audio::Sound = audio::Sound::from_bytes(crate::assets::BUZZER_WAV);
+const BUZZER: audio::Sound = audio::Sound::from_bytes(BUZZER_WAV);
 /// Бип отсчёта.
 const STAGE: audio::Sound = audio::Sound::from_bytes(crate::assets::STAGE_WAV);
 
@@ -867,8 +870,8 @@ pub enum Notice {
 
 /// Хэндл гоночного потока для GUI: шлём намерения, забираем уведомления.
 pub struct Race {
-    intents: Sender<Intent>,
-    pub notices: Receiver<Notice>,
+    intents: crossbeam::Sender<Intent>,
+    pub notices: crossbeam::Receiver<Notice>,
 }
 
 impl Race {
@@ -884,15 +887,15 @@ pub fn spawn(
     assignments: HashMap<String, Pilot>,
     cameras: HashMap<String, CameraConfig>,
     recorders: HashMap<String, Recorder>,
-    mut keyboards: HashMap<String, crossbeam_channel::Receiver<crate::driver::keyboard::KeyEvent>>,
+    mut keyboards: HashMap<String, crossbeam::Receiver<crate::driver::keyboard::KeyEvent>>,
     key_events: std::sync::Arc<std::sync::Mutex<Vec<crate::driver::keyboard::KeyEvent>>>,
     key_dead: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
     first: Intent,
     audio: crate::driver::audio::Audio,
 ) -> Race {
-    let (intent_tx, intent_rx) = crossbeam_channel::bounded(16);
-    let (notice_tx, notice_rx) = crossbeam_channel::bounded(64);
+    let (intent_tx, intent_rx) = crossbeam::bounded(16);
+    let (notice_tx, notice_rx) = crossbeam::bounded(64);
     std::thread::spawn(move || {
         // new = REC нажали: журнал и ноль меток — от этого момента.
         // Жизнь потока — сессия REC: REC-off до старта гонки отменяет
@@ -928,7 +931,7 @@ pub fn spawn(
             }
             let journal = active.journal();
             match journal_path {
-                None => match crate::model::flight::snapshot(journal, &captures_dir) {
+                None => match flight::snapshot(journal, &captures_dir) {
                     Ok(path) => {
                         log::info!("flight journal: stream opened at {path:?}");
                         *journal_written = journal.event_count();
@@ -937,7 +940,7 @@ pub fn spawn(
                     Err(e) => log::error!("flight journal: snapshot failed: {e}"),
                 },
                 Some(path) => {
-                    if let Err(e) = crate::model::flight::append(journal, path, journal_written) {
+                    if let Err(e) = flight::append(journal, path, journal_written) {
                         log::error!("flight journal: append failed: {e}");
                     }
                 }
@@ -960,8 +963,8 @@ pub fn spawn(
                     sync_journal(&core, &mut journal_path, &mut journal_written);
                     break;
                 }
-                Err(RecvTimeoutError::Timeout) => core.tick(Instant::now()),
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam::RecvTimeoutError::Timeout) => core.tick(Instant::now()),
+                Err(crossbeam::RecvTimeoutError::Disconnected) => break,
             };
             apply(&effects, &recorders, &audio);
 
@@ -977,11 +980,11 @@ pub fn spawn(
                                 key_events.lock().expect("key events").push(event);
                                 got = true;
                             }
-                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            Err(crossbeam::TryRecvError::Disconnected) => {
                                 dead_now.push(id.clone());
                                 break;
                             }
-                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Err(crossbeam::TryRecvError::Empty) => break,
                         }
                     }
                 }

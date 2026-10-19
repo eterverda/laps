@@ -352,6 +352,7 @@ mod tests {
     #[test]
     fn yuyv_reencode_records_to_container() {
         use super::{RecordState, SharedRecordState, RecordParams, Record, epoch_millis};
+        use crate::driver::dvr::encode;
         use crate::config::camera::{CameraConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -423,6 +424,7 @@ mod tests {
     #[test]
     fn records_isobmff_and_reads_back() {
         use super::{RecordState, SharedRecordState, open_reader, RecordParams, Record, epoch_millis};
+        use crate::driver::dvr::encode;
         use crate::config::camera::{CameraConfig, ContainerConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -458,7 +460,7 @@ mod tests {
                     .iter()
                     .flat_map(|c| c.to_array())
                     .collect();
-                jpegs.push(crate::driver::dvr::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap());
+                jpegs.push(encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap());
             }
             let base = 8_000_000u64;
             {
@@ -515,6 +517,7 @@ mod tests {
     #[test]
     fn abort_recording_deletes_file() {
         use super::{RecordState, SharedRecordState, RecordParams, Record, epoch_millis};
+        use crate::driver::dvr::encode;
         use crate::config::camera::{CameraConfig, PixelConfig};
         use crossbeam_utils::atomic::AtomicCell;
         use std::sync::Arc;
@@ -545,7 +548,7 @@ mod tests {
                     .iter()
                     .flat_map(|c| c.to_array())
                     .collect();
-            let jpeg = crate::driver::dvr::encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
+            let jpeg = encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
             recorder.push(
                 Arc::new(crate::driver::camera::capture::Frame {
                     timestamp: std::time::Instant::now(),

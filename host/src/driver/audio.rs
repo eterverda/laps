@@ -11,7 +11,7 @@
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel as crossbeam;
 
 /// Короткий звук: WAV PCM целиком в памяти, со своей длительностью.
 /// Конструктор const — строится из бинарей `assets`, файл проверяется и
@@ -89,12 +89,12 @@ enum Command {
 /// разрывается, поток выходит).
 #[derive(Clone)]
 pub struct Audio {
-    commands: crossbeam_channel::Sender<Command>,
+    commands: crossbeam::Sender<Command>,
 }
 
 impl Audio {
     pub fn spawn() -> Self {
-        let (commands, rx) = crossbeam_channel::bounded(16);
+        let (commands, rx) = crossbeam::bounded(16);
         std::thread::spawn(move || output_loop(rx));
         Self { commands }
     }
@@ -161,7 +161,7 @@ impl Schedule {
 
 /// Тело потока-плеера: открывает вывод один раз, дальше крутит
 /// расписание и команды.
-fn output_loop(commands: Receiver<Command>) {
+fn output_loop(commands: crossbeam::Receiver<Command>) {
     let Ok(stream) = rodio::DeviceSinkBuilder::open_default_sink() else {
         log::warn!("audio: no output device, sounds disabled");
         // Канал держим открытым: отправители не должны видеть ошибку,
@@ -215,12 +215,12 @@ fn output_loop(commands: Receiver<Command>) {
                 }
                 schedule.cancel();
             }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err(crossbeam::RecvTimeoutError::Timeout) => {
                 for sound in schedule.pop_due() {
                     current = start(&stream, sound).or(current);
                 }
             }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam::RecvTimeoutError::Disconnected) => break,
         }
     }
 }

@@ -3,6 +3,8 @@
 //! an empty filter matches nothing, so a missing filter can never attach
 //! every keyboard (fail-closed).
 
+use crate::driver::keyboard::{keycode_to_str, keycode_from_str};
+
 /// How the driver attaches the device. Grab is exclusive (the system
 /// and other apps see nothing); listen is passive. Serialized lowercase
 /// (`mode: grab`). Required — a missing mode is an error, never a
@@ -96,7 +98,7 @@ pub struct KeyBind {
 
 /// `key:` accepts the canonical name ("F21", "1") or a bare yaml number
 /// (1 — the digits name the number keys); both resolve through
-/// `driver::keyboard::key_usage`, anything else is an error.
+/// `driver::keyboard::keycode_from_str`, anything else is an error.
 fn de_key_usage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     struct KeyName;
     impl<'de> serde::de::Visitor<'de> for KeyName {
@@ -107,13 +109,13 @@ fn de_key_usage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error>
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u32, E> {
-            crate::driver::keyboard::key_usage(v)
+            keycode_from_str(v)
                 .ok_or_else(|| E::custom(format!("unknown key name: {v}")))
         }
 
         fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u32, E> {
             let name = v.to_string();
-            crate::driver::keyboard::key_usage(&name)
+            keycode_from_str(&name)
                 .ok_or_else(|| E::custom(format!("unknown key number: {v}")))
         }
     }
@@ -122,7 +124,7 @@ fn de_key_usage<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error>
 }
 
 fn ser_key_usage<S: serde::Serializer>(usage: &u32, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&crate::driver::keyboard::key_name(*usage))
+    s.serialize_str(&keycode_to_str(*usage))
 }
 
 /// vid/pid are 0x-prefixed hex scalars in setup files (`vid: 0x8089`):

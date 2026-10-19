@@ -189,6 +189,37 @@ impl MkvWriter {
             duration_ms: 0,
         })
     }
+
+    /// Открывает кластер с абсолютным (от первого кадра) таймкодом rel.
+    fn open_cluster(&mut self, rel: u64) -> io::Result<()> {
+        let cluster_pos = self.writer.stream_position()?;
+        self.writer
+            .write_all(&{ CLUSTER_ID as u32 }.to_be_bytes())?;
+        let size_pos = self.writer.stream_position()?;
+        // 5-байтный size-винт: до 32 ГиБ на кластер — спан 5 с при любом
+        // битрейте MJPEG укладывается с огромным запасом.
+        self.writer.write_all(&vint(0, 5)[3..])?;
+        self.cluster_data_start = self.writer.stream_position()?;
+        let mut tc = Vec::new();
+        push_u(&mut tc, 0xE7, 1, rel); // Timecode
+        self.writer.write_all(&tc)?;
+        self.cluster_size_pos = Some(size_pos);
+        self.cluster_tc = rel;
+        self.clusters.push((rel, cluster_pos));
+        Ok(())
+    }
+
+    /// Патчит size-винт открытого кластера (flush перед write_all_at).
+    fn close_cluster(&mut self) -> io::Result<()> {
+        if let Some(size_pos) = self.cluster_size_pos.take() {
+            let size = self.writer.stream_position()? - self.cluster_data_start;
+            self.writer.flush()?;
+            self.writer
+                .get_ref()
+                .write_all_at(&vint(size, 5)[3..], size_pos)?;
+        }
+        Ok(())
+    }
 }
 
 impl VideoWriter for MkvWriter {
@@ -299,38 +330,6 @@ impl VideoWriter for MkvWriter {
     }
 }
 
-impl MkvWriter {
-    /// Открывает кластер с абсолютным (от первого кадра) таймкодом rel.
-    fn open_cluster(&mut self, rel: u64) -> io::Result<()> {
-        let cluster_pos = self.writer.stream_position()?;
-        self.writer
-            .write_all(&{ CLUSTER_ID as u32 }.to_be_bytes())?;
-        let size_pos = self.writer.stream_position()?;
-        // 5-байтный size-винт: до 32 ГиБ на кластер — спан 5 с при любом
-        // битрейте MJPEG укладывается с огромным запасом.
-        self.writer.write_all(&vint(0, 5)[3..])?;
-        self.cluster_data_start = self.writer.stream_position()?;
-        let mut tc = Vec::new();
-        push_u(&mut tc, 0xE7, 1, rel); // Timecode
-        self.writer.write_all(&tc)?;
-        self.cluster_size_pos = Some(size_pos);
-        self.cluster_tc = rel;
-        self.clusters.push((rel, cluster_pos));
-        Ok(())
-    }
-
-    /// Патчит size-винт открытого кластера (flush перед write_all_at).
-    fn close_cluster(&mut self) -> io::Result<()> {
-        if let Some(size_pos) = self.cluster_size_pos.take() {
-            let size = self.writer.stream_position()? - self.cluster_data_start;
-            self.writer.flush()?;
-            self.writer
-                .get_ref()
-                .write_all_at(&vint(size, 5)[3..], size_pos)?;
-        }
-        Ok(())
-    }
-}
 
 // --- Ридер (зеркало писателя) -----------------------------------------------
 

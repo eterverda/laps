@@ -23,15 +23,15 @@ use nokhwa::NokhwaCapture as Backend;
 use v4l2::V4l2Capture as Backend;
 
 use crate::config::camera::{CameraConfig, PixelConfig, ResolutionConfig};
+use crate::driver::camera::fps::{FpsCounter, FrameStats};
 use crate::driver::dvr::{DvrSink, RecordParams, RecordState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::io::Error as IoError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::io::Error as IoError;
-use crate::driver::camera::fps::{FpsCounter, FrameStats};
 
 /// Ошибки слоя источника (перечисление/открытие устройств). Варианты
 /// различаются принадлежностью: системный сбой / диагноз нашего слоя /
@@ -171,9 +171,7 @@ impl Recorder {
     /// RecordState.done (централизовано, отдельной ячейки нет).
     pub fn wait_finalized(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        while !matches!(self.record_state.load(), RecordState::Done)
-            && Instant::now() < deadline
-        {
+        while !matches!(self.record_state.load(), RecordState::Done) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
         if !matches!(self.record_state.load(), RecordState::Done) {
@@ -219,8 +217,7 @@ impl Camera {
         let slot: ImageSlot = Arc::default();
         let running = Arc::new(AtomicBool::new(true));
         let capture_state: SharedCaptureState = Arc::new(AtomicCell::new(CaptureState::Starting));
-        let record_state: SharedRecordState =
-            Arc::new(AtomicCell::new(RecordState::Idle));
+        let record_state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
         let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
         let ui_latency = Arc::new(Mutex::new(FrameStats::default()));
         // 1×1-пустышка: id валиден с рождения, размер возьмёт первый кадр
@@ -682,9 +679,7 @@ mod tests {
         // Writing ставит worker по факту первого кадра (асинхронно) —
         // ждём, а не проверяем немедленно.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !matches!(state.load(), RecordState::Writing { .. })
-            && Instant::now() < deadline
-        {
+        while !matches!(state.load(), RecordState::Writing { .. }) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(

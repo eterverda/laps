@@ -9,8 +9,8 @@
 
 use crate::driver::camera::capture::Frame;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 use std::fmt::Display;
+use std::time::{Duration, Instant};
 
 pub struct FpsCounter {
     report_after: Duration,

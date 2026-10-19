@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use crate::config::camera::{CameraConfig, ViewportConfig};
-use crate::config::keyboard::{KeyboardConfig, KeyBind};
+use crate::config::keyboard::{KeyBind, KeyboardConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Setup {
@@ -56,8 +56,8 @@ impl ColorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml::from_str as from_yaml_string;
     use crate::config::keyboard::KeyboardMode;
+    use serde_yaml::from_str as from_yaml_string;
 
     const CAMERAS: &str = "cameras:\n  camera-1:\n    name: C7-1\n    resolution: 1920x1080\n    frame-rate: 30fps\n    format: mjpeg\n";
     const PADS: &str =
@@ -92,10 +92,7 @@ mod tests {
         .unwrap();
         assert_eq!(setup.keyboards.len(), 1);
         assert_eq!(setup.keyboards["pad-1"].name.as_deref(), Some("RED"));
-        assert_eq!(
-            setup.keyboards["pad-1"].mode,
-            KeyboardMode::Grab
-        );
+        assert_eq!(setup.keyboards["pad-1"].mode, KeyboardMode::Grab);
     }
 
     #[test]

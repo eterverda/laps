@@ -1,7 +1,7 @@
+use lazy_regex::lazy_regex;
 use serde::Deserialize;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
-use lazy_regex::lazy_regex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PixelConfig {

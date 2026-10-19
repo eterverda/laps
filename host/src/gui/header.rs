@@ -1,8 +1,8 @@
 use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
 use crate::gui::style;
 use crate::gui::view::{self, Corner};
-use time::format_description::{Component, FormatItem};
 use std::time::Duration;
+use time::format_description::{Component, FormatItem};
 
 /// Фон плашки LAPS и даты — голубой в логике catppuccin (blue mocha,
 /// чуть пригашенный под чёрный текст).

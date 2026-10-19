@@ -1,6 +1,6 @@
+use serde_yaml::from_str as from_yaml_string;
 use std::fs;
 use std::path::PathBuf;
-use serde_yaml::from_str as from_yaml_string;
 use std::process;
 use std::thread;
 

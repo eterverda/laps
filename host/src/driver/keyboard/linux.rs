@@ -12,18 +12,18 @@
 
 use super::{AttachError, KeyAction, KeyEvent, KeyboardInfo, ModifierTracker};
 use crate::config::keyboard::{KeyboardConfig, KeyboardMode};
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
+use std::io::Error as IoError;
+use std::io::ErrorKind as IoErrorKind;
+use std::io::Result as IoResult;
+use std::mem;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-use std::collections::HashSet;
-use std::mem;
 use std::thread;
-use std::io::Result as IoResult;
-use std::io::Error as IoError;
-use std::io::ErrorKind as IoErrorKind;
+use std::time::Instant;
 
 // EVIOCGRAB: 'E' 0x90, int argument (1 = grab, 0 = release). The grab
 // is tied to the fd — closing it (thread end, process death) releases.

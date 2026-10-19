@@ -17,14 +17,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::fs;
-use std::process;
-use std::mem;
-use std::thread;
-use std::io::Result as IoResult;
 use serde_yaml::from_str as from_yaml_string;
 use serde_yaml::to_string as to_yaml_string;
+use std::fs;
+use std::io::Result as IoResult;
+use std::mem;
+use std::process;
+use std::sync::Arc;
+use std::thread;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 /// Таймаут сокетных операций на loopback (чтение запроса, ответ).
@@ -96,7 +96,6 @@ fn parse_startup(args: &[String]) -> Result<Startup, String> {
         request: parts.join(" "),
     })
 }
-
 
 // --- Строка команды: квотинг и токенизация ---
 
@@ -321,9 +320,7 @@ impl Server {
     /// инстанс. Команды целиком отдаёт `execute` — колбэку, который кладёт
     /// команду GUI-потоку и будит его (иначе ответ ждал бы ближайшего
     /// кадра egui).
-    pub fn start(
-        execute: Arc<dyn Fn(Vec<String>) -> Response + Send + Sync>,
-    ) -> IoResult<Self> {
+    pub fn start(execute: Arc<dyn Fn(Vec<String>) -> Response + Send + Sync>) -> IoResult<Self> {
         cleanup();
         let listener = TcpListener::bind((DEFAULT_HOST, 0))?;
         let addr = listener.local_addr()?;
@@ -366,7 +363,6 @@ impl Server {
     pub fn port(&self) -> u16 {
         self.instance.port
     }
-
 }
 
 impl Drop for Server {

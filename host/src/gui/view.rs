@@ -11,7 +11,6 @@ use crate::gui::style;
 /// ширины не даёт.
 pub const GLYPH_FLIP: char = '\u{e6c0}';
 
-
 pub struct Letterbox {
     min_virtual_size: egui::Vec2,
     max_virtual_size: egui::Vec2,
@@ -118,18 +117,8 @@ impl Letterbox {
                     guidelines::hatch_rect(ui, bottom);
 
                     // Обводка — снаружи границы (полштриха наружу), не на ней.
-                    guidelines::solid_line(
-                        ui,
-                        egui::Direction::LeftToRight,
-                        rect.min.y,
-                        -1.0,
-                    );
-                    guidelines::solid_line(
-                        ui,
-                        egui::Direction::LeftToRight,
-                        rect.max.y,
-                        1.0,
-                    );
+                    guidelines::solid_line(ui, egui::Direction::LeftToRight, rect.min.y, -1.0);
+                    guidelines::solid_line(ui, egui::Direction::LeftToRight, rect.max.y, 1.0);
                 } else if rect.width() < window.width() {
                     let left = egui::Rect::from_min_max(
                         window.min,
@@ -143,18 +132,8 @@ impl Letterbox {
                     guidelines::hatch_rect(ui, left);
                     guidelines::hatch_rect(ui, right);
 
-                    guidelines::solid_line(
-                        ui,
-                        egui::Direction::TopDown,
-                        rect.min.x,
-                        -1.0,
-                    );
-                    guidelines::solid_line(
-                        ui,
-                        egui::Direction::TopDown,
-                        rect.max.x,
-                        1.0,
-                    );
+                    guidelines::solid_line(ui, egui::Direction::TopDown, rect.min.x, -1.0);
+                    guidelines::solid_line(ui, egui::Direction::TopDown, rect.max.x, 1.0);
                 }
             }
         }
@@ -178,7 +157,6 @@ impl Letterbox {
         egui::InnerResponse::new(response.inner, response.response)
     }
 }
-
 
 /// Угол полосы: определяет, с какой стороны обрезочка (с внешней) и
 /// как читать пришедший rect. Полоса никуда сама не тянется —
@@ -328,7 +306,13 @@ impl<T: AsRef<str>> TransportButton<T> {
     /// enabled — кликабельна; active — нажата (включая тап) или
     /// активирована. Внешние состояния не нужны: решения о виде —
     /// внутри (disabled = !enabled).
-    pub fn new(text: T, enabled: bool, active: bool, idle: egui::Color32, active_color: egui::Color32) -> Self {
+    pub fn new(
+        text: T,
+        enabled: bool,
+        active: bool,
+        idle: egui::Color32,
+        active_color: egui::Color32,
+    ) -> Self {
         Self {
             text,
             enabled,
@@ -544,9 +528,7 @@ pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
     let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
     let mut width: f32 = words
         .iter()
-        .map(|word| {
-            measure_text(ctx, style::FONT_REGULAR_X2, strip_flip_markers(word)).x
-        })
+        .map(|word| measure_text(ctx, style::FONT_REGULAR_X2, strip_flip_markers(word)).x)
         .sum();
     if words.len() > 1 {
         width += cell_x(1) * (words.len() - 1) as f32;

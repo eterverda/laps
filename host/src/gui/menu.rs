@@ -1,5 +1,5 @@
-use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
 use super::{State, header, view};
+use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
 
 pub struct Menu {
     header: header::Header,
@@ -50,19 +50,13 @@ impl Menu {
                 let label = "\u{f070e} START";
                 let w = view::content_width(ui.ctx(), label) + cell_x(4);
                 let center = ui.max_rect().center();
-                let start_rect: egui::Rect =
-                    egui::pos2(center.x - w / 2.0, center.y - cell_y(1))
-                        .into_ruler()
-                        .extrude(w, cell_y(2))
-                        .into();
-                let response = view::TransportButton::new(
-                    label,
-                    true,
-                    false,
-                    START_IDLE,
-                    START_ACTIVE,
-                )
-                .interact(ui, start_rect, ui.make_persistent_id("menu_start"));
+                let start_rect: egui::Rect = egui::pos2(center.x - w / 2.0, center.y - cell_y(1))
+                    .into_ruler()
+                    .extrude(w, cell_y(2))
+                    .into();
+                let response =
+                    view::TransportButton::new(label, true, false, START_IDLE, START_ACTIVE)
+                        .interact(ui, start_rect, ui.make_persistent_id("menu_start"));
                 view::TransportButton::new(
                     label,
                     true,

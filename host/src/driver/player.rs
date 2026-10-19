@@ -15,17 +15,17 @@ use std::time::{Duration, Instant};
 
 use crossbeam_utils::atomic::AtomicCell;
 
-use crate::driver::camera::decode::decode_pixels_mjpeg_into;
 use crate::config::camera::ResolutionConfig;
-use crate::driver::dvr::VideoReader;
+use crate::driver::camera::decode::decode_pixels_mjpeg_into;
 use crate::driver::camera::fps::FrameStats;
+use crate::driver::dvr::VideoReader;
 use crate::driver::dvr::open_reader;
-use std::path::PathBuf;
-use std::path::Path;
-use std::mem;
-use std::io::Result as IoResult;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
+use std::io::Result as IoResult;
+use std::mem;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Клапан показа: на высоких скоростях due-кадры идут чаще, чем успевает
 /// декодер — чаще одного показа за это время не декодируем вообще, индекс

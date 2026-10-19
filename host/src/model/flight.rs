@@ -6,10 +6,11 @@ use time::OffsetDateTime;
 
 use crate::config::setup::PadConfig;
 use crate::model::pilot::Pilot;
-use std::fs;
-use std::io::Result as IoResult;
 use serde_yaml::from_str as from_yaml_string;
 use serde_yaml::to_string as to_yaml_string;
+use std::fs;
+use std::io::Result as IoResult;
+
 /// Заголовок журнала: контекст полёта. Первый документ стрима (без
 /// метки) — файл читается даже без единого события. date_time
 /// авторитетен для имён файлов (стем видео и журнала один).
@@ -104,8 +105,8 @@ impl Journal {
     /// Весь журнал — yaml-стрим: заголовок, затем документ на эвент,
     /// разделители `---`.
     pub fn stream(&self) -> String {
-        let mut out = to_yaml_string(&self.header)
-            .unwrap_or_else(|e| panic!("journal header yaml: {e}"));
+        let mut out =
+            to_yaml_string(&self.header).unwrap_or_else(|e| panic!("journal header yaml: {e}"));
         for (ms, event) in &self.events {
             out.push_str("---\n");
             out.push_str(&self.event_doc(*ms, event));
@@ -181,7 +182,6 @@ impl Journal {
         }
     }
 }
-
 
 /// Стем файлов записи (видео + журнал) по date_time старта.
 fn file_stem_of(date_time: OffsetDateTime) -> String {
@@ -268,38 +268,38 @@ impl RaceClip {
 impl RaceClip {
     pub fn from_events<'a>(events: impl IntoIterator<Item = (u64, &'a JournalRecord)>) -> RaceClip {
         let mut clip = RaceClip::default();
-    for (ms, event) in events {
-        match event {
-            JournalRecord::RecordStarted { .. } => match &mut clip.recording {
-                Some((lo, _)) => *lo = (*lo).min(ms),
-                None => clip.recording = Some((ms, ms)),
-            },
-            JournalRecord::RecordFinished {} => match &mut clip.recording {
-                Some((_, hi)) => *hi = ms,
-                None => clip.recording = Some((ms, ms)),
-            },
-            JournalRecord::VideoAttached {
-                camera_id,
-                filename,
-            } => {
-                clip.files.insert(camera_id.clone(), (filename.clone(), ms));
+        for (ms, event) in events {
+            match event {
+                JournalRecord::RecordStarted { .. } => match &mut clip.recording {
+                    Some((lo, _)) => *lo = (*lo).min(ms),
+                    None => clip.recording = Some((ms, ms)),
+                },
+                JournalRecord::RecordFinished {} => match &mut clip.recording {
+                    Some((_, hi)) => *hi = ms,
+                    None => clip.recording = Some((ms, ms)),
+                },
+                JournalRecord::VideoAttached {
+                    camera_id,
+                    filename,
+                } => {
+                    clip.files.insert(camera_id.clone(), (filename.clone(), ms));
+                }
+                JournalRecord::RaceCountdown {} => clip.race_countdown_ms = Some(ms),
+                JournalRecord::RaceStarted {} => clip.race_started_ms = Some(ms),
+                JournalRecord::RaceFinished { .. } => clip.race_finished_ms = Some(ms),
             }
-            JournalRecord::RaceCountdown {} => clip.race_countdown_ms = Some(ms),
-            JournalRecord::RaceStarted {} => clip.race_started_ms = Some(ms),
-            JournalRecord::RaceFinished { .. } => clip.race_finished_ms = Some(ms),
         }
-    }
         clip
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::process;
-    use std::env::temp_dir;
     use super::*;
     use crate::config::camera::ViewportConfig;
     use crate::config::setup::{ColorConfig, FpvConfig};
+    use std::env::temp_dir;
+    use std::process;
 
     fn sample_journal() -> Journal {
         let date_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
@@ -411,14 +411,13 @@ mod tests {
     /// rename не остаётся; append дописывает новые события.
     #[test]
     fn journal_snapshot_and_append() {
-        let dir =
-            temp_dir().join(format!("laps-journal-file-test-{}", process::id()));
+        let dir = temp_dir().join(format!("laps-journal-file-test-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
-        let path = journal.snapshot( &dir).expect("snapshot written");
+        let path = journal.snapshot(&dir).expect("snapshot written");
         let mut written = journal.event_count();
         journal.push(1500, JournalRecord::RaceStarted {});
-        journal.append_to( &path, &mut written).expect("append");
+        journal.append_to(&path, &mut written).expect("append");
 
         let mut files: Vec<_> = fs::read_dir(&dir)
             .unwrap()
@@ -439,15 +438,14 @@ mod tests {
     /// уходит на диск полным снапшотом.
     #[test]
     fn retain_removes_and_rewrites() {
-        let dir =
-            temp_dir().join(format!("laps-journal-retain-test-{}", process::id()));
+        let dir = temp_dir().join(format!("laps-journal-retain-test-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
         journal.push(100, JournalRecord::RaceStarted {});
         journal.push(200, JournalRecord::RaceFinished { prematurely: true });
-        let path = journal.snapshot( &dir).expect("snapshot written");
+        let path = journal.snapshot(&dir).expect("snapshot written");
         journal.retain(|(ms, _)| *ms != 200);
-        journal.snapshot( &dir).expect("rewrite after edit");
+        journal.snapshot(&dir).expect("rewrite after edit");
 
         let yaml = journal.stream();
         assert!(!yaml.contains("race-finished"), "{yaml}");

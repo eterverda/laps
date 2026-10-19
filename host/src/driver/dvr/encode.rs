@@ -2,8 +2,8 @@
 //! jpeg-камеры сюда не попадают: у них кадры идут в контейнер как есть
 //! (passthrough, см. pipeline в driver/camera).
 
-use std::io::Result as IoResult;
 use std::io::Error as IoError;
+use std::io::Result as IoResult;
 
 #[cfg(not(any(feature = "jpeg-rusturbo", feature = "jpeg-encoder")))]
 compile_error!("Enable feature `jpeg-rusturbo` (default) or `jpeg-encoder`");

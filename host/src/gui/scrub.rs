@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::gui::ruler::CELL_SIZE;
-use std::time::Instant;
 use std::fs;
+use std::time::Instant;
 
 /// База позиционного шага по тапу (клик): тап мотает на
 /// speed × SEEK_TAP файла (10x → 1 с).

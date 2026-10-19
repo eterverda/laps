@@ -5,7 +5,6 @@
 //! Правило слоя: бэкенды (`nokhwa.rs`, позже v4l2/mf/avf) импортируют
 //! только контракты из capture.rs и не трогают pipeline-части.
 
-use self::decode::Error as DecodeError;
 pub mod capture;
 pub mod decode;
 pub mod fps;
@@ -583,12 +582,8 @@ fn dispatch_frame(
                         data: FrameData::Rgba { rgba: image },
                     }));
                 }
-                Err(DecodeError::Recoverable(e)) => {
-                    log::warn!("frame skipped: {}", e);
-                }
-                Err(DecodeError::Unrecoverable(e)) => {
-                    log::error!("capture stopping: {}", e);
-                    return false;
+                Err(e) => {
+                    log::warn!("frame skipped: {e}");
                 }
             }
         }
@@ -606,12 +601,8 @@ fn dispatch_frame(
                     dvr_sink.on_frame(frame.clone());
                     ui_sink.on_frame(frame);
                 }
-                Err(DecodeError::Recoverable(e)) => {
-                    log::warn!("frame skipped: {}", e);
-                }
-                Err(DecodeError::Unrecoverable(e)) => {
-                    log::error!("capture stopping: {}", e);
-                    return false;
+                Err(e) => {
+                    log::warn!("frame skipped: {e}");
                 }
             }
         }

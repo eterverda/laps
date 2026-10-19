@@ -1,19 +1,26 @@
+/// Кадр не декодирован — пропускаем его и живём дальше. Не сбой потока:
+/// причины разнообразны и важны для диагностики, поэтому типизированы.
+#[derive(Debug)]
 pub enum Error {
-    /// Skip this frame and keep capturing.
-    Recoverable(String),
-    /// Stop the capture thread.
-    /// Пока не конструируется: PixelConfig исчерпывающе покрыт двумя
-    /// вариантами, ветки "unsupported format" больше нет. Вариант сохранён
-    /// как семантика для будущих декодеров.
-    #[allow(dead_code)]
-    Unrecoverable(String),
+    /// Нет JPEG SOI (FF D8) — не mjpeg-кадр.
+    NotJpeg,
+    /// Размер буфера не сходится с кадром.
+    BufferSize { got: usize, want: usize },
+    /// Битый/оборванный JPEG (декодер отказал).
+    Corrupt(String),
+    /// YUYV→RGBA конверсия отказала.
+    Convert(String),
 }
 
-impl std::fmt::Debug for Error {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Recoverable(e) => write!(f, "Recoverable({e})"),
-            Error::Unrecoverable(e) => write!(f, "Unrecoverable({e})"),
+            Error::NotJpeg => write!(f, "MJPEG frame without SOI (FF D8)"),
+            Error::BufferSize { got, want } => {
+                write!(f, "decode buffer {got} pixels, expected {want}")
+            }
+            Error::Corrupt(e) => write!(f, "MJPEG decode error: {e}"),
+            Error::Convert(e) => write!(f, "YUYV convert error: {e}"),
         }
     }
 }
@@ -56,7 +63,7 @@ fn decode_pixels_yuyv(raw: &[u8], width: u32, height: u32) -> Result<Vec<egui::C
         yuv::YuvRange::Limited,
         yuv::YuvStandardMatrix::Bt601,
     )
-    .map_err(|e| Error::Recoverable(format!("YUYV convert error: {e}")))?;
+    .map_err(|e| Error::Convert(format!("{e}")))?;
     Ok(pixels)
 }
 
@@ -69,16 +76,13 @@ pub fn decode_pixels_mjpeg_into(
     pixels: &mut [egui::Color32],
 ) -> Result<()> {
     if pixels.len() != (width * height) as usize {
-        return Err(Error::Recoverable(format!(
-            "mjpeg decode buffer {} pixels, expected {}",
-            pixels.len(),
-            width * height
-        )));
+        return Err(Error::BufferSize {
+            got: pixels.len(),
+            want: (width * height) as usize,
+        });
     }
     if !(raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xD8) {
-        return Err(Error::Recoverable(
-            "MJPEG frame without JPEG SOI (FF D8) marker".to_string(),
-        ));
+        return Err(Error::NotJpeg);
     }
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
         zune_jpeg::zune_core::bytestream::ZCursor::new(raw),
@@ -87,7 +91,7 @@ pub fn decode_pixels_mjpeg_into(
     );
     decoder
         .decode_into(bytemuck::cast_slice_mut(pixels))
-        .map_err(|e| Error::Recoverable(format!("MJPEG decode error: {e}")))?;
+        .map_err(|e| Error::Corrupt(format!("{e}")))?;
     Ok(())
 }
 

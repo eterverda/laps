@@ -229,7 +229,7 @@ fn debug_keyboards() -> ! {
 }
 
 #[cfg(test)]
-mod keyboard_tests {
+mod tests {
     use super::*;
 
     #[test]

@@ -94,15 +94,15 @@ impl Server {
         Ok(me)
     }
 
+    fn path(&self) -> PathBuf {
+        self.dir
+            .join(format!("instance-{}.yaml", self.instance.pid))
+    }
     #[cfg(test)]
     pub fn port(&self) -> u16 {
         self.instance.port
     }
 
-    fn path(&self) -> PathBuf {
-        self.dir
-            .join(format!("instance-{}.yaml", self.instance.pid))
-    }
 }
 
 impl Drop for Server {

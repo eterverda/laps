@@ -245,17 +245,17 @@ pub struct RaceClip {
 }
 
 impl RaceClip {
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.recording.is_none() && self.files.is_empty()
-    }
-
     /// Экстент журнала: последняя известная метка (финиш гонки, конец
     /// записи, последний файл). Запасной домен для таймлайна.
     pub fn end_ms(&self) -> Option<u64> {
         self.race_finished_ms
             .or_else(|| self.recording.map(|(_, hi)| hi))
             .or_else(|| self.files.values().map(|(_, ms)| *ms).max())
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.recording.is_none() && self.files.is_empty()
     }
 }
 

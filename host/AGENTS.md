@@ -171,12 +171,12 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 - One file per recording start; **no segment rotation** (documented gap)
 - Стем имён файлов — `date_time` первого события журнала (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
 - Журнал полёта (`model::flight::Journal` — чистые данные: заголовок
-  `JournalHeader` первым документом без метки + события `Vec<(ms,
-FlightEvent)>`): yaml-стрим `captures/<stem>.yaml`, документ на эвент
+  `JournalHeader` первым документом без метки + записи `Vec<(ms,
+JournalRecord)>`): yaml-стрим `captures/<stem>.yaml`, документ на запись
   (`{ms, <variant>: …}`), разделители `---`. Файлом журнал не владеет:
-  запись — свободные функции `snapshot` (полный стрим, tmp+rename:
-  первое создание и перезапись после правок) и `append` (copy-append-
-  rename новых документов, счётчик дописанных держит писатель). В эфире
+  запись — методы `snapshot` (полный стрим, tmp+rename: первое создание
+  и перезапись после правок) и `append_to` (copy-append-rename новых
+  документов, счётчик дописанных держит писатель). В эфире
   журнал внутри RaceCore (единственный писатель событий), поток-обёртка
   синкает его на диск: снапшот на старте гонки, дальше append; при
   закрытии гонки `Notice::EnterDvr { journal }` — владение в GUI

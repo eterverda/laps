@@ -6,7 +6,10 @@ use time::OffsetDateTime;
 
 use crate::config::setup::PadConfig;
 use crate::model::pilot::Pilot;
-
+use std::fs;
+use std::io::Result as IoResult;
+use serde_yaml::from_str as from_yaml_string;
+use serde_yaml::to_string as to_yaml_string;
 /// Заголовок журнала: контекст полёта. Первый документ стрима (без
 /// метки) — файл читается даже без единого события. date_time
 /// авторитетен для имён файлов (стем видео и журнала один).
@@ -100,13 +103,13 @@ impl Journal {
             event: &'a JournalRecord,
         }
         let ser = EventSer { ms, event };
-        serde_yaml::to_string(&ser).unwrap_or_else(|e| panic!("journal yaml: {e}"))
+        to_yaml_string(&ser).unwrap_or_else(|e| panic!("journal yaml: {e}"))
     }
 
     /// Весь журнал — yaml-стрим: заголовок, затем документ на эвент,
     /// разделители `---`.
     pub fn stream(&self) -> String {
-        let mut out = serde_yaml::to_string(&self.header)
+        let mut out = to_yaml_string(&self.header)
             .unwrap_or_else(|e| panic!("journal header yaml: {e}"));
         for (ms, event) in &self.events {
             out.push_str("---\n");
@@ -128,7 +131,7 @@ impl Journal {
         let mut docs = yaml.split("\n---\n").filter(|doc| !doc.trim().is_empty());
         let header = docs
             .next()
-            .and_then(|doc| match serde_yaml::from_str::<JournalHeader>(doc) {
+            .and_then(|doc| match from_yaml_string::<JournalHeader>(doc) {
                 Ok(header) => Some(header),
                 Err(e) => {
                     log::warn!("flight journal: bad header: {e}");
@@ -136,7 +139,7 @@ impl Journal {
                 }
             });
         let events = docs
-            .filter_map(|doc| match serde_yaml::from_str::<EventDoc>(doc) {
+            .filter_map(|doc| match from_yaml_string::<EventDoc>(doc) {
                 Ok(event) => Some((event.ms, event.event)),
                 Err(e) => {
                     log::warn!("flight journal: bad document skipped: {e}");
@@ -163,8 +166,8 @@ impl Journal {
     /// Снапшот журнала в `dir/<stem>.yaml` (стем из date_time): полный
     /// стрим через tmp + rename. Первое создание файла и перезапись
     /// после правок — одна операция. Путь — для последующих append_to.
-    pub fn snapshot(&self, dir: &Path) -> std::io::Result<PathBuf> {
-        std::fs::create_dir_all(dir)?;
+    pub fn snapshot(&self, dir: &Path) -> IoResult<PathBuf> {
+        fs::create_dir_all(dir)?;
         let path = dir.join(format!("{}.yaml", self.header().file_stem()));
         write_atomic(&path, &self.stream())?;
         Ok(path)
@@ -174,12 +177,12 @@ impl Journal {
     /// добавить новые документы, tmp + rename. Потерянный/битый файл —
     /// деградация на полный снапшот. `written` — сквозной счётчик
     /// (состояние держит писатель, сервис).
-    pub fn append_to(&self, path: &Path, written: &mut usize) -> std::io::Result<()> {
+    pub fn append_to(&self, path: &Path, written: &mut usize) -> IoResult<()> {
         let count = self.event_count();
         if *written >= count {
             return Ok(());
         }
-        match std::fs::read_to_string(path) {
+        match fs::read_to_string(path) {
             Ok(mut contents) => {
                 for (ms, event) in self.iter_ms().skip(*written) {
                     contents.push_str("---\n");
@@ -202,11 +205,11 @@ impl Journal {
 /// rename поверх финального имени (POSIX rename атомарен: читатель
 /// видит либо старую, либо новую полную версию). Бесхозный `~` от
 /// убитого краша перед записью чистим; latest_journal его игнорирует.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+fn write_atomic(path: &Path, contents: &str) -> IoResult<()> {
     let tmp = path.with_file_name(format!("{}~", path.file_name().unwrap().to_string_lossy()));
-    let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)
+    let _ = fs::remove_file(&tmp);
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -299,6 +302,8 @@ impl RaceClip {
 
 #[cfg(test)]
 mod tests {
+    use std::process;
+    use std::env::temp_dir;
     use super::*;
     use crate::config::camera::ViewportConfig;
     use crate::config::setup::{ColorConfig, FpvConfig};
@@ -414,15 +419,15 @@ mod tests {
     #[test]
     fn journal_snapshot_and_append() {
         let dir =
-            std::env::temp_dir().join(format!("laps-journal-file-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+            temp_dir().join(format!("laps-journal-file-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
         let path = journal.snapshot( &dir).expect("snapshot written");
         let mut written = journal.event_count();
         journal.push(1500, JournalRecord::RaceStarted {});
         journal.append_to( &path, &mut written).expect("append");
 
-        let mut files: Vec<_> = std::fs::read_dir(&dir)
+        let mut files: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -431,10 +436,10 @@ mod tests {
         assert_eq!(files.len(), 1, "only the final file: {files:?}");
         assert!(files[0].ends_with(".yaml"), "{files:?}");
 
-        let content = std::fs::read_to_string(&path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, journal.stream(), "file mirrors the stream");
 
-        std::fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Правка журнала (retain): событие удалено из памяти; правка
@@ -442,8 +447,8 @@ mod tests {
     #[test]
     fn retain_removes_and_rewrites() {
         let dir =
-            std::env::temp_dir().join(format!("laps-journal-retain-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+            temp_dir().join(format!("laps-journal-retain-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
         journal.push(100, JournalRecord::RaceStarted {});
         journal.push(200, JournalRecord::RaceFinished { prematurely: true });
@@ -454,10 +459,10 @@ mod tests {
         let yaml = journal.stream();
         assert!(!yaml.contains("race-finished"), "{yaml}");
         assert!(yaml.contains("race-started"), "{yaml}");
-        let content = std::fs::read_to_string(&path).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, yaml, "file mirrors the edited stream");
 
-        std::fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

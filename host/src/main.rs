@@ -1,3 +1,11 @@
+use std::fs;
+use std::path::PathBuf;
+use serde_yaml::from_str as from_yaml_string;
+use std::process;
+use std::thread;
+
+use crate::remote::Response;
+
 mod assets;
 mod config;
 mod driver;
@@ -88,19 +96,19 @@ fn main() {
         None => {}
         Some(Err(e)) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            process::exit(2);
         }
-        Some(Ok(remote::Response { message, code: 0 })) => {
+        Some(Ok(Response { message, code: 0 })) => {
             if !message.is_empty() {
                 println!("{message}");
             }
-            std::process::exit(0);
+            process::exit(0);
         }
         Some(Ok(response)) => {
             if !response.message.is_empty() {
                 eprintln!("{}", response.message);
             }
-            std::process::exit(response.code);
+            process::exit(response.code);
         }
     }
 
@@ -124,10 +132,10 @@ fn main() {
             }
         },
         Some(Commands::Scrub) => {
-            let captures = std::path::PathBuf::from("captures");
+            let captures = PathBuf::from("captures");
             // DVR живёт и без видео: журнала (yaml) хватает для полоски
             // и транспорта — пустой captures не пускаем, видео не требуем.
-            let has_any = std::fs::read_dir(&captures)
+            let has_any = fs::read_dir(&captures)
                 .map(|mut d| {
                     d.any(|e| {
                         e.map(|e| {
@@ -142,7 +150,7 @@ fn main() {
                 .unwrap_or(false);
             if !has_any {
                 eprintln!("nothing in captures/");
-                std::process::exit(1);
+                process::exit(1);
             }
             gui::run(Some(captures));
         }
@@ -169,11 +177,11 @@ fn main() {
 /// exiting 1; on success the command blocks until killed.
 #[cfg(target_os = "linux")]
 fn debug_keyboards() -> ! {
-    let setup: config::setup::Setup = match serde_yaml::from_str(assets::SETUP_YAML) {
+    let setup: config::setup::Setup = match from_yaml_string(assets::SETUP_YAML) {
         Ok(setup) => setup,
         Err(e) => {
             eprintln!("embedded setup.yaml failed to parse: {e}");
-            std::process::exit(1);
+            process::exit(1);
         }
     };
     let mut failures = 0usize;
@@ -188,14 +196,14 @@ fn debug_keyboards() -> ! {
         }
     }
     if failures > 0 {
-        std::process::exit(1);
+        process::exit(1);
     }
     // Fan every stream into one channel; each event already carries its
     // keyboard_id, so the printer needs no per-stream bookkeeping.
     let (tx, rx) = crossbeam_channel::unbounded::<driver::keyboard::KeyEvent>();
     for stream in streams {
         let tx = tx.clone();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             while let Ok(event) = stream.recv() {
                 if tx.send(event).is_err() {
                     break;
@@ -219,13 +227,13 @@ fn debug_keyboards() -> ! {
             combo
         );
     }
-    std::process::exit(0); // all streams ended (devices unplugged)
+    process::exit(0); // all streams ended (devices unplugged)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn debug_keyboards() -> ! {
     eprintln!("debug-keyboards is not supported on this platform");
-    std::process::exit(1);
+    process::exit(1);
 }
 
 #[cfg(test)]

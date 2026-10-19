@@ -9,24 +9,24 @@
 //! (mod.rs) — только контракты из capture.rs.
 
 use super::Error;
+use crate::config::camera::CameraConfig;
 use crate::driver::camera::capture::{
-use crate::config::camera::{ResolutionConfig};
     Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
 };
-use crate::config::camera::CameraConfig;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
+use std::io;
+use std::io::Error as IoError;
+use std::mem;
 use std::time::Instant;
 
 /// Map nokhwa's error onto CaptureError: open/stream failures are io,
 /// property (negotiation) rejections are Unsupported; everything else
 /// is passed through unaltered under Backend.
-fn capture_err(e: nokhwa::NokhwaError) -> Error {
+fn capture_err(e: NokhwaError) -> Error {
     use nokhwa::NokhwaError as E;
     match e {
-        E::OpenDeviceError(_, msg) | E::OpenStreamError(msg) => {
-            Error::Io(std::io::Error::other(msg))
-        }
+        E::OpenDeviceError(_, msg) | E::OpenStreamError(msg) => Error::Io(IoError::other(msg)),
         E::GetPropertyError { error, .. } | E::SetPropertyError { error, .. } => {
             Error::Config(format!("unsupported: {error}"))
         }
@@ -44,7 +44,7 @@ pub struct NokhwaSession {
 impl Capture for NokhwaCapture {
     type Session = NokhwaSession;
 
-    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, Error> {
+    fn list_devices() -> Result<Vec<DeviceInfo>, Error> {
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
             Ok(cameras) => cameras,
             Err(e) => return Err(capture_err(e)),

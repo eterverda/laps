@@ -17,6 +17,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::fs;
+use std::process;
+use std::mem;
+use std::thread;
+use std::io::Result as IoResult;
+use serde_yaml::from_str as from_yaml_string;
+use serde_yaml::to_string as to_yaml_string;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 /// Таймаут сокетных операций на loopback (чтение запроса, ответ).
@@ -58,13 +66,13 @@ impl Server {
     /// команду GUI-потоку и будит его (иначе ответ ждал бы ближайшего
     /// кадра egui).
     pub fn start(
-        execute: std::sync::Arc<dyn Fn(Vec<String>) -> Response + Send + Sync>,
-    ) -> std::io::Result<Self> {
+        execute: Arc<dyn Fn(Vec<String>) -> Response + Send + Sync>,
+    ) -> IoResult<Self> {
         cleanup();
         let listener = TcpListener::bind((DEFAULT_HOST, 0))?;
         let addr = listener.local_addr()?;
         let server = Self::register_in(registry_dir(), addr.port())?;
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => serve(stream, execute.as_ref()),
@@ -75,22 +83,22 @@ impl Server {
         log::info!(
             "instance started, remote control on {DEFAULT_HOST}:{} (pid {})",
             addr.port(),
-            std::process::id()
+            process::id()
         );
         Ok(server)
     }
 
     /// Пишет файл инстанса текущего процесса (без listener — шов для тестов).
-    fn register_in(dir: PathBuf, port: u16) -> std::io::Result<Self> {
+    fn register_in(dir: PathBuf, port: u16) -> IoResult<Self> {
         let me = Self {
             instance: Instance {
-                pid: std::process::id(),
+                pid: process::id(),
                 port,
             },
             dir,
         };
-        std::fs::create_dir_all(&me.dir)?;
-        std::fs::write(me.path(), serde_yaml::to_string(&me.instance).unwrap())?;
+        fs::create_dir_all(&me.dir)?;
+        fs::write(me.path(), to_yaml_string(&me.instance).unwrap())?;
         Ok(me)
     }
 
@@ -107,7 +115,7 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.path());
+        let _ = fs::remove_file(self.path());
     }
 }
 
@@ -128,7 +136,7 @@ pub fn cleanup() {
 fn scan(dir: &Path) -> (Vec<Instance>, Vec<PathBuf>) {
     let mut records = Vec::new();
     let mut broken = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = fs::read_dir(dir) else {
         return (records, broken);
     };
     for entry in entries.flatten() {
@@ -136,11 +144,11 @@ fn scan(dir: &Path) -> (Vec<Instance>, Vec<PathBuf>) {
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
-        let Ok(yaml) = std::fs::read_to_string(&path) else {
+        let Ok(yaml) = fs::read_to_string(&path) else {
             broken.push(path);
             continue;
         };
-        match serde_yaml::from_str::<Instance>(&yaml) {
+        match from_yaml_string::<Instance>(&yaml) {
             Ok(inst) => records.push(inst),
             Err(_) => broken.push(path),
         }
@@ -169,7 +177,7 @@ fn cleanup_in(dir: &Path) {
             .map(|i| dir.join(format!("instance-{}.yaml", i.pid))),
     );
     for path in stale {
-        let _ = std::fs::remove_file(&path);
+        let _ = fs::remove_file(&path);
     }
 }
 
@@ -282,7 +290,7 @@ fn tokenize(s: &str) -> Vec<String> {
             }
             c if c.is_whitespace() && !quoted => {
                 if started {
-                    tokens.push(std::mem::take(&mut cur));
+                    tokens.push(mem::take(&mut cur));
                     started = false;
                 }
             }
@@ -434,8 +442,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("laps-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = std::env::temp_dir().join(format!("laps-{name}-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
         dir
     }
 
@@ -526,7 +534,7 @@ mod tests {
         assert_eq!(
             discover_in(&dir),
             vec![Instance {
-                pid: std::process::id(),
+                pid: process::id(),
                 port,
             }]
         );
@@ -536,8 +544,8 @@ mod tests {
     }
 
     /// Колбэк-заглушка, имитирующая App: echo — эхо, остальное — unknown.
-    fn echo_execute() -> std::sync::Arc<dyn Fn(Vec<String>) -> Response + Send + Sync> {
-        std::sync::Arc::new(|tokens| {
+    fn echo_execute() -> Arc<dyn Fn(Vec<String>) -> Response + Send + Sync> {
+        Arc::new(|tokens| {
             if tokens.first().map(String::as_str) == Some("echo") {
                 Response {
                     message: tokens[1..].join(" "),

@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Pilot {
     pub name: String,
@@ -23,7 +24,7 @@ impl Pilot {
     /// повторов, при исчерпании колоды — перетасовка.
     pub fn random() -> Self {
         use rand::seq::SliceRandom;
-        static REMAINING: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+        static REMAINING: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
         let mut remaining = REMAINING.lock().unwrap();
         if remaining.is_empty() {
             *remaining = PILOT_RANDOM_NAMES.to_vec();

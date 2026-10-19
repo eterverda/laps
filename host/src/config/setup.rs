@@ -56,6 +56,7 @@ impl ColorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::from_str as from_yaml_string;
     use crate::config::keyboard::KeyboardMode;
 
     const CAMERAS: &str = "cameras:\n  camera-1:\n    name: C7-1\n    resolution: 1920x1080\n    frame-rate: 30fps\n    format: mjpeg\n";
@@ -64,7 +65,7 @@ mod tests {
 
     #[test]
     fn test_viewport_defaults_to_full_frame() {
-        let fpv: FpvConfig = serde_yaml::from_str("camera-id: camera-1\n").unwrap();
+        let fpv: FpvConfig = from_yaml_string("camera-id: camera-1\n").unwrap();
         assert_eq!(
             fpv.viewport,
             ViewportConfig {
@@ -79,13 +80,13 @@ mod tests {
     #[test]
     fn test_keyboards_default_to_empty() {
         // No keyboards: block — the map defaults to empty.
-        let setup: Setup = serde_yaml::from_str(&format!("{CAMERAS}{PADS}")).unwrap();
+        let setup: Setup = from_yaml_string(&format!("{CAMERAS}{PADS}")).unwrap();
         assert!(setup.keyboards.is_empty());
     }
 
     #[test]
     fn test_keyboards_load() {
-        let setup: Setup = serde_yaml::from_str(&format!(
+        let setup: Setup = from_yaml_string(&format!(
             "{CAMERAS}{PADS}keyboards:\n  pad-1:\n    name: RED\n    vid: 0x8089\n    mode: grab\n"
         ))
         .unwrap();
@@ -100,7 +101,7 @@ mod tests {
     #[test]
     fn test_pad_keybinds() {
         // keybinds parse: key as a yaml number resolves to the usage.
-        let pad: PadConfig = serde_yaml::from_str(
+        let pad: PadConfig = from_yaml_string(
             "label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\nkeybinds:\n  - keyboard-id: key-1\n    key: 1\n    action: lap\n",
         )
         .unwrap();
@@ -109,10 +110,10 @@ mod tests {
         assert_eq!(pad.keybinds[0].keyboard_id, "key-1");
         // Отсутствие блока — пустой список, не ошибка.
         let pad: PadConfig =
-            serde_yaml::from_str("label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\n").unwrap();
+            from_yaml_string("label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\n").unwrap();
         assert!(pad.keybinds.is_empty());
         // Неизвестное имя клавиши — ошибка конфига.
-        assert!(serde_yaml::from_str::<PadConfig>(
+        assert!(from_yaml_string::<PadConfig>(
             "label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\nkeybinds:\n  - keyboard-id: key-1\n    key: banana\n    action: lap\n"
         )
         .is_err());

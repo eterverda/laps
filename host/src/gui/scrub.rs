@@ -6,16 +6,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::gui::ruler::CELL_SIZE;
+use std::time::Instant;
+use std::fs;
 
 /// База позиционного шага по тапу (клик): тап мотает на
 /// speed × SEEK_TAP файла (10x → 1 с).
 pub const SEEK_TAP: u64 = 100;
 /// Задержка до старта hold: press короче неё — чистый клик, hold в
 /// плеер не уходит вообще.
-pub const SEEK_HOLD_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+pub const SEEK_HOLD_DELAY: Duration = Duration::from_millis(100);
 /// Отпускание раньше этого — клик: hold (если уже ушёл) отменяется,
 /// даётся фиксированный позиционный шаг.
-pub const SEEK_CLICK_MAX: std::time::Duration = std::time::Duration::from_millis(300);
+pub const SEEK_CLICK_MAX: Duration = Duration::from_millis(300);
 /// Торможение по отпусканию кнопки перемотки при игре: возврат к
 /// скорости воспроизведения за это время. Из паузы стоп мгновенный
 /// (константа не участвует).
@@ -29,10 +31,10 @@ pub const CIRCLE_MIN_WIDTH_PX: f32 = 24.0;
 /// Непрерывная тишина скролла, после которой следующий жест снова
 /// даёт шаг по шкале. 300 мс — по аналогии с double-tap time
 /// (Android ViewConfiguration / Windows).
-pub const SCROLL_REARM: std::time::Duration = std::time::Duration::from_millis(300);
+pub const SCROLL_REARM: Duration = Duration::from_millis(300);
 /// Тишина, по которой скролл-скраб отпускает курсор. Стандарта нет,
 /// 200 мс — общепринятый дебаунс «конца скролла» в скролл-библиотеках.
-const HSCROLL_RELEASE: std::time::Duration = std::time::Duration::from_millis(200);
+const HSCROLL_RELEASE: Duration = Duration::from_millis(200);
 
 /// Масштаб скролл-скраба: миллисекунды файла на физический пиксель
 /// пальца. Осознанно фиксирован: не зависит от длины записи (бар при
@@ -51,7 +53,7 @@ pub const RPT_SIZES: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
 pub fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
     let stem = format!("-{camera_id}-mjpeg.");
     let exts = ["mkv", "mp4", "mov"];
-    std::fs::read_dir(dir)
+    fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -66,7 +68,7 @@ pub fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
 
 /// Последний журнал полёта в каталоге: стемы сортируются лексикографически.
 pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
+    fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -304,7 +306,7 @@ impl Timeline {
 pub struct ScrollGate {
     acc: f32,
     armed: bool,
-    quiet_since: std::time::Instant,
+    quiet_since: Instant,
 }
 
 impl ScrollGate {
@@ -312,11 +314,11 @@ impl ScrollGate {
         Self {
             acc: 0.0,
             armed: true,
-            quiet_since: std::time::Instant::now(),
+            quiet_since: Instant::now(),
         }
     }
 
-    pub fn step(&mut self, delta: f32, threshold: f32, rearm: std::time::Duration) -> Option<bool> {
+    pub fn step(&mut self, delta: f32, threshold: f32, rearm: Duration) -> Option<bool> {
         if delta == 0.0 {
             if self.quiet_since.elapsed() >= rearm {
                 self.armed = true;
@@ -324,7 +326,7 @@ impl ScrollGate {
             }
             return None;
         }
-        self.quiet_since = std::time::Instant::now();
+        self.quiet_since = Instant::now();
         self.acc += delta;
         if self.armed && self.acc.abs() >= threshold {
             let up = self.acc > 0.0;
@@ -343,7 +345,7 @@ impl ScrollGate {
 pub struct HScroll {
     acc: f32,
     active: bool,
-    quiet_since: std::time::Instant,
+    quiet_since: Instant,
 }
 
 impl HScroll {
@@ -351,7 +353,7 @@ impl HScroll {
         Self {
             acc: 0.0,
             active: false,
-            quiet_since: std::time::Instant::now(),
+            quiet_since: Instant::now(),
         }
     }
 
@@ -371,7 +373,7 @@ impl HScroll {
             }
             return None;
         }
-        self.quiet_since = std::time::Instant::now();
+        self.quiet_since = Instant::now();
         self.acc += dx;
         let px = self.acc * pixels_per_point;
         let enter = if self.active { 1.0 } else { 2.0 };
@@ -396,7 +398,7 @@ impl HScroll {
 pub struct SeekButton {
     pub down: bool,
     /// Момент press'а: окна SEEK_HOLD_DELAY / SEEK_CLICK_MAX.
-    pub down_since: std::time::Instant,
+    pub down_since: Instant,
     /// Hold уже послан в плеер (после SEEK_HOLD_DELAY): отпускание до
     /// SEEK_CLICK_MAX должно его отменить, а не просто игнорировать.
     pub hold_sent: bool,
@@ -410,7 +412,7 @@ impl SeekButton {
     pub fn new() -> Self {
         Self {
             down: false,
-            down_since: std::time::Instant::now(),
+            down_since: Instant::now(),
             hold_sent: false,
             flash: false,
         }

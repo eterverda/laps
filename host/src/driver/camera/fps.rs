@@ -10,6 +10,7 @@
 use crate::driver::camera::capture::Frame;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+use std::fmt::Display;
 
 pub struct FpsCounter {
     report_after: Duration,
@@ -122,7 +123,7 @@ impl FrameStats {
     /// объект «{min: 12ms, avg: 19.3ms, max: 87ms, p90: 31ms}» — `ms` —
     /// суффикс каждого значения, avg — с десятыми (форматной строкой,
     /// без serde) как непрозрачный impl Display.
-    pub fn snapshot(&mut self) -> Option<impl std::fmt::Display> {
+    pub fn snapshot(&mut self) -> Option<impl Display> {
         if self.num == 0 {
             return None;
         }
@@ -243,9 +244,9 @@ mod tests {
     }
 
     mod frame_stats {
-        use super::*;
         use crate::driver::camera::capture::{Frame, FrameData};
         use crate::driver::camera::fps::FrameStats;
+        use std::time::{Duration, Instant};
 
         fn ms(n: u64) -> Duration {
             Duration::from_millis(n)

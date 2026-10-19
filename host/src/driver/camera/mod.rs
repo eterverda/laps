@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::io::Error as IoError;
+use crate::driver::camera::fps::{FpsCounter, FrameStats};
 
 /// Ошибки слоя источника (перечисление/открытие устройств). Варианты
 /// различаются принадлежностью: системный сбой / диагноз нашего слоя /
@@ -36,7 +39,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub enum Error {
     /// Системный сбой (ioctl, открытие файла).
-    Io(std::io::Error),
+    Io(IoError),
     /// Диагноз нашего слоя: по этому конфигу открыться нельзя —
     /// устройство не найдено по имени или отказало в переговорах
     /// формата. Текст различает причину.
@@ -46,8 +49,8 @@ pub enum Error {
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Error::Io(e) => write!(f, "{e}"),
             Error::Config(msg) => write!(f, "{msg}"),
@@ -66,8 +69,8 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
+impl From<IoError> for Error {
+    fn from(e: IoError) -> Self {
         Error::Io(e)
     }
 }
@@ -189,7 +192,7 @@ impl Recorder {
         while !matches!(self.record_state.load(), RecordState::Done)
             && Instant::now() < deadline
         {
-            std::thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         }
         if !matches!(self.record_state.load(), RecordState::Done) {
             log::warn!("dvr: finalize wait timed out");
@@ -210,9 +213,9 @@ pub struct Camera {
     commands: crossbeam_channel::Sender<RecordCommand>,
     /// Латентность live на выходе: пишет UI-поток, логает capture-поток
     /// в конце сеанса.
-    ui_latency: Arc<Mutex<fps::FrameStats>>,
+    ui_latency: Arc<Mutex<FrameStats>>,
     /// Показываемый fps: UI считает по забранным в update_frame кадрам.
-    shown: fps::FpsCounter,
+    shown: FpsCounter,
     /// Неготиированное разрешение потока: пишет capture-поток после
     /// открытия сессии, UI читает (подсказки, эффективное разрешение
     /// вьюпортов).
@@ -229,7 +232,7 @@ impl Camera {
         // слот; маленькая задержка даёт один проход на кадр.
         let on_frame = {
             let ctx = ctx.clone();
-            move || ctx.request_repaint_after(std::time::Duration::from_millis(1))
+            move || ctx.request_repaint_after(Duration::from_millis(1))
         };
         let slot: ImageSlot = Arc::default();
         let running = Arc::new(AtomicBool::new(true));
@@ -237,7 +240,7 @@ impl Camera {
         let record_state: SharedRecordState =
             Arc::new(AtomicCell::new(RecordState::Idle));
         let (commands_tx, commands_rx) = crossbeam_channel::bounded(4);
-        let ui_latency = Arc::new(Mutex::new(fps::FrameStats::default()));
+        let ui_latency = Arc::new(Mutex::new(FrameStats::default()));
         // 1×1-пустышка: id валиден с рождения, размер возьмёт первый кадр
         // (set перезаписывает мету). Контент не отрисовывается: до первого
         // кадра capture_state == Starting и экран показывает testcard.
@@ -276,7 +279,7 @@ impl Camera {
             record_state,
             commands: commands_tx,
             ui_latency,
-            shown: fps::FpsCounter::default(),
+            shown: FpsCounter::default(),
             resolution,
             running,
             thread: Some(thread),
@@ -348,7 +351,7 @@ fn capture_loop(
     record_state: SharedRecordState,
     running: Arc<AtomicBool>,
     commands_rx: crossbeam_channel::Receiver<RecordCommand>,
-    ui_latency: Arc<Mutex<fps::FrameStats>>,
+    ui_latency: Arc<Mutex<FrameStats>>,
     resolution: Arc<AtomicCell<Option<ResolutionConfig>>>,
     on_frame: impl Fn() + Send + Sync + 'static,
 ) {
@@ -380,10 +383,10 @@ fn capture_loop(
     let mut first_frame = true;
     let capture_t0 = Instant::now();
     let mut capture_frames = 0u32;
-    let mut frame_interval = fps::FrameStats::default();
+    let mut frame_interval = FrameStats::default();
     let mut last_timestamp: Option<Instant> = None;
-    let mut decode_jpeg = fps::FrameStats::default();
-    let mut decode_yuyv = fps::FrameStats::default();
+    let mut decode_jpeg = FrameStats::default();
+    let mut decode_yuyv = FrameStats::default();
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -519,12 +522,12 @@ fn open_session(desc: &CameraConfig) -> Result<(impl CaptureSession, CaptureForm
 /// кадрами, латентность «захват → экран», длительности декода.
 #[allow(clippy::too_many_arguments)]
 fn log_session_stats(
-    ui_latency: &Arc<Mutex<fps::FrameStats>>,
+    ui_latency: &Arc<Mutex<FrameStats>>,
     capture_t0: Instant,
     capture_frames: u32,
-    frame_interval: &mut fps::FrameStats,
-    decode_jpeg: &mut fps::FrameStats,
-    decode_yuyv: &mut fps::FrameStats,
+    frame_interval: &mut FrameStats,
+    decode_jpeg: &mut FrameStats,
+    decode_yuyv: &mut FrameStats,
 ) {
     let elapsed = capture_t0.elapsed();
     log::info!(
@@ -558,8 +561,8 @@ fn dispatch_frame(
     height: u32,
     dvr_sink: &mut DvrSink,
     ui_sink: &mut LatestSink,
-    decode_jpeg: &mut fps::FrameStats,
-    decode_yuyv: &mut fps::FrameStats,
+    decode_jpeg: &mut FrameStats,
+    decode_yuyv: &mut FrameStats,
 ) -> bool {
     let ts = frame.timestamp;
     match frame.data {
@@ -623,6 +626,9 @@ fn dispatch_frame(
 mod tests {
     use super::*;
     use crate::config::camera::{FrameRateConfig, ResolutionConfig};
+    use std::env::temp_dir;
+    use std::fs;
+    use std::process;
 
     fn yuyv_frame(w: u32, h: u32) -> Frame {
         Frame {
@@ -645,8 +651,8 @@ mod tests {
             on_frame: Arc::new(|| {}),
         };
         let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
-        let dir = std::env::temp_dir().join(format!("laps-pipe-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir().join(format!("laps-pipe-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
         let negotiated = CaptureFormat {
             resolution: ResolutionConfig {
                 width: 8,
@@ -662,8 +668,8 @@ mod tests {
             camera: CameraConfig::new("Test", 8, 8, 60, PixelConfig::Yuyv),
         });
 
-        let mut dj = fps::FrameStats::default();
-        let mut dy = fps::FrameStats::default();
+        let mut dj = FrameStats::default();
+        let mut dy = FrameStats::default();
         assert!(dispatch_frame(
             yuyv_frame(8, 8),
             8,
@@ -679,7 +685,7 @@ mod tests {
         while !matches!(state.load(), RecordState::Writing { .. })
             && Instant::now() < deadline
         {
-            std::thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(5));
         }
         assert!(
             matches!(state.load(), RecordState::Writing { .. }),
@@ -730,17 +736,17 @@ mod tests {
         drop(dvr); // канал закрыт → writer finalize'ит файл в фоне
         let deadline = Instant::now() + Duration::from_secs(5);
         let mkv = loop {
-            let found = std::fs::read_dir(&dir)
+            let found = fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .any(|p| p.extension().is_some_and(|e| e == "mkv"));
             if found || Instant::now() > deadline {
                 break found;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(50));
         };
         assert!(mkv, "dvr sink must write the container");
-        std::fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&dir).ok();
     }
 }
 

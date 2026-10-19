@@ -15,7 +15,7 @@ pub use linux::scan;
 
 /// Platform stub until a real backend lands: an empty device list.
 #[cfg(not(target_os = "linux"))]
-pub fn scan() -> std::io::Result<Vec<KeyboardInfo>> {
+pub fn scan() -> IoResult<Vec<KeyboardInfo>> {
     Ok(Vec::new())
 }
 
@@ -35,6 +35,9 @@ pub fn scan() -> std::io::Result<Vec<KeyboardInfo>> {
 /// the only ordering need is the deterministic listing (a plain sort
 /// key in `scan`).
 use crate::config::keyboard::KeyboardConfig;
+use std::time::Instant;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::io::Error as IoError;
 
 #[derive(Debug, Clone)]
 pub struct KeyboardInfo {
@@ -57,7 +60,7 @@ pub struct KeyEvent {
     pub keycode: u32,
     pub action: KeyAction,
     /// Reception moment, stamped by the driver as the event is created.
-    pub at: std::time::Instant,
+    pub at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,11 +405,11 @@ pub enum AttachError {
     /// Grab mode requested for a device that cannot be grabbed.
     ModeUnsupported,
     /// Open or EVIOCGRAB failed (permissions, busy, gone mid-way).
-    Io(std::io::Error),
+    Io(IoError),
 }
 
-impl std::fmt::Display for AttachError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl Display for AttachError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
         match self {
             AttachError::NoMatch => write!(f, "no keyboard matches the filter"),
             AttachError::Ambiguous(candidates) => {

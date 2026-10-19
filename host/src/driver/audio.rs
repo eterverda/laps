@@ -12,6 +12,7 @@ use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as crossbeam;
+use std::thread;
 
 /// Короткий звук: WAV PCM целиком в памяти, со своей длительностью.
 /// Конструктор const — строится из бинарей `assets`, файл проверяется и
@@ -100,7 +101,7 @@ pub struct Audio {
 impl Audio {
     pub fn spawn() -> Self {
         let (commands, rx) = crossbeam::bounded(16);
-        std::thread::spawn(move || output_loop(rx));
+        thread::spawn(move || output_loop(rx));
         Self { commands }
     }
 

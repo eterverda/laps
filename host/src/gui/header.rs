@@ -2,6 +2,7 @@ use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
 use crate::gui::style;
 use crate::gui::view::{self, Corner};
 use time::format_description::{Component, FormatItem};
+use std::time::Duration;
 
 /// Фон плашки LAPS и даты — голубой в логике catppuccin (blue mocha,
 /// чуть пригашенный под чёрный текст).
@@ -149,9 +150,9 @@ impl Clock {
         // timer (to avoid overshooting); add it back so the repaint lands on
         // the boundary instead of a frame earlier.
         if let Some(tick) = self.next_tick {
-            let predicted = std::time::Duration::from_secs_f32(ui.ctx().input(|i| i.predicted_dt));
-            let until_tick = std::time::Duration::try_from(tick - now)
-                .unwrap_or(std::time::Duration::ZERO)
+            let predicted = Duration::from_secs_f32(ui.ctx().input(|i| i.predicted_dt));
+            let until_tick = Duration::try_from(tick - now)
+                .unwrap_or(Duration::ZERO)
                 .saturating_add(predicted);
             ui.ctx().request_repaint_after(until_tick);
         }

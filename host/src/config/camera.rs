@@ -1,6 +1,7 @@
 use serde::Deserialize;
-use std::fmt;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
+use lazy_regex::lazy_regex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PixelConfig {
@@ -17,8 +18,8 @@ impl PixelConfig {
     }
 }
 
-impl fmt::Display for PixelConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for PixelConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str(self.as_str())
     }
 }
@@ -53,8 +54,8 @@ impl serde::Serialize for PixelConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseCameraError;
 
-impl fmt::Display for ParseCameraError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for ParseCameraError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(
             f,
             "invalid camera format, expected: 'Name 1920x1080 @ 30fps [YUYV]'"
@@ -138,8 +139,8 @@ impl CameraConfig {
     }
 }
 
-impl fmt::Display for CameraConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for CameraConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(
             f,
             "{} {}x{} @ {}fps [{}]",
@@ -159,7 +160,7 @@ impl FromStr for CameraConfig {
         // Grammar for `CameraConfig`, anchored: the whole string must match. The
         // pixel format in square brackets is required. Validated at compile
         // time, built once, reused across calls.
-        let caps = lazy_regex::lazy_regex!(r"^(.+?) (\d+)x(\d+) @ (\d+)fps \[([A-Za-z0-9]+)\]$")
+        let caps = lazy_regex!(r"^(.+?) (\d+)x(\d+) @ (\d+)fps \[([A-Za-z0-9]+)\]$")
             .captures(s)
             .ok_or(ParseCameraError)?;
         let name = caps[1].trim().to_string();
@@ -180,7 +181,7 @@ pub struct ResolutionConfig {
 impl<'de> Deserialize<'de> for ResolutionConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        let caps = lazy_regex::lazy_regex!(r"^(\d+)x(\d+)$")
+        let caps = lazy_regex!(r"^(\d+)x(\d+)$")
             .captures(&s)
             .ok_or_else(|| serde::de::Error::custom(format!("invalid resolution: {s}")))?;
         Ok(ResolutionConfig {
@@ -199,8 +200,8 @@ impl serde::Serialize for ResolutionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FrameRateConfig(pub u32);
 
-impl fmt::Display for FrameRateConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for FrameRateConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}fps", self.0)
     }
 }
@@ -208,7 +209,7 @@ impl fmt::Display for FrameRateConfig {
 impl<'de> Deserialize<'de> for FrameRateConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        let caps = lazy_regex::lazy_regex!(r"^(\d+)fps$")
+        let caps = lazy_regex!(r"^(\d+)fps$")
             .captures(&s)
             .ok_or_else(|| serde::de::Error::custom(format!("invalid frame rate: {s}")))?;
         Ok(FrameRateConfig(
@@ -353,10 +354,11 @@ pub const VIEWPORT_2X2_R2C2_NARROW: ViewportConfig = ViewportConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml::from_str as from_yaml_string;
 
     #[test]
     fn test_resolution() {
-        let r: ResolutionConfig = serde_yaml::from_str("1920x1080").unwrap();
+        let r: ResolutionConfig = from_yaml_string("1920x1080").unwrap();
         assert_eq!(
             r,
             ResolutionConfig {
@@ -364,21 +366,21 @@ mod tests {
                 height: 1080
             }
         );
-        assert!(serde_yaml::from_str::<ResolutionConfig>("1920 x 1080").is_err());
-        assert!(serde_yaml::from_str::<ResolutionConfig>("1920").is_err());
+        assert!(from_yaml_string::<ResolutionConfig>("1920 x 1080").is_err());
+        assert!(from_yaml_string::<ResolutionConfig>("1920").is_err());
     }
 
     #[test]
     fn test_fps() {
-        let f: FrameRateConfig = serde_yaml::from_str("30fps").unwrap();
+        let f: FrameRateConfig = from_yaml_string("30fps").unwrap();
         assert_eq!(f, FrameRateConfig(30));
-        assert!(serde_yaml::from_str::<FrameRateConfig>("30").is_err());
-        assert!(serde_yaml::from_str::<FrameRateConfig>("30 FPS").is_err());
+        assert!(from_yaml_string::<FrameRateConfig>("30").is_err());
+        assert!(from_yaml_string::<FrameRateConfig>("30 FPS").is_err());
     }
 
     #[test]
     fn test_camera() {
-        let cam: CameraConfig = serde_yaml::from_str(
+        let cam: CameraConfig = from_yaml_string(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\n",
         )
         .unwrap();
@@ -398,25 +400,25 @@ mod tests {
 
     #[test]
     fn test_camera_dvr_container() {
-        let cam: CameraConfig = serde_yaml::from_str(
+        let cam: CameraConfig = from_yaml_string(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mkv\n",
         )
         .unwrap();
         assert_eq!(cam.dvr.container, ContainerConfig::Mkv);
 
-        let cam: CameraConfig = serde_yaml::from_str(
+        let cam: CameraConfig = from_yaml_string(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mov\n",
         )
         .unwrap();
         assert_eq!(cam.dvr.container, ContainerConfig::Mov);
 
-        let cam: CameraConfig = serde_yaml::from_str(
+        let cam: CameraConfig = from_yaml_string(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: mp4\n",
         )
         .unwrap();
         assert_eq!(cam.dvr.container, ContainerConfig::Mp4);
 
-        assert!(serde_yaml::from_str::<CameraConfig>(
+        assert!(from_yaml_string::<CameraConfig>(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 30fps\nformat: mjpeg\ndvr:\n  container: webm\n",
         )
         .is_err());
@@ -424,14 +426,14 @@ mod tests {
 
     #[test]
     fn test_camera_dvr_frame_rate() {
-        let cam: CameraConfig = serde_yaml::from_str(
+        let cam: CameraConfig = from_yaml_string(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 60fps\nformat: mjpeg\ndvr:\n  container: mkv\n  frame-rate: 30fps\n",
         )
         .unwrap();
         assert_eq!(cam.dvr.frame_rate, Some(FrameRateConfig(30)));
 
         // Без dvr.frame-rate — наследуем fps камеры (None).
-        let cam: CameraConfig = serde_yaml::from_str(
+        let cam: CameraConfig = from_yaml_string(
             "name: C7-1\nresolution: 1920x1080\nframe-rate: 60fps\nformat: mjpeg\n",
         )
         .unwrap();
@@ -440,13 +442,13 @@ mod tests {
 
     #[test]
     fn test_viewport_preset() {
-        let v: ViewportConfig = serde_yaml::from_str("2x2-r1c1-narrow").unwrap();
+        let v: ViewportConfig = from_yaml_string("2x2-r1c1-narrow").unwrap();
         assert_eq!(v, VIEWPORT_2X2_R1C1_NARROW);
     }
 
     #[test]
     fn test_viewport_unknown_preset_fails() {
-        assert!(serde_yaml::from_str::<ViewportConfig>("2x2-r1c1").is_err());
+        assert!(from_yaml_string::<ViewportConfig>("2x2-r1c1").is_err());
     }
 
     #[test]

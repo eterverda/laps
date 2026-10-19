@@ -14,10 +14,16 @@ use super::{AttachError, KeyAction, KeyEvent, KeyboardInfo, ModifierTracker};
 use crate::config::keyboard::{KeyboardConfig, KeyboardMode};
 use std::ffi::CString;
 use std::fs;
-use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+use std::collections::HashSet;
+use std::mem;
+use std::thread;
+use std::io::Result as IoResult;
+use std::io::Error as IoError;
+use std::io::ErrorKind as IoErrorKind;
 
 // EVIOCGRAB: 'E' 0x90, int argument (1 = grab, 0 = release). The grab
 // is tied to the fd — closing it (thread end, process death) releases.
@@ -48,8 +54,8 @@ fn is_keyboard_node(has_kbd_by_id: bool, bustype: u16, keyboard_keys: bool) -> b
 /// Event node names (`eventN`) that have at least one by-id symlink
 /// ending in `-event-kbd` without `if01`. Missing by-id dir means an
 /// empty set (the serio fallback still covers the AT keyboard).
-fn kbd_nodes_by_id() -> std::collections::HashSet<String> {
-    let mut nodes = std::collections::HashSet::new();
+fn kbd_nodes_by_id() -> HashSet<String> {
+    let mut nodes = HashSet::new();
     let Ok(entries) = fs::read_dir("/dev/input/by-id") else {
         return nodes;
     };
@@ -99,7 +105,7 @@ struct Device {
 }
 
 /// Enumerate keyboard devices (info + node path), sorted by `sort_key`.
-fn scan_devices() -> io::Result<Vec<Device>> {
+fn scan_devices() -> IoResult<Vec<Device>> {
     let mut devices = Vec::new();
     let kbd_by_id = kbd_nodes_by_id();
     for entry in fs::read_dir("/dev/input")? {
@@ -119,7 +125,7 @@ fn scan_devices() -> io::Result<Vec<Device>> {
 /// Enumerate keyboards: event nodes in /dev/input passing
 /// `is_keyboard_node`, sorted by `sort_key`. Devices that vanish
 /// mid-scan are skipped.
-pub fn scan() -> io::Result<Vec<KeyboardInfo>> {
+pub fn scan() -> IoResult<Vec<KeyboardInfo>> {
     Ok(scan_devices()?.into_iter().map(|d| d.info).collect())
 }
 
@@ -170,7 +176,7 @@ struct InputEventLayout {
     code: u16,
     value: i32,
 }
-const _: () = assert!(std::mem::size_of::<InputEventLayout>() == INPUT_EVENT_SIZE);
+const _: () = assert!(mem::size_of::<InputEventLayout>() == INPUT_EVENT_SIZE);
 
 const EV_KEY: u16 = 1;
 
@@ -467,22 +473,22 @@ pub fn open(
     )
     .map_err(AttachError::Io)?;
     if grab && unsafe { eviocgrab(fd, 1) }.is_err() {
-        let err = io::Error::last_os_error();
+        let err = IoError::last_os_error();
         unsafe { libc::close(fd) };
         return Err(AttachError::Io(err));
     }
     let (tx, rx) = crossbeam_channel::unbounded();
     let keyboard_id = id.to_owned();
-    std::thread::spawn(move || read_events(fd, keyboard_id, tx));
+    thread::spawn(move || read_events(fd, keyboard_id, tx));
     Ok(rx)
 }
 
-fn open_node(path: &Path, flags: libc::c_int) -> io::Result<RawFd> {
+fn open_node(path: &Path, flags: libc::c_int) -> IoResult<RawFd> {
     let cpath = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "node path with NUL"))?;
+        .map_err(|_| IoError::new(IoErrorKind::InvalidInput, "node path with NUL"))?;
     let fd = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC) };
     if fd == -1 {
-        Err(io::Error::last_os_error())
+        Err(IoError::last_os_error())
     } else {
         Ok(fd)
     }
@@ -502,8 +508,8 @@ fn read_events(fd: RawFd, keyboard_id: String, tx: crossbeam_channel::Sender<Key
             break;
         }
         if n < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
+            let err = IoError::last_os_error();
+            if err.kind() == IoErrorKind::Interrupted {
                 continue;
             }
             log::debug!("keyboard {keyboard_id}: read ended: {err}");
@@ -551,7 +557,7 @@ fn decode(buf: &[u8], tracker: &mut ModifierTracker, keyboard_id: &str) -> Vec<K
             modifiers,
             keycode: usage as u32,
             action,
-            at: std::time::Instant::now(),
+            at: Instant::now(),
         });
     }
     events

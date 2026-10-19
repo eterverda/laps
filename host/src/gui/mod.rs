@@ -3,6 +3,11 @@ use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::driver::dvr::CAPTURES_DIR;
 use crate::remote::{Response, Server, RESPONSE_TIMEOUT};
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process;
+use serde_yaml::from_str as from_yaml_string;
 
 mod flight;
 mod guidelines;
@@ -35,13 +40,13 @@ struct App {
     )>,
     state: State,
     setup: Setup,
-    assignments: std::collections::HashMap<String, Pilot>,
+    assignments: HashMap<String, Pilot>,
     // Живёт с приложением: Drop останавливает accept-поток и снимает
     // регистрацию инстанса.
     _server: Option<Server>,
 }
 
-fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
+fn hardcoded_assignments() -> HashMap<String, Pilot> {
     ["pad-1", "pad-2", "pad-3", "pad-4"]
         .into_iter()
         .map(|pad_id| (pad_id.to_owned(), Pilot::random()))
@@ -49,14 +54,14 @@ fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, scrub: Option<std::path::PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, scrub: Option<PathBuf>) -> Self {
         let (remote_tx, remote_rx) = std::sync::mpsc::channel();
         // Колбэк исполнения команд: кладёт задачу в очередь GUI и будит
         // его (иначе ответ ждал бы ближайшего кадра egui), затем ждёт
         // ответа.
         let ctx = cc.egui_ctx.clone();
-        let execute: std::sync::Arc<dyn Fn(Vec<String>) -> Response + Send + Sync> =
-            std::sync::Arc::new(move |command| {
+        let execute: Arc<dyn Fn(Vec<String>) -> Response + Send + Sync> =
+            Arc::new(move |command| {
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 if remote_tx.send((command, reply_tx)).is_err() {
                     return Response {
@@ -82,11 +87,11 @@ impl App {
         };
         // Ошибка сетапа фатальна: без него экраны не построить —
         // лог и exit(1).
-        let setup: Setup = match serde_yaml::from_str(crate::assets::SETUP_YAML) {
+        let setup: Setup = match from_yaml_string(crate::assets::SETUP_YAML) {
             Ok(setup) => setup,
             Err(e) => {
                 log::error!("embedded setup.yaml failed to parse: {e}");
-                std::process::exit(1);
+                process::exit(1);
             }
         };
         let assignments = hardcoded_assignments();
@@ -105,7 +110,7 @@ impl App {
                     setup.clone(),
                     assignments.clone(),
                     RaceRules::default(),
-                    Some(std::path::PathBuf::from(CAPTURES_DIR)),
+                    Some(PathBuf::from(CAPTURES_DIR)),
                 ))),
             },
             setup,
@@ -171,7 +176,7 @@ impl eframe::App for App {
                             self.setup.clone(),
                             self.assignments.clone(),
                             RaceRules::default(),
-                            Some(std::path::PathBuf::from(CAPTURES_DIR)),
+                            Some(PathBuf::from(CAPTURES_DIR)),
                         ))),
                         menu::Action::None => {}
                     },
@@ -226,7 +231,7 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-pub fn run(scrub: Option<std::path::PathBuf>) {
+pub fn run(scrub: Option<PathBuf>) {
     let options = eframe::NativeOptions {
         persist_window: false,
         viewport: egui::ViewportBuilder::default()

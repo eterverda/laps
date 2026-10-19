@@ -4,19 +4,20 @@
 //! GUI. Правила гонки (сигнал старта, отсчёт, длительность) — в
 //! `model::rules`. Модуль: `service::race`.
 
+use crossbeam_channel as crossbeam;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::mem;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-use crossbeam_channel as crossbeam;
-
-
 use crate::config::camera::{CameraConfig, ContainerConfig as CameraConfigContainer};
-use crate::driver::keyboard::KeyEvent;
 use crate::config::setup::PadConfig;
 use crate::driver::audio::{Audio, Sound};
-use crate::driver::camera::Recorder;
 use crate::driver::dvr::{RecordParams, RecordState};
+use crate::driver::camera::Recorder;
+use crate::driver::keyboard::KeyEvent;
 use crate::model::flight::{JournalRecord, Journal};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
@@ -187,7 +188,7 @@ impl RaceCore {
     pub fn new(
         now: Instant,
         rules: RaceRules,
-        captures_dir: std::path::PathBuf,
+        captures_dir: PathBuf,
         buzzer_len: Duration,
         pads: BTreeMap<String, PadConfig>,
         assignments: HashMap<String, Pilot>,
@@ -376,7 +377,7 @@ impl RaceCore {
     /// без первого кадра молча снимаются (файлов нет — событий нет:
     /// GUI показывает Error для камер без VideoAttached).
     fn finish_recording(&mut self, now: Instant) {
-        for (camera_id, pending) in std::mem::take(&mut self.rec_pending) {
+        for (camera_id, pending) in mem::take(&mut self.rec_pending) {
             if !pending.is_empty() {
                 log::warn!(
                     "flight: recording of {camera_id} produced no file; \
@@ -422,7 +423,7 @@ impl RaceCore {
     /// Отложенные события (запись головы до старта гонки) — в журнал
     /// (момент старта гонки, метки исходные, порядок хронологический).
     fn flush_rec_deferred(&mut self) {
-        for (ms, event) in std::mem::take(&mut self.rec_deferred) {
+        for (ms, event) in mem::take(&mut self.rec_deferred) {
             self.journal.push(ms, event);
         }
     }
@@ -479,6 +480,7 @@ impl RaceCore {
 
 #[cfg(test)]
 mod tests {
+    use std::env::temp_dir;
     use super::*;
     use crate::config::camera::PixelConfig;
     use crate::model::rules::StartSignalDelay;
@@ -514,7 +516,7 @@ mod tests {
                 duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
             },
-            std::env::temp_dir(),
+            temp_dir(),
             Duration::ZERO, // гудок нулевой: числа сценариев проще
             BTreeMap::new(),
             HashMap::new(),
@@ -764,7 +766,7 @@ mod tests {
                 duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
             },
-            std::env::temp_dir(),
+            temp_dir(),
             Duration::ZERO,
             BTreeMap::new(),
             HashMap::new(),
@@ -806,7 +808,7 @@ mod tests {
                 duration: None,
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
             },
-            std::env::temp_dir(),
+            temp_dir(),
             Duration::ZERO,
             BTreeMap::new(),
             HashMap::new(),
@@ -878,21 +880,21 @@ impl Race {
 
 pub fn spawn(
     rules: RaceRules,
-    captures_dir: std::path::PathBuf,
+    captures_dir: PathBuf,
     pads: BTreeMap<String, PadConfig>,
     assignments: HashMap<String, Pilot>,
     cameras: HashMap<String, CameraConfig>,
     recorders: HashMap<String, Recorder>,
     mut keyboards: HashMap<String, crossbeam::Receiver<KeyEvent>>,
-    key_events: std::sync::Arc<std::sync::Mutex<Vec<KeyEvent>>>,
-    key_dead: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    key_events: Arc<Mutex<Vec<KeyEvent>>>,
+    key_dead: Arc<Mutex<HashSet<String>>>,
+    wake: Arc<dyn Fn() + Send + Sync>,
     first: Intent,
     audio: Audio,
 ) -> Race {
     let (intent_tx, intent_rx) = crossbeam::bounded(16);
     let (notice_tx, notice_rx) = crossbeam::bounded(64);
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         // new = REC нажали: журнал и ноль меток — от этого момента.
         // Жизнь потока — сессия REC: REC-off до старта гонки отменяет
         // её (ядро дропается, GUI — в Idle), после финиша отдаём журнал
@@ -914,10 +916,10 @@ pub fn spawn(
         let _ = notice_tx.try_send(Notice::State(last_air));
         // Журнал на диске: снапшот на старте гонки, дальше дописываем.
         // Путь и счётчик дописанных событий держит писатель (этот цикл).
-        let mut journal_path: Option<std::path::PathBuf> = None;
+        let mut journal_path: Option<PathBuf> = None;
         let mut journal_written = 0usize;
         let sync_journal = |active: &RaceCore,
-                            journal_path: &mut Option<std::path::PathBuf>,
+                            journal_path: &mut Option<PathBuf>,
                             journal_written: &mut usize| {
             // Гейт — факт старта гонки, не фаза: аварийное отжатие
             // уходит в Finished без гонки (has_raced == false), и писать

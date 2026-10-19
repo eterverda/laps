@@ -5,6 +5,8 @@
 //! (model::rules + service::race), экран — намерения и рендер снапшотов.
 
 use crate::gui::ruler::{IntoRuler, CELL_SIZE, cell_x, cell_y};
+use crate::gui::scrub::{HScroll, ScrollGate, SeekButton, Timeline, TimelineEvent, latest_capture, latest_journal, CIRCLE_MIN_WIDTH_PX, PLAY_SPEEDS, RPT_SIZES, SCROLL_REARM, SCROLL_STEP, SEEK_CLICK_MAX, SEEK_HOLD_DELAY, SEEK_RELEASE_RAMP, SEEK_SPEEDS, SEEK_TAP};
+use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
@@ -23,6 +25,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::collections::HashSet;
+use std::path::Path;
+use std::fs;
+use std::mem;
 
 const MAX_PADS: usize = 4;
 const GRID_WIDTH: isize = 160;
@@ -100,16 +106,16 @@ struct Review {
 /// Состояние скраббинга DVR: таймлайн, кнопки перемотки, шкалы
 /// скоростей, гейты скролла.
 struct Scrub {
-    timeline: scrub::Timeline,
+    timeline: Timeline,
     /// Перемотка REW/FF: состояние удержания.
-    rew: scrub::SeekButton,
-    ff: scrub::SeekButton,
+    rew: SeekButton,
+    ff: SeekButton,
     /// Индексы шкал скоростей (скролл над кнопками).
     seek_speed: usize,
     play_speed: usize,
     rpt_size: usize,
-    vscroll: scrub::ScrollGate,
-    hscroll: scrub::HScroll,
+    vscroll: ScrollGate,
+    hscroll: HScroll,
 }
 
 /// Собранный кадр: рендер читает только его. prepare() заполняет по
@@ -262,7 +268,7 @@ impl Flight {
         if !matches!(self.phase, Mode::Idle(_)) {
             return;
         }
-        let Mode::Idle(idle) = std::mem::replace(
+        let Mode::Idle(idle) = mem::replace(
             &mut self.phase,
             Mode::Idle(Idle {
                 webcams: HashMap::new(),
@@ -288,14 +294,14 @@ impl Flight {
         let state = race::RaceCore::initial_mode(first, Instant::now(), &self.rules);
         let race = race::spawn(
             self.rules,
-            std::path::PathBuf::from(CAPTURES_DIR),
+            PathBuf::from(CAPTURES_DIR),
             self.setup.pads.clone(),
             self.assignments.clone(),
             self.shown_cameras.clone(),
             recorders,
             HashMap::new(),
             Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(std::collections::HashSet::new())),
+            Arc::new(Mutex::new(HashSet::new())),
             Arc::new(|| {}),
             first,
             self.audio.clone(),
@@ -315,7 +321,7 @@ impl Flight {
         if !matches!(self.phase, Mode::Live(_)) {
             return;
         }
-        let Mode::Live(live) = std::mem::replace(
+        let Mode::Live(live) = mem::replace(
             &mut self.phase,
             Mode::Idle(Idle {
                 webcams: HashMap::new(),
@@ -338,8 +344,8 @@ impl Flight {
     ) -> Self {
         // Холодный вход: последний журнал из captures/ → DVR; журнала
         // нет — деградация на последние записи камер (пустая рамка).
-        let journal = scrub::latest_journal(std::path::Path::new(CAPTURES_DIR))
-            .and_then(|path| std::fs::read_to_string(&path).ok())
+        let journal = latest_journal(Path::new(CAPTURES_DIR))
+            .and_then(|path| fs::read_to_string(&path).ok())
             .and_then(|yaml| {
                 let (header, events) = Journal::parse_stream(&yaml);
                 header.map(|header| {
@@ -802,14 +808,14 @@ impl Flight {
             let mut t = transport;
             t.rew.badge = Some(format!(
                 "\u{00d7}{}",
-                scrub::SEEK_SPEEDS[d.scrub.seek_speed]
+                SEEK_SPEEDS[d.scrub.seek_speed]
             ));
-            t.play.badge = Some(format!("{}%", scrub::PLAY_SPEEDS[d.scrub.play_speed]));
+            t.play.badge = Some(format!("{}%", PLAY_SPEEDS[d.scrub.play_speed]));
             t.ff.badge = Some(format!(
                 "\u{00d7}{}",
-                scrub::SEEK_SPEEDS[d.scrub.seek_speed]
+                SEEK_SPEEDS[d.scrub.seek_speed]
             ));
-            t.rpt.badge = Some(format!("±{:.1}s", scrub::RPT_SIZES[d.scrub.rpt_size]));
+            t.rpt.badge = Some(format!("±{:.1}s", RPT_SIZES[d.scrub.rpt_size]));
             t
         } else {
             transport
@@ -853,7 +859,7 @@ impl Flight {
         let frame = self.prepare(ui.ctx(), alt);
         self.res.get_or_insert_with(|| Res::new(ui.ctx()));
 
-        view::Letterbox::new(egui::vec2(cell_x(GRID_WIDTH), cell_y(45)))
+        Letterbox::new(egui::vec2(cell_x(GRID_WIDTH), cell_y(45)))
             .max_virtual_height(cell_y(50))
             .outline(true)
             .show(ui, |ui| {
@@ -889,7 +895,7 @@ impl Flight {
                     // скейлу; иначе капсула тянется до CIRCLE_MIN_WIDTH_PX,
                     // а внутри неё голова (и drag) течёт по локальному
                     // скейлу круга).
-                    let min_w = (scrub::CIRCLE_MIN_WIDTH_PX
+                    let min_w = (CIRCLE_MIN_WIDTH_PX
                         / ui.ctx().pixels_per_point()
                         / timeline_rect.width())
                     .min(1.0);
@@ -929,10 +935,10 @@ impl Flight {
                         );
                         for event in events {
                             match event {
-                                scrub::TimelineEvent::SetDragHeld(held) => {
+                                TimelineEvent::SetDragHeld(held) => {
                                     d.transport.set_drag_held(held);
                                 }
-                                scrub::TimelineEvent::Seek(t_ms) => {
+                                TimelineEvent::Seek(t_ms) => {
                                     // t — мс от начала таймлайна: в домен
                                     // сессии (транспорт сам клампит к шкале).
                                     d.transport.seek(t.start + t_ms);
@@ -1045,7 +1051,7 @@ impl Flight {
                             // Alt: эффективное разрешение вьюпорта
                             // (в правом нижнем углу картинки).
                             if let Some(badge) = &content.res_badge {
-                                view::hint_badge_corner(ui, rect, std::slice::from_ref(badge));
+                                hint_badge_corner(ui, rect, std::slice::from_ref(badge));
                             }
                         });
                     }
@@ -1090,7 +1096,7 @@ impl Flight {
                         egui::pos2(rect.center().x + w / 2.0, rect.top() - row),
                     )
                     .translate(egui::vec2(0.0, row * 0.5));
-                    view::hint_badge(ui, text, egui::Align2::LEFT_BOTTOM, &lines);
+                    hint_badge(ui, text, egui::Align2::LEFT_BOTTOM, &lines);
                 };
                 // Иконки и цвета — часть вёрстки ряда, состояние приходит
                 // в ButtonContents.
@@ -1101,7 +1107,7 @@ impl Flight {
                                     lit: egui::Color32,
                                     rect: egui::Rect,
                                     clicked: bool| {
-                    view::TransportButton::new(
+                    TransportButton::new(
                         icon,
                         content.enabled,
                         content.active || clicked,
@@ -1113,9 +1119,9 @@ impl Flight {
 
                 // EXIT: всегда жива.
                 let exit_response =
-                    view::TransportButton::new(exit_label, true, false, EXIT_IDLE, EXIT_ACTIVE)
+                    TransportButton::new(exit_label, true, false, EXIT_IDLE, EXIT_ACTIVE)
                         .interact(ui, exit_rect, ui.make_persistent_id("flight_exit"));
-                view::TransportButton::new(
+                TransportButton::new(
                     exit_label,
                     true,
                     exit_response.clicked(),
@@ -1169,7 +1175,7 @@ impl Flight {
                     for (content, rect, id, icon, idle, lit) in &transport {
                         responses.push(if content.enabled {
                             Some(
-                                view::TransportButton::new(
+                                TransportButton::new(
                                     *icon,
                                     content.enabled,
                                     false,
@@ -1215,7 +1221,7 @@ impl Flight {
                         }
                     }
                     if responses[3].as_ref().is_some_and(|r| r.clicked()) {
-                        let radius = (scrub::RPT_SIZES[d.scrub.rpt_size] * 1000.0) as u64;
+                        let radius = (RPT_SIZES[d.scrub.rpt_size] * 1000.0) as u64;
                         d.transport.set_circle(if frame.transport.rpt.active {
                             None
                         } else {
@@ -1227,8 +1233,8 @@ impl Flight {
                     if frame.transport.rew.enabled {
                         if let Some(up) = d.scrub.vscroll.step(
                             scroll_delta,
-                            scrub::SCROLL_STEP,
-                            scrub::SCROLL_REARM,
+                            SCROLL_STEP,
+                            SCROLL_REARM,
                         ) {
                             let dir = if up { -1 } else { 1 };
                             let shift = |cur: &mut usize, len: usize, dir: i64| {
@@ -1237,28 +1243,28 @@ impl Flight {
                             // Скролл вверх — к большей скорости (шкалы
                             // по возрастанию, сдвиг единый со всеми).
                             if responses[0].as_ref().is_some_and(|r| r.hovered()) {
-                                shift(&mut d.scrub.seek_speed, scrub::SEEK_SPEEDS.len(), dir);
+                                shift(&mut d.scrub.seek_speed, SEEK_SPEEDS.len(), dir);
                             }
                             if responses[2].as_ref().is_some_and(|r| r.hovered()) {
-                                shift(&mut d.scrub.seek_speed, scrub::SEEK_SPEEDS.len(), dir);
+                                shift(&mut d.scrub.seek_speed, SEEK_SPEEDS.len(), dir);
                             }
                             if responses[3].as_ref().is_some_and(|r| r.hovered()) {
                                 let before = d.scrub.rpt_size;
-                                shift(&mut d.scrub.rpt_size, scrub::RPT_SIZES.len(), dir);
+                                shift(&mut d.scrub.rpt_size, RPT_SIZES.len(), dir);
                                 // Круг включён — переприменить радиус
                                 // (транспорт центр переставит сам).
                                 if d.scrub.rpt_size != before && d.transport.circle().is_some() {
                                     let radius =
-                                        (scrub::RPT_SIZES[d.scrub.rpt_size] * 1000.0) as u64;
+                                        (RPT_SIZES[d.scrub.rpt_size] * 1000.0) as u64;
                                     d.transport.set_circle(Some(Circle { center: 0, radius }));
                                 }
                             }
                             if responses[1].as_ref().is_some_and(|r| r.hovered()) {
                                 let before = d.scrub.play_speed;
-                                shift(&mut d.scrub.play_speed, scrub::PLAY_SPEEDS.len(), dir);
+                                shift(&mut d.scrub.play_speed, PLAY_SPEEDS.len(), dir);
                                 if d.scrub.play_speed != before {
                                     let speed =
-                                        scrub::PLAY_SPEEDS[d.scrub.play_speed] as f64 / 100.0;
+                                        PLAY_SPEEDS[d.scrub.play_speed] as f64 / 100.0;
                                     d.transport.set_speed(speed);
                                 }
                             }
@@ -1274,7 +1280,7 @@ impl Flight {
                 // в гоночный поток.
                 let rec_response = if frame.rec.rec.enabled {
                     Some(
-                        view::TransportButton::new("\u{f044a}", true, false, REC_IDLE, REC_ACTIVE)
+                        TransportButton::new("\u{f044a}", true, false, REC_IDLE, REC_ACTIVE)
                             .interact(ui, rec_rect, ui.make_persistent_id("flight_rec")),
                     )
                 } else {
@@ -1296,7 +1302,7 @@ impl Flight {
 
                 let race_response = if frame.rec.race.enabled {
                     Some(
-                        view::TransportButton::new(
+                        TransportButton::new(
                             "\u{f140b}",
                             true,
                             false,
@@ -1507,7 +1513,7 @@ impl Flight {
                 Event::Release
             } else if !state.down && response.is_pointer_button_down_on() {
                 state.down = true;
-                state.down_since = std::time::Instant::now();
+                state.down_since = Instant::now();
                 state.hold_sent = false;
                 Event::None
             } else if !state.down && response.clicked() {
@@ -1524,14 +1530,14 @@ impl Flight {
                     d.scrub.ff.down_since
                 }
                 .elapsed()
-                    < scrub::SEEK_CLICK_MAX;
+                    < SEEK_CLICK_MAX;
                 if quick {
                     if if back {
                         d.scrub.rew.hold_sent
                     } else {
                         d.scrub.ff.hold_sent
                     } {
-                        d.transport.shuttle_release(scrub::SEEK_RELEASE_RAMP);
+                        d.transport.shuttle_release(SEEK_RELEASE_RAMP);
                     }
                     let state = if back {
                         &mut d.scrub.rew
@@ -1540,10 +1546,10 @@ impl Flight {
                     };
                     state.flash = true;
                     let step =
-                        scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
+                        SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
                     Self::seek_by(d, clip, if back { -step } else { step });
                 } else {
-                    d.transport.shuttle_release(scrub::SEEK_RELEASE_RAMP);
+                    d.transport.shuttle_release(SEEK_RELEASE_RAMP);
                 }
             }
             Event::Tap => {
@@ -1553,7 +1559,7 @@ impl Flight {
                     &mut d.scrub.ff
                 };
                 state.flash = true;
-                let step = scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
+                let step = SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
                 Self::seek_by(d, clip, if back { -step } else { step });
             }
             Event::None => {}
@@ -1567,7 +1573,7 @@ impl Flight {
             if state.down && !state.hold_sent {
                 ui.ctx().request_repaint();
             }
-            state.down && !state.hold_sent && state.down_since.elapsed() >= scrub::SEEK_HOLD_DELAY
+            state.down && !state.hold_sent && state.down_since.elapsed() >= SEEK_HOLD_DELAY
         };
         if arm {
             let state = if back {
@@ -1577,7 +1583,7 @@ impl Flight {
             };
             state.hold_sent = true;
             let speed =
-                scrub::SEEK_SPEEDS[d.scrub.seek_speed] as f64 * if back { -1.0 } else { 1.0 };
+                SEEK_SPEEDS[d.scrub.seek_speed] as f64 * if back { -1.0 } else { 1.0 };
             d.transport.shuttle(speed);
         }
     }
@@ -1624,13 +1630,13 @@ impl Flight {
             (&"play", _) => ok(String::new()),
             (&"ff", Mode::Review(d)) => {
                 let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
-                let step = scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
+                let step = SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
                 Self::seek_by(d, &clip, step);
                 ok(String::new())
             }
             (&"rew", Mode::Review(d)) => {
                 let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
-                let step = scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
+                let step = SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
                 Self::seek_by(d, &clip, -step);
                 ok(String::new())
             }
@@ -1677,7 +1683,7 @@ impl Review {
         });
         let clip = RaceClip::from_events(journal.iter_ms());
         let mut players = HashMap::new();
-        let dir = std::path::Path::new(CAPTURES_DIR);
+        let dir = Path::new(CAPTURES_DIR);
         let mut opened = 0;
         for (camera_id, (filename, _)) in &clip.files {
             let path = dir.join(filename);
@@ -1692,7 +1698,7 @@ impl Review {
             // Рамки нет: деградация на последние файлы камер.
             if let Some(captures) = &captures {
                 for camera_id in shown_cameras.keys() {
-                    if let Some(path) = scrub::latest_capture(captures, camera_id) {
+                    if let Some(path) = latest_capture(captures, camera_id) {
                         players.insert(camera_id.clone(), Player::open(&path, ctx.clone()));
                     }
                 }
@@ -1722,14 +1728,14 @@ impl Review {
             transport,
             master,
             scrub: Scrub {
-                timeline: scrub::Timeline::new(),
-                rew: scrub::SeekButton::new(),
-                ff: scrub::SeekButton::new(),
-                seek_speed: scrub::SEEK_SPEEDS.iter().position(|&v| v == 10).unwrap(),
-                play_speed: scrub::PLAY_SPEEDS.iter().position(|&v| v == 100).unwrap(),
-                rpt_size: scrub::RPT_SIZES.iter().position(|&v| v == 1.0).unwrap(),
-                vscroll: scrub::ScrollGate::new(),
-                hscroll: scrub::HScroll::new(),
+                timeline: Timeline::new(),
+                rew: SeekButton::new(),
+                ff: SeekButton::new(),
+                seek_speed: SEEK_SPEEDS.iter().position(|&v| v == 10).unwrap(),
+                play_speed: PLAY_SPEEDS.iter().position(|&v| v == 100).unwrap(),
+                rpt_size: RPT_SIZES.iter().position(|&v| v == 1.0).unwrap(),
+                vscroll: ScrollGate::new(),
+                hscroll: HScroll::new(),
             },
         }
     }

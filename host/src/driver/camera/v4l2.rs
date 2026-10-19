@@ -6,12 +6,15 @@
 //! S_FMT): switching a device into another mode before the real open
 //! can leave the following stream in a throttled state.
 
-use crate::driver::camera::capture::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
-use crate::config::camera::{ResolutionConfig, FrameRateConfig};
 use super::Error;
 use crate::config::camera::{CameraConfig, PixelConfig};
+use crate::config::camera::{FrameRateConfig, ResolutionConfig};
+use crate::driver::camera::capture::{
+    Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
+};
 use std::ffi::CString;
-use std::io;
+use std::io::Error as IoError;
+use std::io::Result as IoResult;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
@@ -340,7 +343,7 @@ struct Device {
     formats: Vec<CaptureFormat>,
 }
 
-fn open_node(path: &str) -> io::Result<RawFd> {
+fn open_node(path: &str) -> IoResult<RawFd> {
     let cpath = CString::new(path).unwrap();
     let fd = unsafe {
         libc::open(
@@ -349,17 +352,17 @@ fn open_node(path: &str) -> io::Result<RawFd> {
         )
     };
     if fd == -1 {
-        Err(io::Error::last_os_error())
+        Err(IoError::last_os_error())
     } else {
         Ok(fd)
     }
 }
 
-fn query_capture_caps(fd: RawFd) -> io::Result<Option<String>> {
+fn query_capture_caps(fd: RawFd) -> IoResult<Option<String>> {
     // Zeroed + assume_init: Capability is integers and byte arrays only,
     // any bit pattern is valid, and a successful QUERYCAP fully fills it.
     let mut cap = std::mem::MaybeUninit::<Capability>::zeroed();
-    unsafe { querycap(fd, cap.as_mut_ptr()) }.map_err(io::Error::from)?;
+    unsafe { querycap(fd, cap.as_mut_ptr()) }.map_err(IoError::from)?;
     let cap = unsafe { cap.assume_init() };
     let caps = if cap.device_caps != 0 {
         cap.device_caps
@@ -383,8 +386,8 @@ fn enum_next<T: EnumStep>(
     fd: RawFd,
     op: unsafe fn(RawFd, *mut T) -> nix::Result<i32>,
     item: &mut T,
-) -> io::Result<()> {
-    unsafe { op(fd, item) }.map_err(io::Error::from)?;
+) -> IoResult<()> {
+    unsafe { op(fd, item) }.map_err(IoError::from)?;
     item.bump();
     Ok(())
 }
@@ -407,7 +410,7 @@ impl EnumStep for FrameIntervalEnum {
     }
 }
 
-fn enumerate_formats(fd: RawFd) -> io::Result<Vec<CaptureFormat>> {
+fn enumerate_formats(fd: RawFd) -> IoResult<Vec<CaptureFormat>> {
     let mut out = Vec::new();
     let mut desc = FmtDesc {
         index: 0,
@@ -431,7 +434,7 @@ fn enumerate_sizes(
     fourcc: u32,
     config: PixelConfig,
     out: &mut Vec<CaptureFormat>,
-) -> io::Result<()> {
+) -> IoResult<()> {
     let mut sizes = FrameSizeEnum {
         index: 0,
         pixel_format: fourcc,
@@ -459,7 +462,7 @@ fn enumerate_intervals(
     width: u32,
     height: u32,
     out: &mut Vec<CaptureFormat>,
-) -> io::Result<()> {
+) -> IoResult<()> {
     let mut ival = FrameIntervalEnum {
         index: 0,
         pixel_format: fourcc,
@@ -480,9 +483,7 @@ fn enumerate_intervals(
         if fract.numerator != 0 && fract.denominator % fract.numerator == 0 {
             out.push(CaptureFormat {
                 resolution: ResolutionConfig { width, height },
-                frame_rate: FrameRateConfig(
-                    fract.denominator / fract.numerator,
-                ),
+                frame_rate: FrameRateConfig(fract.denominator / fract.numerator),
                 format: config,
             });
         }
@@ -492,14 +493,14 @@ fn enumerate_intervals(
 
 /// Enumerates capture nodes. QUERYCAP/ENUM_* only — device state is
 /// left untouched (no S_FMT).
-fn enumerate_devices() -> io::Result<Vec<Device>> {
+fn enumerate_devices() -> IoResult<Vec<Device>> {
     let mut devices = Vec::new();
     for i in 0..64 {
         let path = format!("/dev/video{i}");
         let Ok(fd) = open_node(&path) else {
             continue;
         };
-        let result: io::Result<Option<Device>> = (|| {
+        let result: IoResult<Option<Device>> = (|| {
             let Some(name) = query_capture_caps(fd)? else {
                 return Ok(None);
             };
@@ -587,9 +588,9 @@ fn mono_to_instant(anchor: &(libc::timespec, Instant), ts: &Timeval) -> Instant 
     }
 }
 
-fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
-    let fd = open_node(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?;
-    let result: io::Result<V4l2Session> = (|| {
+fn open_session(path: &str, config: &CameraConfig) -> IoResult<V4l2Session> {
+    let fd = open_node(path).map_err(|e| IoError::new(e.kind(), format!("{path}: {e}")))?;
+    let result: IoResult<V4l2Session> = (|| {
         let format = fourcc(config.format);
         let mut fmt = Format {
             typ: CAPTURE,
@@ -610,7 +611,7 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
                 },
             },
         };
-        unsafe { s_fmt(fd, &mut fmt) }.map_err(io::Error::from)?;
+        unsafe { s_fmt(fd, &mut fmt) }.map_err(IoError::from)?;
         // S_PARM sets the frame interval; some drivers reject it — not
         // fatal, fall back to the requested rate.
         let mut parm = StreamParm {
@@ -629,7 +630,7 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
                 },
             },
         };
-        let fps = match unsafe { s_parm(fd, &mut parm) }.map_err(io::Error::from) {
+        let fps = match unsafe { s_parm(fd, &mut parm) }.map_err(IoError::from) {
             Ok(_) => {
                 // SAFETY: the driver filled the capture branch of the union.
                 let fract = unsafe { parm.parm.capture.timeperframe };
@@ -655,15 +656,15 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
             flags: 0,
             reserved: [0; 3],
         };
-        unsafe { reqbufs(fd, &mut req) }.map_err(io::Error::from)?;
+        unsafe { reqbufs(fd, &mut req) }.map_err(IoError::from)?;
         if req.count == 0 {
-            return Err(io::Error::other("driver allocated zero buffers"));
+            return Err(IoError::other("driver allocated zero buffers"));
         }
         let mut buffers = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let mut buf = Buffer::new();
             buf.index = index;
-            unsafe { querybuf(fd, &mut buf) }.map_err(io::Error::from)?;
+            unsafe { querybuf(fd, &mut buf) }.map_err(IoError::from)?;
             let ptr = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -676,16 +677,16 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
                 )
             };
             if ptr == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
+                return Err(IoError::last_os_error());
             }
             buffers.push(MmapBuffer {
                 ptr: ptr as *mut u8,
                 len: buf.length as usize,
             });
-            unsafe { qbuf(fd, &mut buf) }.map_err(io::Error::from)?;
+            unsafe { qbuf(fd, &mut buf) }.map_err(IoError::from)?;
         }
         let stream_type = CAPTURE;
-        unsafe { streamon(fd, &stream_type) }.map_err(io::Error::from)?;
+        unsafe { streamon(fd, &stream_type) }.map_err(IoError::from)?;
         let mono_anchor = clock_anchor();
         // The first frame after STREAMON can be a fragment (the stream
         // starts mid-frame). Dequeue a single buffer and drop it unless
@@ -700,7 +701,7 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
         if unsafe { libc::poll(&mut pfd, 1, 500) } > 0 {
             let mut first = Buffer::new();
             if unsafe { dqbuf(fd, &mut first) }
-                .map_err(io::Error::from)
+                .map_err(IoError::from)
                 .is_ok()
             {
                 let index = first.index as usize;
@@ -727,7 +728,7 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
                         log::info!("first frame after STREAMON is a fragment, drained");
                     }
                 }
-                let _ = unsafe { qbuf(fd, &mut first) }.map_err(io::Error::from);
+                let _ = unsafe { qbuf(fd, &mut first) }.map_err(IoError::from);
             }
         }
         Ok(V4l2Session {
@@ -766,7 +767,7 @@ impl CaptureSession for V4l2Session {
         // Non-blocking fd: EAGAIN → poll and retry.
         let mut dequeued = false;
         for _ in 0..8 {
-            match unsafe { dqbuf(self.fd, &mut buf) }.map_err(io::Error::from) {
+            match unsafe { dqbuf(self.fd, &mut buf) }.map_err(IoError::from) {
                 Ok(_) => {
                     dequeued = true;
                     break;
@@ -815,7 +816,7 @@ impl CaptureSession for V4l2Session {
         .expect("index checked above");
         // Buffer copied — return it to the driver before processing.
         unsafe { qbuf(self.fd, &mut buf) }
-            .map_err(|e| FrameError::Recoverable(io::Error::from(e).to_string()))?;
+            .map_err(|e| FrameError::Recoverable(IoError::from(e).to_string()))?;
         Ok(Frame {
             timestamp: buffer_timestamp(&buf, &self.mono_anchor),
             data,
@@ -878,7 +879,7 @@ fn frame_error(poll_rc: i32) -> FrameError {
     }
 }
 
-fn frame_error_e(e: io::Error) -> FrameError {
+fn frame_error_e(e: IoError) -> FrameError {
     match e.raw_os_error() {
         Some(libc::ENODEV) | Some(libc::EIO) => FrameError::Unrecoverable(e.to_string()),
         _ => FrameError::Recoverable(e.to_string()),

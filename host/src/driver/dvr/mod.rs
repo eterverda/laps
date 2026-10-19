@@ -17,7 +17,6 @@ use crate::driver::camera::capture::{CaptureFormat, Frame, FrameData};
 use crate::driver::camera::fps::{FpsCounter, FrameStats};
 
 use crossbeam_utils::atomic::AtomicCell;
-use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +25,15 @@ use mkv::MkvWriter;
 use mp4::IsobmffWriter;
 
 use crate::config::camera::ContainerConfig;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::path::Path;
+use std::fs;
+use std::thread;
+use std::io::Result as IoResult;
+use std::io::Error as IoError;
+use std::io::ErrorKind as IoErrorKind;
 
 /// Состояние записи: жизненный цикл writer-потока.
 /// Idle → Preparing (файл создан) → Writing (первый кадр был — метка
@@ -67,10 +75,10 @@ pub type SharedRecordState = Arc<AtomicCell<RecordState>>;
 /// строит). Конструктор `create` — inherent у каждого писателя, трейт
 /// покрывает жизненный цикл записи. `Send`: writer живёт в своём потоке.
 pub trait VideoWriter: Send {
-    fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> io::Result<()>;
-    fn sync_data(&mut self) -> io::Result<()>;
+    fn write_frame(&mut self, jpeg: &[u8], ts_ms: u64) -> IoResult<()>;
+    fn sync_data(&mut self) -> IoResult<()>;
     /// Потребляет писателя: таблицы/индекс, патчи заголовков, fsync.
-    fn finalize(self: Box<Self>) -> io::Result<()>;
+    fn finalize(self: Box<Self>) -> IoResult<()>;
 }
 
 /// Размеры кадра записи (реэкспорт, в dvr без суффикса Config).
@@ -90,18 +98,18 @@ pub trait VideoReader: Send {
     /// Размеры кадра.
     fn resolution(&self) -> ResolutionConfig;
     /// Кадр i в буфер (длиной ≥ max_frame_len). Возвращает (pts, байт).
-    fn read_frame_into(&mut self, i: usize, buf: &mut [u8]) -> io::Result<(u64, usize)>;
+    fn read_frame_into(&mut self, i: usize, buf: &mut [u8]) -> IoResult<(u64, usize)>;
 }
 
 /// Открыть читалку по расширению файла.
-pub fn open_reader(path: &std::path::Path) -> io::Result<Box<dyn VideoReader>> {
+pub fn open_reader(path: &Path) -> IoResult<Box<dyn VideoReader>> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("mkv") => Ok(Box::new(mkv::MkvReader::open(path)?)),
         // MP4 и MOV читаются одним ридером ISOBMFF (бренды ftyp для
         // чтения не важны).
         Some("mp4") | Some("mov") => Ok(Box::new(mp4::IsobmffReader::open(path)?)),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
+        other => Err(IoError::new(
+            IoErrorKind::InvalidInput,
             format!("unsupported recording format: {other:?}"),
         )),
     }
@@ -133,14 +141,14 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// не держит, detach безопасен).
 pub struct Record {
     state: SharedRecordState,
-    sender: Option<crossbeam_channel::Sender<(std::sync::Arc<Frame>, u64)>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    sender: Option<crossbeam_channel::Sender<(Arc<Frame>, u64)>>,
+    thread: Option<thread::JoinHandle<()>>,
     /// Дропы в канале (try_send failed), считает push, читает
     /// writer-поток для отчёта.
-    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    dropped: Arc<AtomicU64>,
     /// Флаг «запись вне гонки»: writer после finalize удаляет файл.
     /// Ставится abort() до drop — поток видит флаг при финализации.
-    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: Arc<AtomicBool>,
 }
 
 impl Record {
@@ -148,9 +156,9 @@ impl Record {
         params: &RecordParams,
         negotiated: &CaptureFormat,
         state: &SharedRecordState,
-    ) -> io::Result<Self> {
+    ) -> IoResult<Self> {
         use FrameData;
-        std::fs::create_dir_all(&params.dir)?;
+        fs::create_dir_all(&params.dir)?;
         // Стем полный (с camera_id и номером сессии) — см. RecordParams.
         let stem = format!("{}-mjpeg", params.stem);
         // Файл создаём здесь, а не в writer-потоке: ошибка (диск полон,
@@ -170,13 +178,13 @@ impl Record {
         state.store(RecordState::Preparing);
         let writer_path = path.clone();
         let (sender, receiver) =
-            crossbeam_channel::bounded::<(std::sync::Arc<Frame>, u64)>(CHANNEL_CAP);
+            crossbeam_channel::bounded::<(Arc<Frame>, u64)>(CHANNEL_CAP);
         let state_clone = state.clone();
-        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let abort_clone = std::sync::Arc::clone(&abort);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_clone = Arc::clone(&abort);
         // В поток уходят owned-копии: ссылки на параметры не 'static.
-        let thread = std::thread::spawn(move || {
+        let thread = thread::spawn(move || {
             // Финализация (включая ранние return по ошибкам) завершена —
             // будим ждущих тёплый DVR.
             let _done = SetDone(state_clone.clone());
@@ -274,8 +282,8 @@ impl Record {
             }
             // Прерванная (вне гонки) запись: файл корректно закрыт
             // выше — теперь удаляем.
-            if abort_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                match std::fs::remove_file(&writer_path) {
+            if abort_clone.load(Ordering::Relaxed) {
+                match fs::remove_file(&writer_path) {
                     Ok(()) => log::info!("dvr: aborted recording deleted {:?}", writer_path),
                     Err(e) => log::error!("dvr: abort delete failed for {:?}: {}", writer_path, e),
                 }
@@ -302,7 +310,7 @@ impl Record {
     /// Прервать запись: файл будет финализирован и удалён (запись вне
     /// гонки). Вызывается до drop.
     pub fn abort(&self) {
-        self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.abort.store(true, Ordering::Relaxed);
     }
 
     /// Из pipeline. `ts` — момент захвата кадра, мс с Unix-эпохи
@@ -310,7 +318,7 @@ impl Record {
     /// просто выбрасывается (состояние уже отражено в RecordState, UI
     /// показал). Переполнение канала = дроп кадра + warn (захват важнее
     /// записи).
-    pub fn push(&self, frame: std::sync::Arc<Frame>, ts: u64) {
+    pub fn push(&self, frame: Arc<Frame>, ts: u64) {
         if !matches!(
             self.state.load(),
             RecordState::Preparing | RecordState::Writing { .. }
@@ -320,7 +328,7 @@ impl Record {
         if let Some(sender) = &self.sender {
             if sender.try_send((frame, ts)).is_err() {
                 self.dropped
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed);
                 log::warn!("dvr: frame dropped (writer busy)");
             }
         }
@@ -346,6 +354,14 @@ pub fn epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::config::camera::{FrameRateConfig, ResolutionConfig};
+    use crossbeam_utils::atomic::AtomicCell;
+    use std::env::temp_dir;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use std::{fs, process, thread};
+
     /// YUYV: RGBA перекодируется в JPEG и пишется в контейнер по
     /// умолчанию (MKV); REC гаснет по выходу writer-потока.
     #[test]
@@ -354,13 +370,10 @@ mod tests {
             CaptureFormat, Frame, FrameData, Record, RecordParams, RecordState, SharedRecordState,
             epoch_millis,
         };
-        use crate::config::camera::{CameraConfig, PixelConfig};
-        use crate::config::camera::{FrameRateConfig, ResolutionConfig};
-        use crossbeam_utils::atomic::AtomicCell;
-        use std::sync::Arc;
+        use crate::config::camera::{CameraConfig, FrameRateConfig, PixelConfig, ResolutionConfig};
 
-        let dir = std::env::temp_dir().join(format!("laps-dvr-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir().join(format!("laps-dvr-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
         let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
         let params = RecordParams {
             dir: dir.clone(),
@@ -380,8 +393,8 @@ mod tests {
             for _ in 0..3 {
                 let pixels = vec![egui::Color32::BLACK; 64 * 48];
                 recorder.push(
-                    std::sync::Arc::new(Frame {
-                        timestamp: std::time::Instant::now(),
+                    Arc::new(Frame {
+                        timestamp: Instant::now(),
                         data: FrameData::Rgba {
                             rgba: egui::ColorImage::new([64, 48], pixels),
                         },
@@ -393,14 +406,14 @@ mod tests {
 
         // Джойна нет по дизайну — ждём гашение REC (writer гасит его по
         // закрытию канала, до finalize/fsync).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !matches!(state.load(), RecordState::Done) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(state.load(), RecordState::Done) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(state.load(), RecordState::Done);
 
         // Видеофайл есть (контейнер по умолчанию — MKV), других файлов нет.
-        let entries: Vec<_> = std::fs::read_dir(&dir)
+        let entries: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
@@ -417,7 +430,7 @@ mod tests {
             "unexpected files: {entries:?}"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Record → mp4/mov → open_reader: контейнеры семейства ISOBMFF
@@ -430,17 +443,14 @@ mod tests {
             open_reader,
         };
         use crate::config::camera::{CameraConfig, ContainerConfig, PixelConfig};
-        use crate::config::camera::{FrameRateConfig, ResolutionConfig};
         use crate::driver::dvr::encode;
-        use crossbeam_utils::atomic::AtomicCell;
-        use std::sync::Arc;
 
         for container in [ContainerConfig::Mp4, ContainerConfig::Mov] {
-            let dir = std::env::temp_dir().join(format!(
+            let dir = temp_dir().join(format!(
                 "laps-dvr-test-{}-{container:?}",
-                std::process::id()
+                process::id()
             ));
-            std::fs::create_dir_all(&dir).unwrap();
+            fs::create_dir_all(&dir).unwrap();
             let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
             let mut camera = CameraConfig::new("Test", 64, 48, 30, PixelConfig::Mjpeg);
             camera.dvr.container = container;
@@ -474,8 +484,8 @@ mod tests {
                 for i in 0..6u64 {
                     let jpeg = &jpegs[i as usize % 2];
                     recorder.push(
-                        std::sync::Arc::new(Frame {
-                            timestamp: std::time::Instant::now(),
+                        Arc::new(Frame {
+                            timestamp: Instant::now(),
                             data: FrameData::Jpeg {
                                 buf: jpeg.clone(),
                                 len: Some(jpeg.len()),
@@ -486,10 +496,10 @@ mod tests {
                 }
             } // drop: writer финализирует в фоне
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !matches!(state.load(), RecordState::Done) && std::time::Instant::now() < deadline
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(state.load(), RecordState::Done) && Instant::now() < deadline
             {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(50));
             }
             assert_eq!(state.load(), RecordState::Done);
 
@@ -498,7 +508,7 @@ mod tests {
                 ContainerConfig::Mov => "mov",
                 ContainerConfig::Mp4 => "mp4",
             };
-            let path = std::fs::read_dir(&dir)
+            let path = fs::read_dir(&dir)
                 .unwrap()
                 .flatten()
                 .map(|e| e.path())
@@ -514,7 +524,7 @@ mod tests {
                 assert_eq!(&buf[..len], jpegs[i as usize % 2].as_slice(), "кадр {i}");
             }
 
-            std::fs::remove_dir_all(&dir).ok();
+            fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -525,13 +535,9 @@ mod tests {
             CaptureFormat, Frame, FrameData, Record, RecordParams, RecordState, SharedRecordState,
         };
         use crate::config::camera::{CameraConfig, PixelConfig};
-        use crate::config::camera::{FrameRateConfig, ResolutionConfig};
-        use crossbeam_utils::atomic::AtomicCell;
-        use std::sync::Arc;
-        use crate::driver::dvr::encode;
 
-        let dir = std::env::temp_dir().join(format!("laps-dvr-abort-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir().join(format!("laps-dvr-abort-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
         let state: SharedRecordState = Arc::new(AtomicCell::new(RecordState::Idle));
         let params = RecordParams {
             dir: dir.clone(),
@@ -559,7 +565,7 @@ mod tests {
             let jpeg = encode::encode_rgba_to_jpeg(&rgba, 64, 48).unwrap();
             recorder.push(
                 Arc::new(Frame {
-                    timestamp: std::time::Instant::now(),
+                    timestamp: Instant::now(),
                     data: FrameData::Jpeg {
                         buf: jpeg.clone(),
                         len: Some(jpeg.len()),
@@ -571,19 +577,19 @@ mod tests {
         } // drop: writer finalize'ит и удаляет файл в фоне
 
         // Writer detached — поллим исчезновение файла.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while path.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
         }
         assert!(
             !path.exists(),
             "aborted recording must be deleted: {path:?}"
         );
         assert!(
-            std::fs::read_dir(&dir).unwrap().flatten().next().is_none(),
+            fs::read_dir(&dir).unwrap().flatten().next().is_none(),
             "aborted recording leaves no files in {dir:?}"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&dir).ok();
     }
 }

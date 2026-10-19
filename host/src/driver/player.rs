@@ -8,7 +8,6 @@
 //! от частоты кадров UI. Позиция на экране — pts показанного кадра
 //! (атомик `shown`), циферблат читает его.
 
-use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,6 +20,12 @@ use crate::config::camera::ResolutionConfig;
 use crate::driver::dvr::VideoReader;
 use crate::driver::camera::fps::FrameStats;
 use crate::driver::dvr::open_reader;
+use std::path::PathBuf;
+use std::path::Path;
+use std::mem;
+use std::io::Result as IoResult;
+use std::io::Error as IoError;
+use std::io::ErrorKind as IoErrorKind;
 
 /// Клапан показа: на высоких скоростях due-кадры идут чаще, чем успевает
 /// декодер — чаще одного показа за это время не декодируем вообще, индекс
@@ -96,7 +101,7 @@ pub struct Player {
 impl Player {
     /// Открыть файл. Фасад возвращается сразу; индекс, первый кадр
     /// и само воспроизведение — в worker-потоке.
-    pub fn open(path: &std::path::Path, ctx: egui::Context) -> Self {
+    pub fn open(path: &Path, ctx: egui::Context) -> Self {
         let slot: FrameSlot = Arc::new(Mutex::new(None));
         let inner = Arc::new(Mutex::new(Inner {
             state: PlayerState::Opening,
@@ -206,7 +211,7 @@ impl Drop for Player {
 /// дедлайнов), UI видит слот и атомики. Зеркало capture_loop: функция
 /// без self, состояние — локальный тип.
 fn playback_loop(
-    path: std::path::PathBuf,
+    path: PathBuf,
     ctx: egui::Context,
     slot: FrameSlot,
     inner: Arc<Mutex<Inner>>,
@@ -309,11 +314,11 @@ fn playback_loop(
 
         /// Кадр i: read в постоянный JPEG-буфер, декод in-place в image.
         /// presented=false — стоп-кадр (клапан показа не трогаем).
-        fn read_and_present(&mut self, i: usize, presented: bool) -> io::Result<()> {
+        fn read_and_present(&mut self, i: usize, presented: bool) -> IoResult<()> {
             let t0 = Instant::now();
             let (_, len) = self.reader.read_frame_into(i, &mut self.jpeg)?;
             self.read.on_process(t0.elapsed());
-            let data = std::mem::take(&mut self.jpeg);
+            let data = mem::take(&mut self.jpeg);
             self.decode_and_publish(&data[..len], presented);
             self.jpeg = data;
             Ok(())
@@ -554,7 +559,7 @@ fn playback_loop(
         over_decodes: 0,
     };
     if pb.pts.is_empty() {
-        let e = io::Error::new(io::ErrorKind::InvalidData, "no frames");
+        let e = IoError::new(IoErrorKind::InvalidData, "no frames");
         log::error!("player: {}: {e}", path.display());
         inner.lock().unwrap().state = PlayerState::Failed(e.to_string());
         pb.ctx.request_repaint();

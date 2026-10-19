@@ -1,6 +1,7 @@
 /// Кадр не декодирован — пропускаем его и живём дальше. Не сбой потока:
 /// причины разнообразны и важны для диагностики, поэтому типизированы.
 use crate::config::camera::PixelConfig;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 #[derive(Debug)]
 pub enum Error {
@@ -14,8 +15,8 @@ pub enum Error {
     Convert(String),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Error::NotJpeg => write!(f, "MJPEG frame without SOI (FF D8)"),
             Error::BufferSize { got, want } => {

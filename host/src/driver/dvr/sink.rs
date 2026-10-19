@@ -3,9 +3,10 @@
 //! с Record и политикой троттлинга; композиция — в pipeline camera,
 //! который создаёт DvrSink и дёргает start/stop по командам UI.
 
-use super::{RecordParams, Record, SharedRecordState, epoch_millis};
+use super::{Record, RecordParams, RecordState, SharedRecordState, epoch_millis};
+use crate::driver::camera::capture::{CaptureFormat, Frame};
 use crate::config::camera::FrameRateConfig;
-use crate::driver::camera::capture::{Frame, FrameData, FrameSink};
+use crate::driver::camera::capture::{FrameData, FrameSink};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,7 +53,7 @@ pub struct DvrSink {
     /// записанный + 25 мс). Стартовое now(): первый кадр записи штампится
     /// позже и проходит всегда — спец-значения не нужны.
     next_eligible: Instant,
-    negotiated: crate::driver::camera::CaptureFormat,
+    negotiated: CaptureFormat,
     state: SharedRecordState,
     /// Якорь Instant→epoch millis (ставится до цикла кадров).
     anchor: (Instant, u64),
@@ -61,7 +62,7 @@ pub struct DvrSink {
 impl DvrSink {
     pub fn new(
         fps: FrameRateConfig,
-        negotiated: crate::driver::camera::CaptureFormat,
+        negotiated: CaptureFormat,
         state: SharedRecordState,
     ) -> Self {
         Self {
@@ -87,7 +88,7 @@ impl DvrSink {
             Ok(recorder) => self.recorder = Some(recorder),
             Err(e) => {
                 log::error!("dvr: recording unavailable: {}", e);
-                self.state.store(crate::driver::dvr::RecordState::Failed);
+                self.state.store(RecordState::Failed);
                 self.recorder = None;
             }
         }

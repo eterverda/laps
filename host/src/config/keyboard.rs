@@ -3,7 +3,7 @@
 //! an empty filter matches nothing, so a missing filter can never attach
 //! every keyboard (fail-closed).
 
-use crate::driver::keyboard::{keycode_to_str, keycode_from_str};
+use crate::driver::keyboard::{KeyboardInfo, keycode_from_str, keycode_to_str};
 
 /// How the driver attaches the device. Grab is exclusive (the system
 /// and other apps see nothing); listen is passive. Serialized lowercase
@@ -57,7 +57,7 @@ impl KeyboardConfig {
     /// Mirror of `CameraConfig::matches`: name is a case-insensitive
     /// substring, vid/pid/serial are exact when set. Requires at least
     /// one criterion — an empty config matches nothing.
-    pub fn matches(&self, info: &crate::driver::keyboard::KeyboardInfo) -> bool {
+    pub fn matches(&self, info: &KeyboardInfo) -> bool {
         let has_criterion = self.name.is_some()
             || self.vid.is_some()
             || self.pid.is_some()

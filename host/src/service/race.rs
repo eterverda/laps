@@ -10,22 +10,16 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel as crossbeam;
 
-use crate::assets::BUZZER_WAV;
-use crate::model::flight;
 
 use crate::config::camera::{CameraConfig, ContainerConfig as CameraConfigContainer};
+use crate::driver::keyboard::KeyEvent;
 use crate::config::setup::PadConfig;
-use crate::driver::audio::{self, Audio};
+use crate::driver::audio::{Audio, Sound};
 use crate::driver::camera::Recorder;
-use crate::driver::dvr::RecordParams;
-use crate::model::flight::{FlightEvent, Journal, file_stem};
+use crate::driver::dvr::{RecordParams, RecordState};
+use crate::model::flight::{JournalRecord, Journal};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
-
-/// Гудок старт/стоп.
-const BUZZER: audio::Sound = audio::Sound::from_bytes(BUZZER_WAV);
-/// Бип отсчёта.
-const STAGE: audio::Sound = audio::Sound::from_bytes(crate::assets::STAGE_WAV);
 
 /// Интервал поллинга record_state (first_frame_at) и крышка сна
 /// recv_timeout: события первых кадров заметны не позже этого.
@@ -135,22 +129,6 @@ impl RaceStage {
     }
 }
 
-/// Фаза, в которой окажется ядро после born с этим намерением —
-/// GUI ставит её в Live на кадр рождения, до первого Notice::State.
-pub fn born_state(first: Intent, now: Instant, rules: &RaceRules) -> RaceStage {
-    match first {
-        Intent::RecPressed => RaceStage::Before,
-        Intent::RacePressed => RaceStage::Countdown {
-            start: race_time_start(
-                now,
-                Duration::from_secs(PRE_BEEP_SECS) + sample_start_delay(&rules.start_signal_delay),
-                BUZZER.duration(),
-            ),
-        },
-        Intent::Exit => RaceStage::Finished,
-    }
-}
-
 /// Гоночное ядро: часы гонки, политика записи, журнал. Чистое — решения
 /// возвращаются эффектами, IO исполняет поток-обёртка. Ядро — единственный
 /// писатель журнала; порядок «журнал раньше уведомления GUI» обеспечивает
@@ -174,7 +152,7 @@ pub struct RaceCore {
     /// Отложенные события (REC-on и VideoAttached головы до старта
     /// гонки): пишутся в журнал в момент старта гонки, при отмене —
     /// выбрасываются.
-    rec_deferred: Vec<(u64, FlightEvent)>,
+    rec_deferred: Vec<(u64, JournalRecord)>,
     /// Последнее известное first_frame_at по камерам (edge-детект).
     rec_seen: HashMap<String, Option<Instant>>,
     /// Гонка состоялась (Running или дальше): отличает финиш после гонки
@@ -184,6 +162,23 @@ pub struct RaceCore {
 }
 
 impl RaceCore {
+    /// Фаза, в которой окажется ядро после new с этим намерением —
+    /// GUI ставит её в Live на кадр рождения, до первого Notice::State.
+    pub fn initial_mode(first: Intent, now: Instant, rules: &RaceRules) -> RaceStage {
+        match first {
+            Intent::RecPressed => RaceStage::Before,
+            Intent::RacePressed => RaceStage::Countdown {
+                start: race_time_start(
+                    now,
+                    Duration::from_secs(PRE_BEEP_SECS)
+                        + sample_start_delay(&rules.start_signal_delay),
+                    Sound::BUZZER.duration(),
+                ),
+            },
+            Intent::Exit => RaceStage::Finished,
+        }
+    }
+
     /// Конструктор = REC нажали: ядро рождается с записью (Before) —
     /// журнал, ноль меток, сессии записи и отложенный RecordStarted
     /// стартуют от этого момента (файлы называются временем первой
@@ -216,7 +211,7 @@ impl RaceCore {
             raced: false,
         };
         core.rec_deferred
-            .push((core.ms(now), FlightEvent::RecordStarted {}));
+            .push((core.ms(now), JournalRecord::RecordStarted {}));
         let effects = vec![Effect::Record {
             sessions: core.start_sessions(),
         }];
@@ -266,7 +261,7 @@ impl RaceCore {
                 // писатель (поток-обёртка) снапшотом на этом же тике.
                 self.flush_rec_deferred();
                 self.journal
-                    .push(self.ms(start), FlightEvent::RaceStarted {});
+                    .push(self.ms(start), JournalRecord::RaceStarted {});
                 self.phase = RaceStage::Running { start };
                 self.raced = true;
                 Vec::new()
@@ -276,7 +271,7 @@ impl RaceCore {
                 if self.rules.duration.is_some_and(|limit| elapsed >= limit) {
                     self.journal.push(
                         self.ms(now),
-                        FlightEvent::RaceFinished { prematurely: false },
+                        JournalRecord::RaceFinished { prematurely: false },
                     );
                     self.phase = RaceStage::After { race: elapsed };
                     vec![Effect::Buzzer]
@@ -303,7 +298,7 @@ impl RaceCore {
                 // REC гасит запись посреди гонки — гонка финиширует здесь.
                 self.journal.push(
                     self.ms(now),
-                    FlightEvent::RaceFinished { prematurely: false },
+                    JournalRecord::RaceFinished { prematurely: false },
                 );
                 self.finish_recording(now);
                 self.phase = RaceStage::Finished;
@@ -333,7 +328,7 @@ impl RaceCore {
             RaceStage::Countdown { .. } => {
                 // Отмена: отложенный отсчёт не состоялся — выбрасываем.
                 self.rec_deferred
-                    .retain(|(_, ev)| !matches!(ev, FlightEvent::RaceCountdown {}));
+                    .retain(|(_, ev)| !matches!(ev, JournalRecord::RaceCountdown {}));
                 self.phase = RaceStage::Before;
                 vec![Effect::CancelAudio]
             }
@@ -342,7 +337,7 @@ impl RaceCore {
                 let race = now.saturating_duration_since(start);
                 self.journal.push(
                     self.ms(now),
-                    FlightEvent::RaceFinished { prematurely: true },
+                    JournalRecord::RaceFinished { prematurely: true },
                 );
                 self.phase = RaceStage::After { race };
                 vec![Effect::Buzzer]
@@ -359,7 +354,7 @@ impl RaceCore {
             RaceStage::Running { .. } => {
                 self.journal.push(
                     self.ms(now),
-                    FlightEvent::RaceFinished { prematurely: true },
+                    JournalRecord::RaceFinished { prematurely: true },
                 );
                 self.finish_recording(now);
                 vec![Effect::Buzzer, Effect::StopRecording { commit: true }]
@@ -390,7 +385,7 @@ impl RaceCore {
             }
         }
         self.journal
-            .push(self.ms(now), FlightEvent::RecordFinished {});
+            .push(self.ms(now), JournalRecord::RecordFinished {});
     }
 
     /// Свежий first_frame_at камеры из поллинга record_state. Новое
@@ -413,7 +408,7 @@ impl RaceCore {
             log::warn!("flight: first frame of {camera_id} without pending filename");
             return;
         };
-        let event = FlightEvent::VideoAttached {
+        let event = JournalRecord::VideoAttached {
             camera_id: camera_id.to_owned(),
             filename,
         };
@@ -436,9 +431,9 @@ impl RaceCore {
     /// до гонки) не плодит дубликаты — старый выбрасываем.
     fn defer_countdown(&mut self, now: Instant) {
         self.rec_deferred
-            .retain(|(_, ev)| !matches!(ev, FlightEvent::RaceCountdown {}));
+            .retain(|(_, ev)| !matches!(ev, JournalRecord::RaceCountdown {}));
         self.rec_deferred
-            .push((self.ms(now), FlightEvent::RaceCountdown {}));
+            .push((self.ms(now), JournalRecord::RaceCountdown {}));
     }
 
     fn countdown_delay(&self) -> Duration {
@@ -450,7 +445,7 @@ impl RaceCore {
     /// в FIFO ожидания первых кадров. Параметры готовы к исполнению —
     /// обёртка их не собирает.
     fn start_sessions(&mut self) -> Vec<(String, RecordParams)> {
-        let flight_stem = file_stem(self.journal.date_time());
+        let flight_stem = self.journal.header().file_stem();
         let mut sessions = Vec::new();
         for (id, camera) in &self.cameras {
             let stem = format!("{flight_stem}-{id}");
@@ -485,6 +480,7 @@ impl RaceCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::camera::PixelConfig;
     use crate::model::rules::StartSignalDelay;
 
     /// Длительность гонки для сценариев.
@@ -508,7 +504,7 @@ mod tests {
     }
 
     fn test_camera() -> CameraConfig {
-        CameraConfig::new("Test", 8, 8, 30, crate::config::camera::PixelConfig::Mjpeg)
+        CameraConfig::new("Test", 8, 8, 30, PixelConfig::Mjpeg)
     }
 
     fn test_core(clock: &FakeClock) -> RaceCore {
@@ -533,12 +529,12 @@ mod tests {
             .iter_ms()
             .map(|(ms, event)| {
                 let mark = match event {
-                    FlightEvent::RecordStarted {} => "rec",
-                    FlightEvent::RecordFinished {} => "rec-end",
-                    FlightEvent::VideoAttached { .. } => "file",
-                    FlightEvent::RaceCountdown {} => "cd",
-                    FlightEvent::RaceStarted {} => "go",
-                    FlightEvent::RaceFinished { prematurely } => {
+                    JournalRecord::RecordStarted {} => "rec",
+                    JournalRecord::RecordFinished {} => "rec-end",
+                    JournalRecord::VideoAttached { .. } => "file",
+                    JournalRecord::RaceCountdown {} => "cd",
+                    JournalRecord::RaceStarted {} => "go",
+                    JournalRecord::RaceFinished { prematurely } => {
                         if *prematurely {
                             "finish-user"
                         } else {
@@ -887,12 +883,12 @@ pub fn spawn(
     assignments: HashMap<String, Pilot>,
     cameras: HashMap<String, CameraConfig>,
     recorders: HashMap<String, Recorder>,
-    mut keyboards: HashMap<String, crossbeam::Receiver<crate::driver::keyboard::KeyEvent>>,
-    key_events: std::sync::Arc<std::sync::Mutex<Vec<crate::driver::keyboard::KeyEvent>>>,
+    mut keyboards: HashMap<String, crossbeam::Receiver<KeyEvent>>,
+    key_events: std::sync::Arc<std::sync::Mutex<Vec<KeyEvent>>>,
     key_dead: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
     first: Intent,
-    audio: crate::driver::audio::Audio,
+    audio: Audio,
 ) -> Race {
     let (intent_tx, intent_rx) = crossbeam::bounded(16);
     let (notice_tx, notice_rx) = crossbeam::bounded(64);
@@ -905,7 +901,7 @@ pub fn spawn(
             Instant::now(),
             rules,
             captures_dir.clone(),
-            BUZZER.duration(),
+            Sound::BUZZER.duration(),
             pads,
             assignments,
             cameras,
@@ -931,7 +927,7 @@ pub fn spawn(
             }
             let journal = active.journal();
             match journal_path {
-                None => match flight::snapshot(journal, &captures_dir) {
+                None => match journal.snapshot(&captures_dir) {
                     Ok(path) => {
                         log::info!("flight journal: stream opened at {path:?}");
                         *journal_written = journal.event_count();
@@ -940,7 +936,7 @@ pub fn spawn(
                     Err(e) => log::error!("flight journal: snapshot failed: {e}"),
                 },
                 Some(path) => {
-                    if let Err(e) = flight::append(journal, path, journal_written) {
+                    if let Err(e) = journal.append_to(path, journal_written) {
                         log::error!("flight journal: append failed: {e}");
                     }
                 }
@@ -1001,7 +997,7 @@ pub fn spawn(
             // Поллинг first_frame_at: edge-детект — в ядре.
             for (id, recorder) in &recorders {
                 let first_frame_at = match recorder.record_state() {
-                    crate::driver::dvr::RecordState::Writing { first_frame_at, .. } => {
+                    RecordState::Writing { first_frame_at, .. } => {
                         Some(first_frame_at)
                     }
                     _ => None,
@@ -1047,16 +1043,16 @@ pub fn spawn(
 
 /// Звуковая программа отсчёта: бипы по секундам, гудок на старте.
 /// Задержка до гудка — из ядра (там же сэмплирована пауза сигнала).
-fn countdown_steps(delay: Duration) -> Vec<(Duration, audio::Sound)> {
+fn countdown_steps(delay: Duration) -> Vec<(Duration, Sound)> {
     let interval = delay.saturating_sub(Duration::from_secs(PRE_BEEP_SECS));
     if interval.is_zero() {
-        vec![(Duration::ZERO, BUZZER)]
+        vec![(Duration::ZERO, Sound::BUZZER)]
     } else {
-        let mut steps: Vec<(Duration, audio::Sound)> = (0..PRE_BEEP_SECS)
+        let mut steps: Vec<(Duration, Sound)> = (0..PRE_BEEP_SECS)
             .map(Duration::from_secs)
-            .map(|t| (t, STAGE))
+            .map(|t| (t, Sound::STAGE))
             .collect();
-        steps.push((delay, BUZZER));
+        steps.push((delay, Sound::BUZZER));
         steps
     }
 }
@@ -1082,7 +1078,7 @@ fn apply(effects: &[Effect], recorders: &HashMap<String, Recorder>, audio: &Audi
                 }
             }
             Effect::Countdown { delay } => audio.sequence(countdown_steps(*delay)),
-            Effect::Buzzer => audio.play(BUZZER),
+            Effect::Buzzer => audio.play(Sound::BUZZER),
             Effect::CancelAudio => audio.cancel(),
         }
     }

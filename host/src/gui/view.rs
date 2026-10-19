@@ -1,5 +1,6 @@
+use crate::gui::guidelines;
 use crate::gui::measure_text;
-use crate::gui::ruler::{self, cell_x, cell_y};
+use crate::gui::ruler::{CELL_SIZE, cell_x, cell_y};
 use crate::gui::style;
 
 pub struct Letterbox {
@@ -82,8 +83,8 @@ impl Letterbox {
         // не нужен. Границы (min/max) кратны клеткам, округление в них
         // не вылезает.
         let virtual_size = egui::vec2(
-            (virtual_size.x / ruler::CELL_SIZE.x).round() * ruler::CELL_SIZE.x,
-            (virtual_size.y / ruler::CELL_SIZE.y).round() * ruler::CELL_SIZE.y,
+            (virtual_size.x / CELL_SIZE.x).round() * CELL_SIZE.x,
+            (virtual_size.y / CELL_SIZE.y).round() * CELL_SIZE.y,
         );
         let screen_offset = min_rect + offset;
         let rect = egui::Rect::from_min_size(screen_offset, virtual_size * scale);
@@ -91,7 +92,7 @@ impl Letterbox {
         if self.outline {
             let window = ui.min_rect();
 
-            if crate::gui::guidelines::ENABLED {
+            if guidelines::ENABLED {
                 if rect.height() < window.height() {
                     // Граница штриховки — 1px наружу от границы letterbox:
                     // диагонали не касаются контента, как и solid-линии.
@@ -104,17 +105,17 @@ impl Letterbox {
                         window.max,
                     );
 
-                    crate::gui::guidelines::hatch_rect(ui, top);
-                    crate::gui::guidelines::hatch_rect(ui, bottom);
+                    guidelines::hatch_rect(ui, top);
+                    guidelines::hatch_rect(ui, bottom);
 
                     // Обводка — снаружи границы (полштриха наружу), не на ней.
-                    crate::gui::guidelines::solid_line(
+                    guidelines::solid_line(
                         ui,
                         egui::Direction::LeftToRight,
                         rect.min.y,
                         -1.0,
                     );
-                    crate::gui::guidelines::solid_line(
+                    guidelines::solid_line(
                         ui,
                         egui::Direction::LeftToRight,
                         rect.max.y,
@@ -130,16 +131,16 @@ impl Letterbox {
                         window.max,
                     );
 
-                    crate::gui::guidelines::hatch_rect(ui, left);
-                    crate::gui::guidelines::hatch_rect(ui, right);
+                    guidelines::hatch_rect(ui, left);
+                    guidelines::hatch_rect(ui, right);
 
-                    crate::gui::guidelines::solid_line(
+                    guidelines::solid_line(
                         ui,
                         egui::Direction::TopDown,
                         rect.min.x,
                         -1.0,
                     );
-                    crate::gui::guidelines::solid_line(
+                    guidelines::solid_line(
                         ui,
                         egui::Direction::TopDown,
                         rect.max.x,
@@ -500,7 +501,7 @@ pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]
     if lines.is_empty() {
         return;
     }
-    let row = ruler::CELL_SIZE.y;
+    let row = CELL_SIZE.y;
     let width = lines
         .iter()
         .map(|line| measure_text(ui.ctx(), style::FONT_REGULAR, line).x)
@@ -521,8 +522,8 @@ pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]
 /// вертикали тоже), обводка белая 1 пункт прямо по границам фона
 /// (снаружи), той же скруглённости.
 pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, lines: &[String]) {
-    let pad = ruler::CELL_SIZE.x * 0.5;
-    let row = ruler::CELL_SIZE.y;
+    let pad = CELL_SIZE.x * 0.5;
+    let row = CELL_SIZE.y;
     let bg = text.expand(pad);
     // Чёрная подложка на 1 px шире контура (во все стороны), поверх —
     // контурный скруглённый прямоугольник. Полупрозрачная заливка не

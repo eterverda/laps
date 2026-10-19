@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::gui::ruler;
+use crate::gui::ruler::CELL_SIZE;
 
 /// База позиционного шага по тапу (клик): тап мотает на
 /// speed × SEEK_TAP файла (10x → 1 с).
@@ -166,7 +166,7 @@ impl Timeline {
                 egui::Stroke::NONE,
             );
         }
-        let knob_r = ruler::CELL_SIZE.y * 0.24;
+        let knob_r = CELL_SIZE.y * 0.24;
         match circle {
             Some((lo, hi)) => {
                 // Круг: белая капсула между его границами (крупнее

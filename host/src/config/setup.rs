@@ -1,14 +1,17 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
+use crate::config::camera::{CameraConfig, ViewportConfig};
+use crate::config::keyboard::{KeyboardConfig, KeyBind};
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Setup {
-    pub cameras: BTreeMap<String, crate::config::camera::CameraConfig>,
+    pub cameras: BTreeMap<String, CameraConfig>,
     pub pads: BTreeMap<String, PadConfig>,
     // Attached by `laps debug-keyboards`; parsed here so setup files can
     // carry keyboards already.
     #[serde(default)]
-    pub keyboards: BTreeMap<String, crate::config::keyboard::KeyboardConfig>,
+    pub keyboards: BTreeMap<String, KeyboardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -19,7 +22,7 @@ pub struct PadConfig {
     /// Клавиши настроенных клавиатур, привязанные к паду (пусто —
     /// пад без клавиатурных биндов).
     #[serde(default)]
-    pub keybinds: Vec<crate::config::keyboard::KeyBind>,
+    pub keybinds: Vec<KeyBind>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -27,7 +30,7 @@ pub struct FpvConfig {
     #[serde(rename = "camera-id")]
     pub camera_id: String,
     #[serde(default)]
-    pub viewport: crate::config::camera::ViewportConfig,
+    pub viewport: ViewportConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -53,6 +56,7 @@ impl ColorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::keyboard::KeyboardMode;
 
     const CAMERAS: &str = "cameras:\n  camera-1:\n    name: C7-1\n    resolution: 1920x1080\n    frame-rate: 30fps\n    format: mjpeg\n";
     const PADS: &str =
@@ -63,7 +67,7 @@ mod tests {
         let fpv: FpvConfig = serde_yaml::from_str("camera-id: camera-1\n").unwrap();
         assert_eq!(
             fpv.viewport,
-            crate::config::camera::ViewportConfig {
+            ViewportConfig {
                 left: 0.0,
                 top: 0.0,
                 right: 1.0,
@@ -89,7 +93,7 @@ mod tests {
         assert_eq!(setup.keyboards["pad-1"].name.as_deref(), Some("RED"));
         assert_eq!(
             setup.keyboards["pad-1"].mode,
-            crate::config::keyboard::KeyboardMode::Grab
+            KeyboardMode::Grab
         );
     }
 

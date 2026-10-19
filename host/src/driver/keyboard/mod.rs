@@ -34,6 +34,8 @@ pub fn scan() -> std::io::Result<Vec<KeyboardInfo>> {
 /// No Eq/Ord: matching a config entry is a filter, not equality, and
 /// the only ordering need is the deterministic listing (a plain sort
 /// key in `scan`).
+use crate::config::keyboard::KeyboardConfig;
+
 #[derive(Debug, Clone)]
 pub struct KeyboardInfo {
     pub name: String,
@@ -85,27 +87,7 @@ pub const MODIFIER_NAMES: [(u32, &str); 8] = [
     (0x80, "RGui"),
 ];
 
-/// "LCtrl+LShift" for a non-empty mask, empty string otherwise. Order
-/// follows `MODIFIER_NAMES`; the caller joins the combo as Mod+Mod+Key.
-pub fn modifier_names(mask: u32) -> String {
-    let mut s = String::new();
-    for (bit, name) in MODIFIER_NAMES {
-        if mask & bit != 0 {
-            if !s.is_empty() {
-                s.push('+');
-            }
-            s.push_str(name);
-        }
-    }
-    s
-}
 
-/// Boot-protocol bit of a modifier usage (0xE0..=0xE7), if it is one.
-pub fn modifier_bit(hid_usage: u32) -> Option<u32> {
-    (0xE0..=0xE7)
-        .contains(&hid_usage)
-        .then(|| 1 << (hid_usage - 0xE0))
-}
 
 /// Per-device HID modifier state: a Press of a modifier usage sets its
 /// bit, a Release clears it. Modifier keys still arrive as regular
@@ -118,13 +100,34 @@ pub struct ModifierTracker {
 impl ModifierTracker {
     /// Apply one mapped key action; returns the fresh mask.
     pub fn apply(&mut self, hid_usage: u32, action: KeyAction) -> u32 {
-        if let Some(bit) = modifier_bit(hid_usage) {
+        if let Some(bit) = Self::bit_of(hid_usage) {
             match action {
                 KeyAction::Press => self.mask |= bit,
                 KeyAction::Release => self.mask &= !bit,
             }
         }
         self.mask
+    }
+
+    /// "LCtrl+LShift" for a non-empty mask, empty string otherwise. Order
+    /// follows `MODIFIER_NAMES`; the caller joins the combo as Mod+Mod+Key.
+    pub fn names(mask: u32) -> String {
+        let mut s = String::new();
+        for (bit, name) in MODIFIER_NAMES {
+            if mask & bit != 0 {
+                if !s.is_empty() {
+                    s.push('+');
+                }
+                s.push_str(name);
+            }
+        }
+        s
+    }
+
+    pub fn bit_of(hid_usage: u32) -> Option<u32> {
+        (0xE0..=0xE7)
+            .contains(&hid_usage)
+            .then(|| 1 << (hid_usage - 0xE0))
     }
 }
 
@@ -433,7 +436,7 @@ impl std::error::Error for AttachError {}
 #[cfg(target_os = "linux")]
 pub fn open(
     id: &str,
-    cfg: &crate::config::keyboard::KeyboardConfig,
+    cfg: &KeyboardConfig,
 ) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
     linux::open(id, cfg)
 }
@@ -442,7 +445,7 @@ pub fn open(
 #[cfg(not(target_os = "linux"))]
 pub fn open(
     id: &str,
-    cfg: &crate::config::keyboard::KeyboardConfig,
+    cfg: &KeyboardConfig,
 ) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
     let _ = (id, cfg);
     Err(AttachError::NoMatch)
@@ -467,11 +470,11 @@ mod tests {
 
     #[test]
     fn modifier_bit_maps_the_usage_range() {
-        assert_eq!(modifier_bit(0xE0), Some(0x01));
-        assert_eq!(modifier_bit(0xE2), Some(0x04));
-        assert_eq!(modifier_bit(0xE7), Some(0x80));
-        assert_eq!(modifier_bit(0xE8), None);
-        assert_eq!(modifier_bit(0x04), None);
+        assert_eq!(ModifierTracker::bit_of(0xE0), Some(0x01));
+        assert_eq!(ModifierTracker::bit_of(0xE2), Some(0x04));
+        assert_eq!(ModifierTracker::bit_of(0xE7), Some(0x80));
+        assert_eq!(ModifierTracker::bit_of(0xE8), None);
+        assert_eq!(ModifierTracker::bit_of(0x04), None);
     }
 
     #[test]
@@ -508,9 +511,9 @@ mod tests {
 
     #[test]
     fn modifier_names_render_plus_list() {
-        assert_eq!(modifier_names(0), "");
-        assert_eq!(modifier_names(0x02), "LShift");
-        assert_eq!(modifier_names(0x03), "LCtrl+LShift");
-        assert_eq!(modifier_names(0x82), "LShift+RGui");
+        assert_eq!(ModifierTracker::names(0), "");
+        assert_eq!(ModifierTracker::names(0x02), "LShift");
+        assert_eq!(ModifierTracker::names(0x03), "LCtrl+LShift");
+        assert_eq!(ModifierTracker::names(0x82), "LShift+RGui");
     }
 }

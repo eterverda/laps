@@ -1,5 +1,8 @@
 use crate::config::setup::Setup;
 use crate::model::pilot::Pilot;
+use crate::model::rules::RaceRules;
+use crate::driver::dvr::CAPTURES_DIR;
+use crate::remote::{Response, Server, RESPONSE_TIMEOUT};
 
 mod flight;
 mod guidelines;
@@ -28,14 +31,14 @@ impl Navigator {
 struct App {
     remote_rx: std::sync::mpsc::Receiver<(
         Vec<String>,
-        std::sync::mpsc::Sender<crate::remote::Response>,
+        std::sync::mpsc::Sender<Response>,
     )>,
     state: State,
     setup: Setup,
     assignments: std::collections::HashMap<String, Pilot>,
     // Живёт с приложением: Drop останавливает accept-поток и снимает
     // регистрацию инстанса.
-    _server: Option<crate::remote::Server>,
+    _server: Option<Server>,
 }
 
 fn hardcoded_assignments() -> std::collections::HashMap<String, Pilot> {
@@ -52,25 +55,25 @@ impl App {
         // его (иначе ответ ждал бы ближайшего кадра egui), затем ждёт
         // ответа.
         let ctx = cc.egui_ctx.clone();
-        let execute: std::sync::Arc<dyn Fn(Vec<String>) -> crate::remote::Response + Send + Sync> =
+        let execute: std::sync::Arc<dyn Fn(Vec<String>) -> Response + Send + Sync> =
             std::sync::Arc::new(move |command| {
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 if remote_tx.send((command, reply_tx)).is_err() {
-                    return crate::remote::Response {
+                    return Response {
                         message: "gui unavailable".to_owned(),
                         code: 1,
                     };
                 }
                 ctx.request_repaint();
-                match reply_rx.recv_timeout(crate::remote::RESPONSE_TIMEOUT) {
+                match reply_rx.recv_timeout(RESPONSE_TIMEOUT) {
                     Ok(response) => response,
-                    Err(_) => crate::remote::Response {
+                    Err(_) => Response {
                         message: "no response".to_owned(),
                         code: 1,
                     },
                 }
             });
-        let server = match crate::remote::Server::start(execute) {
+        let server = match Server::start(execute) {
             Ok(server) => Some(server),
             Err(e) => {
                 log::warn!("remote control unavailable: {e}");
@@ -101,8 +104,8 @@ impl App {
                     &cc.egui_ctx,
                     setup.clone(),
                     assignments.clone(),
-                    crate::model::rules::RaceRules::default(),
-                    Some(std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR)),
+                    RaceRules::default(),
+                    Some(std::path::PathBuf::from(CAPTURES_DIR)),
                 ))),
             },
             setup,
@@ -119,7 +122,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         command: &[String],
-    ) -> crate::remote::Response {
+    ) -> Response {
         let response = match &mut self.state {
             State::Flight(flight) => flight.handle_remote(ctx, command),
             State::Menu(_) => None,
@@ -128,7 +131,7 @@ impl App {
             // Экраны отклонили: echo — команда уровня приложения,
             // остальное неизвестно.
             if command.first().map(String::as_str) == Some("echo") {
-                return crate::remote::Response {
+                return Response {
                     message: command[1..].join(" "),
                     code: 0,
                 };
@@ -137,7 +140,7 @@ impl App {
                 Some(head) => format!("unknown command {head:?}"),
                 None => "empty command".to_owned(),
             };
-            crate::remote::Response { message, code: 1 }
+            Response { message, code: 1 }
         })
     }
 }
@@ -167,8 +170,8 @@ impl eframe::App for App {
                             &ctx,
                             self.setup.clone(),
                             self.assignments.clone(),
-                            crate::model::rules::RaceRules::default(),
-                            Some(std::path::PathBuf::from(crate::driver::dvr::CAPTURES_DIR)),
+                            RaceRules::default(),
+                            Some(std::path::PathBuf::from(CAPTURES_DIR)),
                         ))),
                         menu::Action::None => {}
                     },

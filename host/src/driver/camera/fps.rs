@@ -7,6 +7,7 @@
 //! держит последнее известное значение. В тестах время подаётся снаружи
 //! через on_frame_at.
 
+use crate::driver::camera::capture::Frame;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -97,12 +98,12 @@ impl Default for FrameStats {
 
 impl FrameStats {
     /// Штатная точка входа: задержка от таймстемпа кадра до «сейчас».
-    pub fn on_frame(&mut self, frame: &crate::driver::camera::capture::Frame) {
+    pub fn on_frame(&mut self, frame: &Frame) {
         self.on_frame_at(frame, Instant::now());
     }
 
     /// Задержка от таймстемпа кадра до заданного момента (для тестов).
-    pub fn on_frame_at(&mut self, frame: &crate::driver::camera::capture::Frame, now: Instant) {
+    pub fn on_frame_at(&mut self, frame: &Frame, now: Instant) {
         self.on_process(now.saturating_duration_since(frame.timestamp));
     }
 

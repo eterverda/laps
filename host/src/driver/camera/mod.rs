@@ -22,7 +22,7 @@ use nokhwa::NokhwaCapture as Backend;
 #[cfg(target_os = "linux")]
 use v4l2::V4l2Capture as Backend;
 
-use crate::config::camera::{CameraConfig, PixelConfig};
+use crate::config::camera::{CameraConfig, PixelConfig, ResolutionConfig};
 use crate::driver::dvr::{DvrSink, RecordParams, RecordState, SharedRecordState};
 use crossbeam_utils::atomic::AtomicCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -216,7 +216,7 @@ pub struct Camera {
     /// Неготиированное разрешение потока: пишет capture-поток после
     /// открытия сессии, UI читает (подсказки, эффективное разрешение
     /// вьюпортов).
-    resolution: Arc<AtomicCell<Option<crate::config::camera::ResolutionConfig>>>,
+    resolution: Arc<AtomicCell<Option<ResolutionConfig>>>,
     /// Останов и join capture-потока (Drop).
     running: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -285,7 +285,7 @@ impl Camera {
 
     /// Неготиированное разрешение захвата; None, пока сессия не
     /// открылась (или поток умер раньше открытия).
-    pub fn resolution(&self) -> Option<crate::config::camera::ResolutionConfig> {
+    pub fn resolution(&self) -> Option<ResolutionConfig> {
         self.resolution.load()
     }
 
@@ -349,7 +349,7 @@ fn capture_loop(
     running: Arc<AtomicBool>,
     commands_rx: crossbeam_channel::Receiver<RecordCommand>,
     ui_latency: Arc<Mutex<fps::FrameStats>>,
-    resolution: Arc<AtomicCell<Option<crate::config::camera::ResolutionConfig>>>,
+    resolution: Arc<AtomicCell<Option<ResolutionConfig>>>,
     on_frame: impl Fn() + Send + Sync + 'static,
 ) {
     let (mut session, matched) = match open_session(&desc) {

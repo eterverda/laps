@@ -18,6 +18,13 @@ pub struct JournalHeader {
     pub assignments: HashMap<String, Pilot>,
 }
 
+impl JournalHeader {
+    /// Стем файлов записи (видео + журнал) — по date_time старта.
+    pub fn file_stem(&self) -> String {
+        file_stem_of(self.date_time)
+    }
+}
+
 /// Журнал полёта: заголовок + события с метками мс, файл yaml-стрима.
 /// Метки — мс от момента создания (ноль шкалы — у производителя событий,
 /// сервиса; журнал метки только хранит). Файл открывается (`open_file`)
@@ -26,9 +33,9 @@ pub struct JournalHeader {
 /// Журнал полёта — данные: заголовок + события с метками мс. Метки —
 /// мс от момента создания (ноль шкалы — у производителя событий,
 /// сервиса; журнал метки только хранит). Файлом журнал не владеет:
-/// запись — свободные функции модуля (`snapshot`/`append`).
+/// запись — методы `snapshot`/`append_to`.
 pub struct Journal {
-    events: Vec<(u64, FlightEvent)>,
+    events: Vec<(u64, JournalRecord)>,
     /// Контекст полёта (заголовок). date_time — источник стема имён
     /// файлов записи.
     header: JournalHeader,
@@ -51,12 +58,12 @@ impl Journal {
     }
 
     /// date_time полёта — источник стема имён файлов записи.
-    pub fn date_time(&self) -> OffsetDateTime {
-        self.header.date_time
+    pub fn header(&self) -> &JournalHeader {
+        &self.header
     }
 
     /// Итератор событий с метками мс (домен, в котором живёт скраббинг).
-    pub fn iter_ms(&self) -> impl Iterator<Item = (u64, &FlightEvent)> {
+    pub fn iter_ms(&self) -> impl Iterator<Item = (u64, &JournalRecord)> {
         self.events.iter().map(|(ms, event)| (*ms, event))
     }
 
@@ -67,7 +74,7 @@ impl Journal {
 
     /// Добавить событие (память; на диск уходит через `append`/`snapshot`
     /// — журнал файла не касается).
-    pub fn push(&mut self, ms: u64, event: FlightEvent) {
+    pub fn push(&mut self, ms: u64, event: JournalRecord) {
         self.events.push((ms, event));
     }
 
@@ -75,7 +82,7 @@ impl Journal {
     /// переписывается снапшотом целиком. Первый эвент не удаляется
     /// (держит ноль шкалы).
     #[allow(dead_code)]
-    pub fn retain<F: FnMut(&(u64, &FlightEvent)) -> bool>(&mut self, mut pred: F) {
+    pub fn retain<F: FnMut(&(u64, &JournalRecord)) -> bool>(&mut self, mut pred: F) {
         let mut i = 0;
         self.events.retain(|(ms, event)| {
             i += 1;
@@ -85,12 +92,12 @@ impl Journal {
 
     /// Один эвент — один yaml-документ: `{ms, <variant>: {...}}`.
     /// Документы стрима разделяются `---` (см. `stream`).
-    pub fn event_doc(&self, ms: u64, event: &FlightEvent) -> String {
+    pub fn event_doc(&self, ms: u64, event: &JournalRecord) -> String {
         #[derive(Serialize)]
         struct EventSer<'a> {
             ms: u64,
             #[serde(flatten)]
-            event: &'a FlightEvent,
+            event: &'a JournalRecord,
         }
         let ser = EventSer { ms, event };
         serde_yaml::to_string(&ser).unwrap_or_else(|e| panic!("journal yaml: {e}"))
@@ -111,12 +118,12 @@ impl Journal {
     /// Парсинг yaml-стрима (холодный вход в скраббинг): первый
     /// документ — заголовок, дальше события через `---`. Битые
     /// документы пропускаются с warn.
-    pub fn parse_stream(yaml: &str) -> (Option<JournalHeader>, Vec<(u64, FlightEvent)>) {
+    pub fn parse_stream(yaml: &str) -> (Option<JournalHeader>, Vec<(u64, JournalRecord)>) {
         #[derive(Deserialize)]
         struct EventDoc {
             ms: u64,
             #[serde(flatten)]
-            event: FlightEvent,
+            event: JournalRecord,
         }
         let mut docs = yaml.split("\n---\n").filter(|doc| !doc.trim().is_empty());
         let header = docs
@@ -141,39 +148,52 @@ impl Journal {
     }
 }
 
-/// Снапшот журнала в `dir/<stem>.yaml` (стем из date_time): полный
-/// стрим через tmp + rename. Первое создание файла и перезапись после
-/// правок — одна операция. Путь — для последующих `append`.
-pub fn snapshot(journal: &Journal, dir: &Path) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{}.yaml", file_stem(journal.date_time())));
-    write_atomic(&path, &journal.stream())?;
-    Ok(path)
+/// Стем файлов записи (видео + журнал) по date_time старта.
+fn file_stem_of(date_time: OffsetDateTime) -> String {
+    use time::macros::format_description;
+    const FMT: &[time::format_description::FormatItem<'static>] =
+        format_description!("[year]-[month]-[day]-[hour]-[minute]-[second].[subsecond digits:3]");
+    date_time.format(&FMT).unwrap_or_else(|e| {
+        log::error!("flight journal: timestamp format failed: {e}");
+        "journal".to_owned()
+    })
 }
 
-/// Дописать события, появившиеся после `written`: прочитать файл,
-/// добавить новые документы, tmp + rename. Потерянный/битый файл —
-/// деградация на полный снапшот. `written` — сквозной счётчик
-/// (состояние держит писатель, сервис).
-pub fn append(journal: &Journal, path: &Path, written: &mut usize) -> std::io::Result<()> {
-    let count = journal.event_count();
-    if *written >= count {
-        return Ok(());
+impl Journal {
+    /// Снапшот журнала в `dir/<stem>.yaml` (стем из date_time): полный
+    /// стрим через tmp + rename. Первое создание файла и перезапись
+    /// после правок — одна операция. Путь — для последующих append_to.
+    pub fn snapshot(&self, dir: &Path) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("{}.yaml", self.header().file_stem()));
+        write_atomic(&path, &self.stream())?;
+        Ok(path)
     }
-    match std::fs::read_to_string(path) {
-        Ok(mut contents) => {
-            for (ms, event) in journal.iter_ms().skip(*written) {
-                contents.push_str("---\n");
-                contents.push_str(&journal.event_doc(ms, event));
-            }
-            *written = count;
-            write_atomic(path, &contents)
+
+    /// Дописать события, появившиеся после `written`: прочитать файл,
+    /// добавить новые документы, tmp + rename. Потерянный/битый файл —
+    /// деградация на полный снапшот. `written` — сквозной счётчик
+    /// (состояние держит писатель, сервис).
+    pub fn append_to(&self, path: &Path, written: &mut usize) -> std::io::Result<()> {
+        let count = self.event_count();
+        if *written >= count {
+            return Ok(());
         }
-        Err(e) => {
-            log::warn!("flight journal: append lost file ({e}), full snapshot");
-            let dir = path.parent().unwrap_or(Path::new("."));
-            *written = journal.event_count();
-            snapshot(journal, dir).map(|_| ())
+        match std::fs::read_to_string(path) {
+            Ok(mut contents) => {
+                for (ms, event) in self.iter_ms().skip(*written) {
+                    contents.push_str("---\n");
+                    contents.push_str(&self.event_doc(ms, event));
+                }
+                *written = count;
+                write_atomic(path, &contents)
+            }
+            Err(e) => {
+                log::warn!("flight journal: append lost file ({e}), full snapshot");
+                let dir = path.parent().unwrap_or(Path::new("."));
+                *written = self.event_count();
+                self.snapshot(dir).map(|_| ())
+            }
         }
     }
 }
@@ -189,20 +209,9 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Стем файлов записи (видео + журнал) по date_time старта.
-pub fn file_stem(date_time: OffsetDateTime) -> String {
-    use time::macros::format_description;
-    const FMT: &[time::format_description::FormatItem<'static>] =
-        format_description!("[year]-[month]-[day]-[hour]-[minute]-[second].[subsecond digits:3]");
-    date_time.format(&FMT).unwrap_or_else(|e| {
-        log::error!("flight journal: timestamp format failed: {e}");
-        "journal".to_owned()
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum FlightEvent {
+pub enum JournalRecord {
     /// Пользователь включил запись (REC, или RACE из эфира без записи).
     /// Без камер: запись — сессия, по её времени строится полоска DVR.
     /// Контекст полёта — в заголовке стрима (JournalHeader).
@@ -260,35 +269,39 @@ impl RaceClip {
 }
 
 /// Сбор рамки полёта из событий журнала (мс журнала).
-pub fn race_clip<'a>(events: impl IntoIterator<Item = (u64, &'a FlightEvent)>) -> RaceClip {
-    let mut clip = RaceClip::default();
+impl RaceClip {
+    pub fn from_events<'a>(events: impl IntoIterator<Item = (u64, &'a JournalRecord)>) -> RaceClip {
+        let mut clip = RaceClip::default();
     for (ms, event) in events {
         match event {
-            FlightEvent::RecordStarted { .. } => match &mut clip.recording {
+            JournalRecord::RecordStarted { .. } => match &mut clip.recording {
                 Some((lo, _)) => *lo = (*lo).min(ms),
                 None => clip.recording = Some((ms, ms)),
             },
-            FlightEvent::RecordFinished {} => match &mut clip.recording {
+            JournalRecord::RecordFinished {} => match &mut clip.recording {
                 Some((_, hi)) => *hi = ms,
                 None => clip.recording = Some((ms, ms)),
             },
-            FlightEvent::VideoAttached {
+            JournalRecord::VideoAttached {
                 camera_id,
                 filename,
             } => {
                 clip.files.insert(camera_id.clone(), (filename.clone(), ms));
             }
-            FlightEvent::RaceCountdown {} => clip.race_countdown_ms = Some(ms),
-            FlightEvent::RaceStarted {} => clip.race_started_ms = Some(ms),
-            FlightEvent::RaceFinished { .. } => clip.race_finished_ms = Some(ms),
+            JournalRecord::RaceCountdown {} => clip.race_countdown_ms = Some(ms),
+            JournalRecord::RaceStarted {} => clip.race_started_ms = Some(ms),
+            JournalRecord::RaceFinished { .. } => clip.race_finished_ms = Some(ms),
         }
     }
-    clip
+        clip
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::camera::ViewportConfig;
+    use crate::config::setup::{ColorConfig, FpvConfig};
 
     fn sample_journal() -> Journal {
         let date_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
@@ -297,10 +310,10 @@ mod tests {
             "pad-1".to_owned(),
             PadConfig {
                 label: "A1".to_owned(),
-                color: crate::config::setup::ColorConfig::Red,
-                fpv: crate::config::setup::FpvConfig {
+                color: ColorConfig::Red,
+                fpv: FpvConfig {
                     camera_id: "camera-1".to_owned(),
-                    viewport: crate::config::camera::ViewportConfig::default(),
+                    viewport: ViewportConfig::default(),
                 },
                 keybinds: Vec::new(),
             },
@@ -308,14 +321,14 @@ mod tests {
         let mut assignments = HashMap::new();
         assignments.insert("pad-1".to_owned(), Pilot::new("Цой Жив"));
         let mut journal = Journal::new(date_time, pads, assignments);
-        journal.push(0, FlightEvent::RecordStarted {});
+        journal.push(0, JournalRecord::RecordStarted {});
         journal
     }
 
     #[test]
     fn file_stem_format() {
         let date_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-        let stem = file_stem(date_time);
+        let stem = file_stem_of(date_time);
         assert!(
             lazy_regex::regex_is_match!(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.\d{3}$", &stem),
             "bad file stem: {stem}"
@@ -327,13 +340,13 @@ mod tests {
         let mut journal = sample_journal();
         journal.push(
             1500,
-            FlightEvent::VideoAttached {
+            JournalRecord::VideoAttached {
                 camera_id: "camera-1".to_owned(),
                 filename: "2026-01-01-00-00-00.000-camera-1-mjpeg.mkv".to_owned(),
             },
         );
-        journal.push(1600, FlightEvent::RaceStarted {});
-        journal.push(42_000, FlightEvent::RaceFinished { prematurely: true });
+        journal.push(1600, JournalRecord::RaceStarted {});
+        journal.push(42_000, JournalRecord::RaceFinished { prematurely: true });
         let yaml = journal.stream();
         assert!(yaml.contains("---\n"), "multi-document stream: {yaml}");
         assert!(yaml.contains("ms: 0"), "{yaml}");
@@ -359,12 +372,12 @@ mod tests {
         let mut journal = sample_journal();
         journal.push(
             1500,
-            FlightEvent::VideoAttached {
+            JournalRecord::VideoAttached {
                 camera_id: "camera-1".to_owned(),
                 filename: "2026-01-01-00-00-00.000-camera-1-mjpeg.mkv".to_owned(),
             },
         );
-        journal.push(42_000, FlightEvent::RaceFinished { prematurely: false });
+        journal.push(42_000, JournalRecord::RaceFinished { prematurely: false });
         let (header, events) = Journal::parse_stream(&journal.stream());
         let header = header.expect("header roundtrip");
         assert_eq!(
@@ -372,14 +385,14 @@ mod tests {
             OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
         );
         assert_eq!(events.len(), 3, "{events:?}");
-        assert!(matches!(events[0].1, FlightEvent::RecordStarted {}));
+        assert!(matches!(events[0].1, JournalRecord::RecordStarted {}));
         assert_eq!(events[0].0, 0);
         assert_eq!(events[1].0, 1500);
-        assert!(matches!(events[1].1, FlightEvent::VideoAttached { .. }));
+        assert!(matches!(events[1].1, JournalRecord::VideoAttached { .. }));
         assert_eq!(events[2].0, 42000);
         assert_eq!(
             events[2].1,
-            FlightEvent::RaceFinished { prematurely: false }
+            JournalRecord::RaceFinished { prematurely: false }
         );
     }
 
@@ -391,9 +404,9 @@ mod tests {
         let (header, events) = Journal::parse_stream(yaml);
         assert!(header.is_none(), "{header:?}");
         assert_eq!(events.len(), 2, "{events:?}");
-        assert!(matches!(events[0].1, FlightEvent::RecordStarted {}));
+        assert!(matches!(events[0].1, JournalRecord::RecordStarted {}));
         assert_eq!(events[1].0, 100);
-        assert!(matches!(events[1].1, FlightEvent::RaceStarted {}));
+        assert!(matches!(events[1].1, JournalRecord::RaceStarted {}));
     }
 
     /// Снапшот: полный стрим в финальном файле, временный `~` после
@@ -404,10 +417,10 @@ mod tests {
             std::env::temp_dir().join(format!("laps-journal-file-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
-        let path = snapshot(&journal, &dir).expect("snapshot written");
+        let path = journal.snapshot( &dir).expect("snapshot written");
         let mut written = journal.event_count();
-        journal.push(1500, FlightEvent::RaceStarted {});
-        append(&journal, &path, &mut written).expect("append");
+        journal.push(1500, JournalRecord::RaceStarted {});
+        journal.append_to( &path, &mut written).expect("append");
 
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
@@ -432,11 +445,11 @@ mod tests {
             std::env::temp_dir().join(format!("laps-journal-retain-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
-        journal.push(100, FlightEvent::RaceStarted {});
-        journal.push(200, FlightEvent::RaceFinished { prematurely: true });
-        let path = snapshot(&journal, &dir).expect("snapshot written");
+        journal.push(100, JournalRecord::RaceStarted {});
+        journal.push(200, JournalRecord::RaceFinished { prematurely: true });
+        let path = journal.snapshot( &dir).expect("snapshot written");
         journal.retain(|(ms, _)| *ms != 200);
-        snapshot(&journal, &dir).expect("rewrite after edit");
+        journal.snapshot( &dir).expect("rewrite after edit");
 
         let yaml = journal.stream();
         assert!(!yaml.contains("race-finished"), "{yaml}");
@@ -451,7 +464,7 @@ mod tests {
     fn date_time_getter_matches_constructor() {
         let journal = sample_journal();
         assert_eq!(
-            journal.date_time(),
+            journal.header().date_time,
             OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
         );
     }
@@ -461,20 +474,20 @@ mod tests {
     #[test]
     fn race_clip_window_in_file_positions() {
         let events = vec![
-            (20_000, FlightEvent::RecordStarted {}),
+            (20_000, JournalRecord::RecordStarted {}),
             (
                 20_500,
-                FlightEvent::VideoAttached {
+                JournalRecord::VideoAttached {
                     camera_id: "camera-1".to_owned(),
                     filename: "f-camera-1-mjpeg.mkv".to_owned(),
                 },
             ),
-            (23_000, FlightEvent::RaceCountdown {}),
-            (23_500, FlightEvent::RaceStarted {}),
-            (60_000, FlightEvent::RecordFinished {}),
-            (68_000, FlightEvent::RaceFinished { prematurely: true }),
+            (23_000, JournalRecord::RaceCountdown {}),
+            (23_500, JournalRecord::RaceStarted {}),
+            (60_000, JournalRecord::RecordFinished {}),
+            (68_000, JournalRecord::RaceFinished { prematurely: true }),
         ];
-        let clip = race_clip(events.iter().map(|(ms, e)| (*ms, e)));
+        let clip = RaceClip::from_events(events.iter().map(|(ms, e)| (*ms, e)));
         assert!(!clip.is_empty());
         // Полоска — окно записи; файл лежит на нём со сдвигом.
         assert_eq!(clip.recording, Some((20_000, 60_000)));

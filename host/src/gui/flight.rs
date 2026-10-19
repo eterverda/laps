@@ -4,16 +4,19 @@
 //! EXIT в меню. Гоночное состояние живёт в потоке ядра
 //! (model::rules + service::race), экран — намерения и рендер снапшотов.
 
-use crate::gui::ruler::{self, IntoRuler};
+use crate::gui::ruler::{IntoRuler, CELL_SIZE, cell_x, cell_y};
 use super::*;
 use crate::config::camera::CameraConfig;
 use crate::config::setup::Setup;
 use crate::driver::camera::CaptureState;
-use crate::driver::dvr::CAPTURES_DIR;
+use crate::driver::audio::Audio;
+use crate::driver::camera::Camera;
+use crate::driver::dvr::{RecordState, CAPTURES_DIR};
 use crate::driver::player::{Player, PlayerState};
-use crate::model::flight::{Journal, RaceClip, race_clip};
+use crate::model::flight::{Journal, RaceClip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
+use crate::remote::Response;
 use crate::service::race::{self, Intent, Notice, Race};
 use crate::service::transport::{Circle, Transport};
 use std::collections::HashMap;
@@ -55,7 +58,7 @@ enum Mode {
 /// Данные Idle-эфира: только захваты (как в Live, но без race, state
 /// и keepawake).
 struct Idle {
-    webcams: HashMap<String, crate::driver::camera::Camera>,
+    webcams: HashMap<String, Camera>,
 }
 
 /// Данные эфира: гоночный поток, последний снапшот его состояния,
@@ -68,7 +71,7 @@ struct Live {
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: race::RaceStage,
     rules: RaceRules,
-    webcams: HashMap<String, crate::driver::camera::Camera>,
+    webcams: HashMap<String, Camera>,
     /// Подавление сна: держится ради Drop (inhibit снимается при
     /// разрушении), чтений нет.
     #[allow(dead_code)]
@@ -195,7 +198,7 @@ pub struct Flight {
     /// Аудио-плеер: уровень приложения (поток-плеер живёт, пока жив
     /// хэндл), гоночные сессии получают клон — без переоткрытия
     /// устройства на каждый REC.
-    audio: crate::driver::audio::Audio,
+    audio: Audio,
     /// Показываемые камеры: пады с пилотами (сейчас ≤ MAX_PADS) → их
     /// камеры, дедуп по camera_id (несколько падов смотрят в одну).
     /// Материализованы ради owned-среза для гоночного потока и дедупа
@@ -235,7 +238,7 @@ impl Flight {
         for (id, camera) in &shown_cameras {
             webcams.insert(
                 id.clone(),
-                crate::driver::camera::Camera::open(camera.clone(), ctx.clone()),
+                Camera::open(camera.clone(), ctx.clone()),
             );
         }
         log::info!("flight: webcams starting: {}", webcams.len());
@@ -243,7 +246,7 @@ impl Flight {
             setup,
             assignments,
             rules,
-            audio: crate::driver::audio::Audio::spawn(),
+            audio: Audio::spawn(),
             shown_cameras,
             captures,
             res: None,
@@ -282,7 +285,7 @@ impl Flight {
             .iter()
             .map(|(id, camera)| (id.clone(), camera.recorder()))
             .collect();
-        let state = race::born_state(first, Instant::now(), &self.rules);
+        let state = race::RaceCore::initial_mode(first, Instant::now(), &self.rules);
         let race = race::spawn(
             self.rules,
             std::path::PathBuf::from(CAPTURES_DIR),
@@ -360,7 +363,7 @@ impl Flight {
             setup,
             assignments,
             rules: RaceRules::default(),
-            audio: crate::driver::audio::Audio::spawn(),
+            audio: Audio::spawn(),
             shown_cameras,
             captures: Some(captures),
             res: None,
@@ -421,7 +424,7 @@ impl Flight {
     /// target — целевой fps (dvr.frame-rate, иначе camera); «error» при
     /// мёртвом потоке и при провале записи в REC-он.
     fn fps_lines(
-        webcams: &HashMap<String, crate::driver::camera::Camera>,
+        webcams: &HashMap<String, Camera>,
         shown_cameras: &HashMap<String, CameraConfig>,
         rec_on: bool,
     ) -> Vec<String> {
@@ -438,13 +441,13 @@ impl Flight {
                         if rec_on
                             && matches!(
                                 w.record_state(),
-                                crate::driver::dvr::RecordState::Failed
+                                RecordState::Failed
                             ) =>
                     {
                         "\u{f16df} error".to_owned()
                     }
                     Some(w) => match w.record_state() {
-                        crate::driver::dvr::RecordState::Writing { fps, .. } if fps > 0.0 => {
+                        RecordState::Writing { fps, .. } if fps > 0.0 => {
                             format!("\u{f16df} {:.0}fps", fps)
                         }
                         _ => format!("\u{f16df} {target}"),
@@ -458,7 +461,7 @@ impl Flight {
     /// разрешений (только для камер активных падов). Рендерятся все пады
     /// (неназначенные — пустые рамки).
     fn prepare_pads(
-        webcams: &mut HashMap<String, crate::driver::camera::Camera>,
+        webcams: &mut HashMap<String, Camera>,
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
@@ -654,7 +657,7 @@ impl Flight {
         assignments: &HashMap<String, Pilot>,
         alt: bool,
     ) -> Vec<PadContents> {
-        let clip = Some(race_clip(d.journal.iter_ms()));
+        let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
         let pos = d.transport.position();
         for player in d.players.values_mut() {
             player.update_frame();
@@ -737,7 +740,7 @@ impl Flight {
         d.transport.sync();
         let pos = d.transport.position();
         let speed = d.transport.velocity();
-        let clip = Some(race_clip(d.journal.iter_ms()));
+        let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
         for (id, player) in d.players.iter() {
             let file = Self::clip_rec_ms(&clip, id).map_or(pos, |rec| pos.saturating_sub(rec));
             player.sync(file.min(player.duration()), speed);
@@ -850,15 +853,15 @@ impl Flight {
         let frame = self.prepare(ui.ctx(), alt);
         self.res.get_or_insert_with(|| Res::new(ui.ctx()));
 
-        view::Letterbox::new(egui::vec2(ruler::cell_x(GRID_WIDTH), ruler::cell_y(45)))
-            .max_virtual_height(ruler::cell_y(50))
+        view::Letterbox::new(egui::vec2(cell_x(GRID_WIDTH), cell_y(45)))
+            .max_virtual_height(cell_y(50))
             .outline(true)
             .show(ui, |ui| {
                 let header_rect: egui::Rect = ui
                     .max_rect()
                     .into_ruler()
                     .collapse_top()
-                    .extrude(0.0, ruler::cell_y(TOP_BAR_ROWS))
+                    .extrude(0.0, cell_y(TOP_BAR_ROWS))
                     .into();
                 self.header.show(ui, header_rect);
 
@@ -869,10 +872,10 @@ impl Flight {
                     .max_rect()
                     .into_ruler()
                     .collapse_bottom()
-                    .translate(0.0, -ruler::cell_y(4))
-                    .extrude(0.0, ruler::cell_y(2))
-                    .shrink(ruler::cell_x(LEFT_MARGIN), 0.0)
-                    .shrink(-ruler::cell_x(RIGHT_MARGIN), 0.0)
+                    .translate(0.0, -cell_y(4))
+                    .extrude(0.0, cell_y(2))
+                    .shrink(cell_x(LEFT_MARGIN), 0.0)
+                    .shrink(-cell_x(RIGHT_MARGIN), 0.0)
                     .into();
                 // Таймлайн жив ровно тогда же, когда кнопки транспорта
                 // (enabled общий для всех четырёх — из players_ready).
@@ -942,7 +945,7 @@ impl Flight {
                             0.0
                         };
                         if let Some(ms) = d.scrub.hscroll.feed(dx, ui.ctx().pixels_per_point()) {
-                            Self::seek_by(d, &Some(race_clip(d.journal.iter_ms())), ms);
+                            Self::seek_by(d, &Some(RaceClip::from_events(d.journal.iter_ms())), ms);
                         }
                         if d.scrub.hscroll.active() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -965,11 +968,11 @@ impl Flight {
                 // (4 клетки от низа). Горизонтальные линии не рисуем.
                 if guidelines::ENABLED {
                     let screen = ui.max_rect().into_ruler();
-                    let top = screen.collapse_top().translate(0.0, ruler::cell_y(2));
-                    let bottom = screen.collapse_bottom().translate(0.0, -ruler::cell_y(4));
+                    let top = screen.collapse_top().translate(0.0, cell_y(2));
+                    let bottom = screen.collapse_bottom().translate(0.0, -cell_y(4));
                     let stroke = egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x1e));
                     for i in 1..columns {
-                        let x = ruler::cell_x(LEFT_MARGIN + segment * i);
+                        let x = cell_x(LEFT_MARGIN + segment * i);
                         let line = egui::pos2(x, top.bottom_left().y)
                             .into_ruler()
                             .extrude(0.0, bottom.bottom_left().y - top.bottom_left().y);
@@ -984,8 +987,8 @@ impl Flight {
                     // первый — клетка ниже картинки (рамка рисуется
                     // Outside — не в счёт), высота 4 клетки; второй —
                     // клетка ниже первого, низ — на нижней границе.
-                    let vf_bottom = ruler::cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows + 2);
-                    let first_top = vf_bottom + ruler::cell_y(1);
+                    let vf_bottom = cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows + 2);
+                    let first_top = vf_bottom + cell_y(1);
                     let placeholder = |ui: &mut egui::Ui, rect: egui::Rect| {
                         ui.painter().text(
                             rect.center(),
@@ -997,17 +1000,17 @@ impl Flight {
                     };
                     for &(zone_start, zone_width) in &column_geometry {
                         // Ширина — как у вьюфайндера: центр той же зоны.
-                        let x = ruler::cell_x(zone_start + (zone_width - viewfinder_cols) / 2);
-                        let w = ruler::cell_x(viewfinder_cols);
+                        let x = cell_x(zone_start + (zone_width - viewfinder_cols) / 2);
+                        let w = cell_x(viewfinder_cols);
                         let first: egui::Rect = egui::pos2(x, first_top)
                             .into_ruler()
-                            .extrude(w, ruler::cell_y(4))
+                            .extrude(w, cell_y(4))
                             .into();
-                        let second: egui::Rect = egui::pos2(x, first.bottom() + ruler::cell_y(1))
+                        let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
                             .into_ruler()
                             .extrude(
                                 w,
-                                bottom.bottom_left().y - ruler::cell_y(1) - first.bottom(),
+                                bottom.bottom_left().y - cell_y(1) - first.bottom(),
                             )
                             .into();
                         guidelines::dashed_rect(ui, first);
@@ -1021,11 +1024,11 @@ impl Flight {
                     for (i, content) in frame.pads.iter().enumerate() {
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - viewfinder_cols) / 2;
-                        let ruler = egui::pos2(ruler::cell_x(col), ruler::cell_y(TOP_BAR_ROWS + 1))
+                        let ruler = egui::pos2(cell_x(col), cell_y(TOP_BAR_ROWS + 1))
                             .into_ruler();
                         let viewfinder = ruler.extrude(
-                            ruler::cell_x(viewfinder_cols),
-                            ruler::cell_y(viewfinder_rows + 2),
+                            cell_x(viewfinder_cols),
+                            cell_y(viewfinder_rows + 2),
                         );
                         let frame_rect: egui::Rect = viewfinder.into();
                         viewfinder::ViewfinderFrame::new(
@@ -1057,11 +1060,11 @@ impl Flight {
                 let y = ui.max_rect().bottom();
 
                 let exit_label = "\u{e6c0}\u{f0206}";
-                let btn_h = ruler::cell_y(2);
+                let btn_h = cell_y(2);
                 let mut ruler = egui::pos2(0.0, y).into_ruler().extrude(0.0, -btn_h);
                 let mut btn = |w: isize, gap: isize| -> egui::Rect {
-                    let next = ruler.extrude(ruler::cell_x(w), 0.0);
-                    ruler = next.collapse_right().translate(ruler::cell_x(gap), 0.0);
+                    let next = ruler.extrude(cell_x(w), 0.0);
+                    ruler = next.collapse_right().translate(cell_x(gap), 0.0);
                     next.into()
                 };
                 let exit_rect = btn(6, 3);
@@ -1077,7 +1080,7 @@ impl Flight {
                 let badge = |ui: &mut egui::Ui, rect: egui::Rect, badge: &Option<String>| {
                     let Some(badge) = badge else { return };
                     let lines: Vec<String> = badge.split('\n').map(str::to_owned).collect();
-                    let row = ruler::CELL_SIZE.y;
+                    let row = CELL_SIZE.y;
                     let w = lines
                         .iter()
                         .map(|l| measure_text(ui.ctx(), style::FONT_REGULAR, l).x)
@@ -1161,7 +1164,7 @@ impl Flight {
                     ),
                 ];
                 if let Mode::Review(d) = &mut self.phase {
-                    let clip = Some(race_clip(d.journal.iter_ms()));
+                    let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
                     let mut responses: Vec<Option<egui::Response>> = Vec::new();
                     for (content, rect, id, icon, idle, lit) in &transport {
                         responses.push(if content.enabled {
@@ -1325,7 +1328,7 @@ impl Flight {
 
                 // TIMER: в live-фазах — счётчик гонки (цвет с учётом
                 // мигания/нулей), в DVR — позиция.
-                let timer_pos = egui::pos2(egui::Rect::from(ruler).right() + ruler::cell_x(2), y);
+                let timer_pos = egui::pos2(egui::Rect::from(ruler).right() + cell_x(2), y);
                 let timer_icon = "\u{f43a}";
                 let icon_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
                 let timer_color = if frame.timer.dim {
@@ -1341,7 +1344,7 @@ impl Flight {
                     timer_color,
                 );
                 ui.painter().text(
-                    egui::pos2(timer_pos.x + icon_w + ruler::cell_x(1), timer_pos.y),
+                    egui::pos2(timer_pos.x + icon_w + cell_x(1), timer_pos.y),
                     egui::Align2::LEFT_BOTTOM,
                     &frame.timer.text,
                     style::FONT_REGULAR_X2,
@@ -1586,9 +1589,9 @@ impl Flight {
         &mut self,
         ctx: &egui::Context,
         command: &[String],
-    ) -> Option<crate::remote::Response> {
+    ) -> Option<Response> {
         let head = command.first()?.as_str();
-        let ok = |message: String| Some(crate::remote::Response { message, code: 0 });
+        let ok = |message: String| Some(Response { message, code: 0 });
         match (&head, &mut self.phase) {
             (&"rec", _) => {
                 if matches!(self.phase, Mode::Idle(_)) {
@@ -1620,13 +1623,13 @@ impl Flight {
             }
             (&"play", _) => ok(String::new()),
             (&"ff", Mode::Review(d)) => {
-                let clip = Some(race_clip(d.journal.iter_ms()));
+                let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
                 let step = scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
                 Self::seek_by(d, &clip, step);
                 ok(String::new())
             }
             (&"rew", Mode::Review(d)) => {
-                let clip = Some(race_clip(d.journal.iter_ms()));
+                let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
                 let step = scrub::SEEK_SPEEDS[d.scrub.seek_speed] as i64 * scrub::SEEK_TAP as i64;
                 Self::seek_by(d, &clip, -step);
                 ok(String::new())
@@ -1672,7 +1675,7 @@ impl Review {
             });
             Journal::new(date_time, setup.pads.clone(), HashMap::new())
         });
-        let clip = race_clip(journal.iter_ms());
+        let clip = RaceClip::from_events(journal.iter_ms());
         let mut players = HashMap::new();
         let dir = std::path::Path::new(CAPTURES_DIR);
         let mut opened = 0;
@@ -1797,9 +1800,9 @@ impl Res {
     fn new(ctx: &egui::Context) -> Self {
         let symbol_size = measure_text(ctx, style::FONT_REGULAR, "M");
         assert!(
-            symbol_size == ruler::CELL_SIZE,
+            symbol_size == CELL_SIZE,
             "Font size mismatch: expected {:?}, got {:?}. Update ruler::CELL_SIZE or check font assets.",
-            ruler::CELL_SIZE,
+            CELL_SIZE,
             symbol_size,
         );
         Self

@@ -15,7 +15,8 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use super::{Resolution, VideoWriter};
+use super::{VideoReader, VideoWriter};
+use crate::config::camera::ResolutionConfig;
 
 /// Таймлайн в миллисекундах: дельты таймкодов пишем без округления.
 const TIMESCALE: u32 = 1000;
@@ -89,7 +90,7 @@ pub struct IsobmffWriter {
 }
 
 impl IsobmffWriter {
-    pub fn create_mp4(path: &Path, resolution: Resolution) -> io::Result<Self> {
+    pub fn create_mp4(path: &Path, resolution: ResolutionConfig) -> io::Result<Self> {
         // major brand дублируется в compat — так принято у MP4.
         Self::create(
             path,
@@ -99,14 +100,14 @@ impl IsobmffWriter {
         )
     }
 
-    pub fn create_mov(path: &Path, resolution: Resolution) -> io::Result<Self> {
+    pub fn create_mov(path: &Path, resolution: ResolutionConfig) -> io::Result<Self> {
         Self::create(path, resolution, BRAND_QT, &[BRAND_QT])
     }
 
     /// MP4 и MOV различаются только брендами ftyp — они и есть «flavor».
     fn create(
         path: &Path,
-        resolution: Resolution,
+        resolution: ResolutionConfig,
         major_brand: [u8; 4],
         compat_brands: &[[u8; 4]],
     ) -> io::Result<Self> {
@@ -402,7 +403,7 @@ pub struct IsobmffReader {
     offsets: Vec<u64>,
     sizes: Vec<u32>,
     max_frame: usize,
-    resolution: Resolution,
+    resolution: ResolutionConfig,
 }
 
 impl IsobmffReader {
@@ -513,7 +514,7 @@ impl IsobmffReader {
         if &stsd[12..16] != b"jpeg" {
             return Err(invalid("unsupported codec (not 'jpeg')"));
         }
-        let resolution = Resolution {
+        let resolution = ResolutionConfig {
             width: ru16(stsd, 8 + 8 + 24)? as u32,
             height: ru16(stsd, 8 + 8 + 26)? as u32,
         };
@@ -599,10 +600,10 @@ struct TrackIndex {
     pts: Vec<u64>,
     offsets: Vec<u64>,
     sizes: Vec<u32>,
-    resolution: Resolution,
+    resolution: ResolutionConfig,
 }
 
-impl crate::driver::dvr::VideoReader for IsobmffReader {
+impl VideoReader for IsobmffReader {
     fn frame_count(&self) -> usize {
         self.pts.len()
     }
@@ -615,7 +616,7 @@ impl crate::driver::dvr::VideoReader for IsobmffReader {
         self.max_frame
     }
 
-    fn resolution(&self) -> Resolution {
+    fn resolution(&self) -> ResolutionConfig {
         self.resolution
     }
 
@@ -839,7 +840,7 @@ mod tests {
             let mut writer = Box::new(
                 IsobmffWriter::create_mp4(
                     &path,
-                    Resolution {
+                    ResolutionConfig {
                         width: 1920,
                         height: 1080,
                     },
@@ -926,7 +927,7 @@ mod tests {
             let mut writer = Box::new(
                 IsobmffWriter::create_mp4(
                     &path,
-                    Resolution {
+                    ResolutionConfig {
                         width: 640,
                         height: 480,
                     },
@@ -962,7 +963,7 @@ mod tests {
         Box::new(
             IsobmffWriter::create_mp4(
                 &path,
-                Resolution {
+                ResolutionConfig {
                     width: 640,
                     height: 480,
                 },
@@ -1050,7 +1051,7 @@ mod tests {
         let writer = Box::new(
             IsobmffWriter::create_mp4(
                 &path,
-                Resolution {
+                ResolutionConfig {
                     width: 640,
                     height: 480,
                 },
@@ -1070,7 +1071,7 @@ mod tests {
         let writer = Box::new(
             IsobmffWriter::create_mov(
                 &path,
-                Resolution {
+                ResolutionConfig {
                     width: 1280,
                     height: 720,
                 },

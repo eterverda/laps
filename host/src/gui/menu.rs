@@ -1,4 +1,4 @@
-use crate::gui::ruler::{self, IntoRuler};
+use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
 use super::{State, header, view};
 
 pub struct Menu {
@@ -32,15 +32,15 @@ impl Menu {
         // Разметка — копия flight'овской: тот же Letterbox (160×45
         // клеток, виртуальный максимум 50 строк, обводка) и тот же
         // хедер на две клетки от верха.
-        view::Letterbox::new(egui::vec2(ruler::cell_x(160), ruler::cell_y(45)))
-            .max_virtual_height(ruler::cell_y(50))
+        view::Letterbox::new(egui::vec2(cell_x(160), cell_y(45)))
+            .max_virtual_height(cell_y(50))
             .outline(true)
             .show(ui, |ui| {
                 let header_rect: egui::Rect = ui
                     .max_rect()
                     .into_ruler()
                     .collapse_top()
-                    .extrude(0.0, ruler::cell_y(2))
+                    .extrude(0.0, cell_y(2))
                     .into();
                 self.header.show(ui, header_rect);
 
@@ -48,12 +48,12 @@ impl Menu {
                 // flight'а (interact → paint); ширина — контент плюс по
                 // колонке поля с каждой стороны.
                 let label = "\u{f070e} START";
-                let w = view::content_width(ui.ctx(), label) + ruler::cell_x(4);
+                let w = view::content_width(ui.ctx(), label) + cell_x(4);
                 let center = ui.max_rect().center();
                 let start_rect: egui::Rect =
-                    egui::pos2(center.x - w / 2.0, center.y - ruler::cell_y(1))
+                    egui::pos2(center.x - w / 2.0, center.y - cell_y(1))
                         .into_ruler()
-                        .extrude(w, ruler::cell_y(2))
+                        .extrude(w, cell_y(2))
                         .into();
                 let response = view::TransportButton::new(
                     label,

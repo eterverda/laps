@@ -7,6 +7,7 @@
 //! can leave the following stream in a throttled state.
 
 use crate::driver::camera::capture::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
+use crate::config::camera::{ResolutionConfig, FrameRateConfig};
 use super::Error;
 use crate::config::camera::{CameraConfig, PixelConfig};
 use std::ffi::CString;
@@ -478,8 +479,8 @@ fn enumerate_intervals(
         // fps = denominator / numerator; skip fractional rates.
         if fract.numerator != 0 && fract.denominator % fract.numerator == 0 {
             out.push(CaptureFormat {
-                resolution: crate::config::camera::ResolutionConfig { width, height },
-                frame_rate: crate::config::camera::FrameRateConfig(
+                resolution: ResolutionConfig { width, height },
+                frame_rate: FrameRateConfig(
                     fract.denominator / fract.numerator,
                 ),
                 format: config,
@@ -735,11 +736,11 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
             pending,
             mono_anchor,
             negotiated: CaptureFormat {
-                resolution: crate::config::camera::ResolutionConfig {
+                resolution: ResolutionConfig {
                     width: negotiated_pix.width,
                     height: negotiated_pix.height,
                 },
-                frame_rate: crate::config::camera::FrameRateConfig(fps),
+                frame_rate: FrameRateConfig(fps),
                 format: config.format,
             },
         })

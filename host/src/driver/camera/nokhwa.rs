@@ -10,6 +10,7 @@
 
 use super::Error;
 use crate::driver::camera::capture::{
+use crate::config::camera::{ResolutionConfig};
     Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
 };
 use crate::config::camera::CameraConfig;
@@ -128,11 +129,11 @@ impl CaptureSession for NokhwaSession {
         // Буфер может быть больше самого кадра (ёмкость буфера vs
         // длина кадра) — длина jpeg (SOI..EOI) вычисляется здесь.
         let data = match self.negotiated.format {
-            crate::config::camera::PixelConfig::Mjpeg => FrameData::Jpeg {
+            PixelConfig::Mjpeg => FrameData::Jpeg {
                 len: jpeg_len(&buf),
                 buf,
             },
-            crate::config::camera::PixelConfig::Yuyv => FrameData::Yuyv { buf },
+            PixelConfig::Yuyv => FrameData::Yuyv { buf },
         };
         Ok(Frame { timestamp, data })
     }
@@ -175,10 +176,10 @@ fn to_capture_format(f: &CameraFormat) -> Option<CaptureFormat> {
     })
 }
 
-fn to_frame_format(f: crate::config::camera::PixelConfig) -> FrameFormat {
+fn to_frame_format(f: PixelConfig) -> FrameFormat {
     match f {
-        crate::config::camera::PixelConfig::Yuyv => FrameFormat::YUYV,
-        crate::config::camera::PixelConfig::Mjpeg => FrameFormat::MJPEG,
+        PixelConfig::Yuyv => FrameFormat::YUYV,
+        PixelConfig::Mjpeg => FrameFormat::MJPEG,
     }
 }
 

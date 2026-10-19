@@ -17,8 +17,10 @@ use std::time::{Duration, Instant};
 use crossbeam_utils::atomic::AtomicCell;
 
 use crate::driver::camera::decode::decode_pixels_mjpeg_into;
+use crate::config::camera::ResolutionConfig;
+use crate::driver::dvr::VideoReader;
 use crate::driver::camera::fps::FrameStats;
-use crate::driver::dvr::{VideoReader, open_reader};
+use crate::driver::dvr::open_reader;
 
 /// Клапан показа: на высоких скоростях due-кадры идут чаще, чем успевает
 /// декодер — чаще одного показа за это время не декодируем вообще, индекс
@@ -52,7 +54,7 @@ pub struct Meta {
     /// кадр «держится» на экране столько же, сколько предпоследний —
     /// для расчёта гэпов покрытие файла = duration + last_step.
     pub last_step: u64,
-    pub resolution: crate::driver::dvr::Resolution,
+    pub resolution: ResolutionConfig,
 }
 
 /// Состояние + метаданные: одна блокировка на холодные данные.
@@ -171,7 +173,7 @@ impl Player {
     }
 
     /// Разрешение файла; None, пока идёт open.
-    pub fn resolution(&self) -> Option<crate::driver::dvr::Resolution> {
+    pub fn resolution(&self) -> Option<ResolutionConfig> {
         let meta = self.inner.lock().unwrap().meta;
         meta.and_then(|m| (m.resolution.height > 0).then_some(m.resolution))
     }
@@ -226,7 +228,7 @@ fn playback_loop(
         jpeg: Vec<u8>,
         /// Пиксельный буфер кадра; в слот уходит Arc-клон.
         image: Arc<egui::ColorImage>,
-        dims: crate::driver::dvr::Resolution,
+        dims: ResolutionConfig,
         /// Сейчас на экране (индекс в pts).
         shown_idx: usize,
         /// Транспортный синк: позиция (файл) на sync_at со скоростью;

@@ -11,7 +11,7 @@
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel as crossbeam;
+use crossbeam_channel::Receiver;
 
 /// Короткий звук: WAV PCM целиком в памяти, со своей длительностью.
 /// Конструктор const — строится из бинарей `assets`, файл проверяется и
@@ -89,12 +89,12 @@ enum Command {
 /// разрывается, поток выходит).
 #[derive(Clone)]
 pub struct Audio {
-    commands: crossbeam::Sender<Command>,
+    commands: crossbeam_channel::Sender<Command>,
 }
 
 impl Audio {
     pub fn spawn() -> Self {
-        let (commands, rx) = crossbeam::bounded(16);
+        let (commands, rx) = crossbeam_channel::bounded(16);
         std::thread::spawn(move || output_loop(rx));
         Self { commands }
     }
@@ -161,7 +161,7 @@ impl Schedule {
 
 /// Тело потока-плеера: открывает вывод один раз, дальше крутит
 /// расписание и команды.
-fn output_loop(commands: crossbeam::Receiver<Command>) {
+fn output_loop(commands: Receiver<Command>) {
     let Ok(stream) = rodio::DeviceSinkBuilder::open_default_sink() else {
         log::warn!("audio: no output device, sounds disabled");
         // Канал держим открытым: отправители не должны видеть ошибку,
@@ -215,12 +215,12 @@ fn output_loop(commands: crossbeam::Receiver<Command>) {
                 }
                 schedule.cancel();
             }
-            Err(crossbeam::RecvTimeoutError::Timeout) => {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 for sound in schedule.pop_due() {
                     current = start(&stream, sound).or(current);
                 }
             }
-            Err(crossbeam::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -228,11 +228,10 @@ fn output_loop(commands: crossbeam::Receiver<Command>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{BUZZER_WAV, STAGE_WAV};
 
     // Расписанию содержимое не важно — два разных звука для сравнений.
-    const A: Sound = Sound::from_bytes(STAGE_WAV);
-    const B: Sound = Sound::from_bytes(BUZZER_WAV);
+    const A: Sound = Sound::from_bytes(crate::assets::STAGE_WAV);
+    const B: Sound = Sound::from_bytes(crate::assets::BUZZER_WAV);
 
     /// Заэмбеженные файлы декодируются (без звукового устройства);
     /// длительности из заголовков — против значений из спецификаций

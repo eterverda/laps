@@ -1,4 +1,3 @@
-use crate::config::camera::PixelConfig;
 pub enum Error {
     /// Skip this frame and keep capturing.
     Recoverable(String),
@@ -23,14 +22,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Decodes one raw camera frame into an egui image.
 pub fn decode_frame(
-    frame_format: PixelConfig,
+    frame_format: crate::config::camera::PixelConfig,
     raw: &[u8],
     width: u32,
     height: u32,
 ) -> Result<egui::ColorImage> {
     let pixels = match frame_format {
-        PixelConfig::Mjpeg => decode_pixels_mjpeg(raw, width, height)?,
-        PixelConfig::Yuyv => decode_pixels_yuyv(raw, width, height)?,
+        crate::config::camera::PixelConfig::Mjpeg => decode_pixels_mjpeg(raw, width, height)?,
+        crate::config::camera::PixelConfig::Yuyv => decode_pixels_yuyv(raw, width, height)?,
     };
     Ok(egui::ColorImage {
         size: [width as usize, height as usize],

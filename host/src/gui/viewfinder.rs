@@ -1,6 +1,4 @@
-use crate::assets::TESTCARD_SVG;
-use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
-use crate::gui::style::{FONT_REGULAR, FONT_REGULAR_X2};
+use super::ruler::{IntoRuler, cell_x, cell_y};
 use std::sync::OnceLock;
 
 pub struct Viewfinder {
@@ -29,7 +27,7 @@ impl Viewfinder {
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     "\u{ead0}",
-                    FONT_REGULAR_X2,
+                    super::style::FONT_REGULAR_X2,
                     egui::Color32::from_rgb(0xEA, 0x31, 0x23),
                 );
             }
@@ -90,7 +88,7 @@ impl<'a> ViewfinderFrame<'a> {
             label_rect.center(),
             egui::Align2::CENTER_CENTER,
             self.label,
-            FONT_REGULAR_X2,
+            super::style::FONT_REGULAR_X2,
             egui::Color32::WHITE,
         );
 
@@ -104,7 +102,7 @@ impl<'a> ViewfinderFrame<'a> {
             name_rect.left_top(),
             egui::Align2::LEFT_TOP,
             self.name,
-            FONT_REGULAR,
+            super::style::FONT_REGULAR,
             egui::Color32::WHITE,
         );
 
@@ -119,8 +117,11 @@ static TESTCARD_TEXTURE: OnceLock<egui::TextureHandle> = OnceLock::new();
 fn testcard_texture_id(ui: &mut egui::Ui) -> egui::TextureId {
     TESTCARD_TEXTURE
         .get_or_init(|| {
-            let tree = resvg::usvg::Tree::from_data(TESTCARD_SVG, &resvg::usvg::Options::default())
-                .expect("failed to parse testcard.svg");
+            let tree = resvg::usvg::Tree::from_data(
+                crate::assets::TESTCARD_SVG,
+                &resvg::usvg::Options::default(),
+            )
+            .expect("failed to parse testcard.svg");
 
             let size = tree.size();
             let w = size.width() as u32;

@@ -6,11 +6,9 @@
 //! S_FMT): switching a device into another mode before the real open
 //! can leave the following stream in a throttled state.
 
-use crate::config::camera::{CameraConfig, FrameRateConfig, PixelConfig, ResolutionConfig};
-use crate::driver::camera;
-use crate::driver::camera::capture::{
-    Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
-};
+use super::capture::{Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError};
+use super::Error;
+use crate::config::camera::{CameraConfig, PixelConfig};
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
@@ -480,8 +478,10 @@ fn enumerate_intervals(
         // fps = denominator / numerator; skip fractional rates.
         if fract.numerator != 0 && fract.denominator % fract.numerator == 0 {
             out.push(CaptureFormat {
-                resolution: ResolutionConfig { width, height },
-                frame_rate: FrameRateConfig(fract.denominator / fract.numerator),
+                resolution: crate::config::camera::ResolutionConfig { width, height },
+                frame_rate: crate::config::camera::FrameRateConfig(
+                    fract.denominator / fract.numerator,
+                ),
                 format: config,
             });
         }
@@ -528,7 +528,7 @@ fn enumerate_devices() -> io::Result<Vec<Device>> {
 impl Capture for V4l2Capture {
     type Session = V4l2Session;
 
-    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, camera::Error> {
+    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, Error> {
         let devices = enumerate_devices()?;
         Ok(devices
             .into_iter()
@@ -539,7 +539,7 @@ impl Capture for V4l2Capture {
             .collect())
     }
 
-    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, camera::Error> {
+    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, Error> {
         let devices = enumerate_devices()?;
         let needle = config.name.to_lowercase();
         // Exact name match preferred over contains (two passes) — same
@@ -549,7 +549,7 @@ impl Capture for V4l2Capture {
                 .iter()
                 .filter(|d| d.name.to_lowercase().contains(&needle)),
         );
-        let mut last_err = camera::Error::Config(format!("camera not found: {}", config.name));
+        let mut last_err = Error::Config(format!("camera not found: {}", config.name));
         for device in candidates {
             match open_session(&device.path, config) {
                 Ok(session) => return Ok(session),
@@ -735,11 +735,11 @@ fn open_session(path: &str, config: &CameraConfig) -> io::Result<V4l2Session> {
             pending,
             mono_anchor,
             negotiated: CaptureFormat {
-                resolution: ResolutionConfig {
+                resolution: crate::config::camera::ResolutionConfig {
                     width: negotiated_pix.width,
                     height: negotiated_pix.height,
                 },
-                frame_rate: FrameRateConfig(fps),
+                frame_rate: crate::config::camera::FrameRateConfig(fps),
                 format: config.format,
             },
         })

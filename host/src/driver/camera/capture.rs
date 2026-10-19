@@ -8,7 +8,6 @@
 //! файле — `mjpeg`-поток. Никаких «MJPEG-кадров».
 
 use crate::config::camera::{CameraConfig, FrameRateConfig, PixelConfig, ResolutionConfig};
-use crate::driver::camera;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -70,16 +69,18 @@ pub enum FrameData {
     Rgba { rgba: egui::ColorImage },
 }
 
+use super::Error;
+
 /// Фабрика сессий захвата. Два метода: перечисление устройств (с
 /// форматами, одним проходом) и открытие по `CameraConfig`.
 pub trait Capture {
     type Session: CaptureSession;
 
-    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, camera::Error>;
+    fn list_devices() -> std::result::Result<Vec<DeviceInfo>, Error>;
     /// Резолвит устройство по имени конфига свежим перечислением:
     /// индексы V4L2 нестабильны при переподключении, снимок
     /// `list_devices` — не ключ.
-    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, camera::Error>;
+    fn open(config: &CameraConfig) -> std::result::Result<Self::Session, Error>;
 }
 
 /// Открытая камера: negotiated-формат и блокирующее чтение кадров.

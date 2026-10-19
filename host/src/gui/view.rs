@@ -1,6 +1,3 @@
-use crate::gui::measure_text;
-use crate::gui::ruler::{CELL_SIZE, cell_x, cell_y};
-use crate::gui::style::{FONT_REGULAR, FONT_REGULAR_X2};
 pub struct Letterbox {
     min_virtual_size: egui::Vec2,
     max_virtual_size: egui::Vec2,
@@ -81,8 +78,8 @@ impl Letterbox {
         // не нужен. Границы (min/max) кратны клеткам, округление в них
         // не вылезает.
         let virtual_size = egui::vec2(
-            (virtual_size.x / CELL_SIZE.x).round() * CELL_SIZE.x,
-            (virtual_size.y / CELL_SIZE.y).round() * CELL_SIZE.y,
+            (virtual_size.x / super::ruler::CELL_SIZE.x).round() * super::ruler::CELL_SIZE.x,
+            (virtual_size.y / super::ruler::CELL_SIZE.y).round() * super::ruler::CELL_SIZE.y,
         );
         let screen_offset = min_rect + offset;
         let rect = egui::Rect::from_min_size(screen_offset, virtual_size * scale);
@@ -195,7 +192,7 @@ fn round_to_pixels(pos: egui::Pos2, pixels_per_point: f32) -> egui::Pos2 {
 /// (paint_glyph_flipped). Возвращает ширину слова (как measure_text у
 /// обычного слова).
 fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color32) -> f32 {
-    let font = FONT_REGULAR_X2;
+    let font = super::style::FONT_REGULAR_X2;
     let mut x = pos.x;
     // Прогон обычных глифов накапливается в run, маркер его сбрасывает
     // (прогон рисуется) и переворачивает следующий глиф.
@@ -211,7 +208,7 @@ fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color
                     font.clone(),
                     color,
                 );
-                x += measure_text(ui.ctx(), font.clone(), &run).x;
+                x += super::measure_text(ui.ctx(), font.clone(), &run).x;
                 run.clear();
             }
             if let Some(g) = chars.next() {
@@ -229,7 +226,7 @@ fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color
             font.clone(),
             color,
         );
-        x += measure_text(ui.ctx(), font, &run).x;
+        x += super::measure_text(ui.ctx(), font, &run).x;
     }
     x - pos.x
 }
@@ -239,7 +236,7 @@ fn paint_word(ui: &mut egui::Ui, pos: egui::Pos2, word: &str, color: egui::Color
 /// uv отражена. Позиционирование повторяет painter.text с LEFT_BOTTOM
 /// (включая округление к физпикселям).
 fn paint_glyph_flipped(ui: &mut egui::Ui, pos: egui::Pos2, chr: char, color: egui::Color32) -> f32 {
-    let font = FONT_REGULAR_X2;
+    let font = super::style::FONT_REGULAR_X2;
     let galley = ui
         .ctx()
         .fonts_mut(|fonts| fonts.layout_no_wrap(chr.to_string(), font, color));
@@ -286,10 +283,12 @@ pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
     let words: Vec<&str> = text.split(' ').filter(|word| !word.is_empty()).collect();
     let mut width: f32 = words
         .iter()
-        .map(|word| measure_text(ctx, FONT_REGULAR_X2, strip_flip_markers(word)).x)
+        .map(|word| {
+            super::measure_text(ctx, super::style::FONT_REGULAR_X2, strip_flip_markers(word)).x
+        })
         .sum();
     if words.len() > 1 {
-        width += cell_x(1) * (words.len() - 1) as f32;
+        width += super::ruler::cell_x(1) * (words.len() - 1) as f32;
     }
     width
 }
@@ -380,8 +379,8 @@ fn stripe(
             let cut: egui::Rect = rect
                 .right_top()
                 .into_ruler()
-                .translate(-cell_x(rows), 0.0)
-                .extrude(cell_x(rows), cell_y(rows))
+                .translate(-super::ruler::cell_x(rows), 0.0)
+                .extrude(super::ruler::cell_x(rows), super::ruler::cell_y(rows))
                 .into();
             (cut, rect.with_max_x(cut.left()))
         }
@@ -389,7 +388,7 @@ fn stripe(
             let cut: egui::Rect = rect
                 .left_top()
                 .into_ruler()
-                .extrude(cell_x(rows), cell_y(rows))
+                .extrude(super::ruler::cell_x(rows), super::ruler::cell_y(rows))
                 .into();
             (cut, rect.with_min_x(cut.right()))
         }
@@ -419,8 +418,8 @@ fn stripe(
     // Контент: по клетке поля слева и справа от текста; по вертикали
     // отступов нет.
     plate
-        .with_min_x(plate.min.x + cell_x(1))
-        .with_max_x(plate.max.x - cell_x(1))
+        .with_min_x(plate.min.x + super::ruler::cell_x(1))
+        .with_max_x(plate.max.x - super::ruler::cell_x(1))
 }
 
 /// Кнопка транспорта (scrub): залитый прямоугольник 3 клетки высотой,
@@ -442,13 +441,7 @@ impl<T: AsRef<str>> TransportButton<T> {
     /// enabled — кликабельна; active — нажата (включая тап) или
     /// активирована. Внешние состояния не нужны: решения о виде —
     /// внутри (disabled = !enabled).
-    pub fn new(
-        text: T,
-        enabled: bool,
-        active: bool,
-        idle: egui::Color32,
-        active_color: egui::Color32,
-    ) -> Self {
+    pub fn new(text: T, enabled: bool, active: bool, idle: egui::Color32, active_color: egui::Color32) -> Self {
         Self {
             text,
             enabled,
@@ -491,7 +484,7 @@ impl<T: AsRef<str>> TransportButton<T> {
         let w = content_width(ui.ctx(), text);
         let mut pos = egui::pos2(rect.center().x - w / 2.0, rect.bottom());
         for word in text.split(' ').filter(|word| !word.is_empty()) {
-            pos.x += paint_word(ui, pos, word, icon_color) + cell_x(1);
+            pos.x += paint_word(ui, pos, word, icon_color) + super::ruler::cell_x(1);
         }
     }
 }
@@ -503,13 +496,13 @@ pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]
     if lines.is_empty() {
         return;
     }
-    let row = CELL_SIZE.y;
+    let row = super::ruler::CELL_SIZE.y;
     let width = lines
         .iter()
-        .map(|line| measure_text(ui.ctx(), FONT_REGULAR, line).x)
+        .map(|line| super::measure_text(ui.ctx(), super::style::FONT_REGULAR, line).x)
         .fold(0.0f32, f32::max);
-    let right = anchor.right() - cell_x(1);
-    let bottom = anchor.bottom() - cell_y(1);
+    let right = anchor.right() - super::ruler::cell_x(1);
+    let bottom = anchor.bottom() - super::ruler::cell_y(1);
     let text = egui::Rect::from_min_max(
         egui::pos2(right - width, bottom - row),
         egui::pos2(right, bottom),
@@ -524,8 +517,8 @@ pub fn hint_badge_corner(ui: &mut egui::Ui, anchor: egui::Rect, lines: &[String]
 /// вертикали тоже), обводка белая 1 пункт прямо по границам фона
 /// (снаружи), той же скруглённости.
 pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, lines: &[String]) {
-    let pad = CELL_SIZE.x * 0.5;
-    let row = CELL_SIZE.y;
+    let pad = super::ruler::CELL_SIZE.x * 0.5;
+    let row = super::ruler::CELL_SIZE.y;
     let bg = text.expand(pad);
     // Чёрная подложка на 1 px шире контура (во все стороны), поверх —
     // контурный скруглённый прямоугольник. Полупрозрачная заливка не
@@ -548,7 +541,7 @@ pub fn hint_badge(ui: &mut egui::Ui, text: egui::Rect, align: egui::Align2, line
             egui::pos2(x, text.top() + row * (i + 1) as f32),
             align,
             line,
-            FONT_REGULAR,
+            super::style::FONT_REGULAR,
             egui::Color32::WHITE,
         );
     }

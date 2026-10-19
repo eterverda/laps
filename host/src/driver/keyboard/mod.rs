@@ -7,12 +7,9 @@
 //! exists; macOS (IOKit) will join as a sibling module. The discovery
 //! CLI (`list-keyboards`) stays Linux-only — it is specific to evdev.
 
-use crossbeam_channel as crossbeam;
-
 #[cfg(target_os = "linux")]
 pub mod linux;
 
-use crate::config::keyboard::KeyboardConfig;
 #[cfg(target_os = "linux")]
 pub use linux::scan;
 
@@ -434,13 +431,19 @@ impl std::error::Error for AttachError {}
 /// return the event stream. The receiver disconnects when the device is
 /// unplugged or the thread dies.
 #[cfg(target_os = "linux")]
-pub fn open(id: &str, cfg: &KeyboardConfig) -> Result<crossbeam::Receiver<KeyEvent>, AttachError> {
+pub fn open(
+    id: &str,
+    cfg: &crate::config::keyboard::KeyboardConfig,
+) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
     linux::open(id, cfg)
 }
 
 /// Platform stub until a real backend lands: nothing can match.
 #[cfg(not(target_os = "linux"))]
-pub fn open(id: &str, cfg: &KeyboardConfig) -> Result<crossbeam::Receiver<KeyEvent>, AttachError> {
+pub fn open(
+    id: &str,
+    cfg: &crate::config::keyboard::KeyboardConfig,
+) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
     let _ = (id, cfg);
     Err(AttachError::NoMatch)
 }

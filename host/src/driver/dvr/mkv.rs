@@ -692,16 +692,7 @@ mod tests {
         let path = test_path("header");
         let frames = fake_frames(3);
         {
-            let mut writer = Box::new(
-                MkvWriter::create(
-                    &path,
-                    Resolution {
-                        width: 1920,
-                        height: 1080,
-                    },
-                )
-                .unwrap(),
-            );
+            let mut writer = Box::new(MkvWriter::create(&path, Resolution { width: 1920, height: 1080 }).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 1_000_000 + i as u64 * 33)
@@ -773,16 +764,7 @@ mod tests {
         let path = test_path("clusters");
         let frames = fake_frames(400); // 400 * 33 мс ≈ 13 с — два переключения
         {
-            let mut writer = Box::new(
-                MkvWriter::create(
-                    &path,
-                    Resolution {
-                        width: 640,
-                        height: 480,
-                    },
-                )
-                .unwrap(),
-            );
+            let mut writer = Box::new(MkvWriter::create(&path, Resolution { width: 640, height: 480 }).unwrap());
             for (i, frame) in frames.iter().enumerate() {
                 writer
                     .write_frame(frame, 5_000_000 + i as u64 * 33)
@@ -852,18 +834,9 @@ mod tests {
     #[test]
     fn test_empty_file() {
         let path = test_path("empty");
-        Box::new(
-            MkvWriter::create(
-                &path,
-                Resolution {
-                    width: 640,
-                    height: 480,
-                },
-            )
-            .unwrap(),
-        )
-        .finalize()
-        .unwrap();
+        Box::new(MkvWriter::create(&path, Resolution { width: 640, height: 480 }).unwrap())
+            .finalize()
+            .unwrap();
 
         let buf = std::fs::read(&path).unwrap();
         let top = parse(&buf, 0, buf.len());
@@ -894,16 +867,7 @@ mod tests {
             .map(|i| (i * 40, vec![i as u8; 100 + i as usize]))
             .collect();
         {
-            let mut w: Box<dyn VideoWriter> = Box::new(
-                MkvWriter::create(
-                    &path,
-                    Resolution {
-                        width: 64,
-                        height: 48,
-                    },
-                )
-                .unwrap(),
-            );
+            let mut w: Box<dyn VideoWriter> = Box::new(MkvWriter::create(&path, Resolution { width: 64, height: 48 }).unwrap());
             for (ts, data) in &frames {
                 w.write_frame(data, *ts).unwrap();
             }

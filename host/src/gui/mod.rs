@@ -1,13 +1,14 @@
 use crate::config::setup::Setup;
+use crate::driver::dvr::CAPTURES_DIR;
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
-use crate::driver::dvr::CAPTURES_DIR;
-use crate::remote::{Response, Server, RESPONSE_TIMEOUT};
-use std::sync::Arc;
+use crate::remote::{RESPONSE_TIMEOUT, Response, Server};
+use crossbeam_channel as crossbeam;
+use serde_yaml::from_str as from_yaml_string;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
-use serde_yaml::from_str as from_yaml_string;
+use std::sync::Arc;
 
 mod flight;
 mod guidelines;
@@ -34,10 +35,7 @@ impl Navigator {
 }
 
 struct App {
-    remote_rx: std::sync::mpsc::Receiver<(
-        Vec<String>,
-        std::sync::mpsc::Sender<Response>,
-    )>,
+    remote_rx: crossbeam::Receiver<(Vec<String>, crossbeam::Sender<Response>)>,
     state: State,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
@@ -55,14 +53,16 @@ fn hardcoded_assignments() -> HashMap<String, Pilot> {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, scrub: Option<PathBuf>) -> Self {
-        let (remote_tx, remote_rx) = std::sync::mpsc::channel();
+        // Очередь команд в GUI (16 — с запасом над одним обслуживаемым
+        // клиентом): переполнение = «gui unavailable».
+        let (remote_tx, remote_rx) = crossbeam::bounded(16);
         // Колбэк исполнения команд: кладёт задачу в очередь GUI и будит
         // его (иначе ответ ждал бы ближайшего кадра egui), затем ждёт
         // ответа.
         let ctx = cc.egui_ctx.clone();
         let execute: Arc<dyn Fn(Vec<String>) -> Response + Send + Sync> =
             Arc::new(move |command| {
-                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                let (reply_tx, reply_rx) = crossbeam::bounded(1);
                 if remote_tx.send((command, reply_tx)).is_err() {
                     return Response {
                         message: "gui unavailable".to_owned(),
@@ -123,11 +123,7 @@ impl App {
     /// Обработка команды удалённого управления: сначала команду получает
     /// текущий экран; отклонённое (None дошло до верха) ловит App — echo
     /// отвечает здесь же, остальное превращается в «unknown command».
-    fn handle_remote(
-        &mut self,
-        ctx: &egui::Context,
-        command: &[String],
-    ) -> Response {
+    fn handle_remote(&mut self, ctx: &egui::Context, command: &[String]) -> Response {
         let response = match &mut self.state {
             State::Flight(flight) => flight.handle_remote(ctx, command),
             State::Menu(_) => None,

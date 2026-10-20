@@ -1,18 +1,21 @@
 //! Keyboard driver: platform-independent contract, platform backends in
 //! submodules. Backends deliver key presses to the application in one
 //! shape regardless of the source (the focus keyboard wrapped from egui,
-//! USB macro pads, any HID keyboard) — see `docs/keyboard.md`.
+//! USB macro pads, any HID keyboard).
 //!
 //! Currently only the Linux backend (`linux`, evdev/sysfs discovery)
 //! exists; macOS (IOKit) will join as a sibling module. The discovery
 //! CLI (`list-keyboards`) stays Linux-only — it is specific to evdev.
 
+pub mod egui;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
-use crate::config::keyboard::KeyboardConfig;
+use crossbeam_utils::atomic::AtomicCell;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::io::Error as IoError;
+use std::sync::Arc;
 use std::time::Instant;
 
 const X: Option<&str> = None;
@@ -282,37 +285,53 @@ pub struct KeyboardInfo {
     pub grabbable: bool,
 }
 
-/// Key press in the canonical cross-platform shape (see
-/// docs/keyboard.md): `keycode` is the HID usage id (page 0x07),
-/// `modifiers` the HID boot-protocol bitmask of the same keyboard.
+/// Нажатие клавиши в каноничной кросс-платформенной форме: `keycode` —
+/// HID usage id (page 0x07), `modifiers` — HID boot-маска той же
+/// клавиатуры на момент нажатия. Только фронт нажатия: релизы в канал не
+/// идут (модификаторы отслеживает трекер).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyEvent {
+pub struct KeyPressed {
     /// Internal name: "main" or the key of `Setup.keyboards`.
     pub keyboard_id: String,
     pub modifiers: u32,
     pub keycode: u32,
-    pub action: KeyAction,
     /// Reception moment, stamped by the driver as the event is created.
     pub at: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyAction {
-    Press,
-    Release,
-}
-
-impl KeyAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            KeyAction::Press => "press",
-            KeyAction::Release => "release",
-        }
+/// "pad-1  LCtrl+LShift+A" — id, Mod+Mod+Key (modifiers prefix the key,
+/// joined by "+").
+impl Display for KeyPressed {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        let modifiers = ModifierTracker::names(self.modifiers);
+        let key = keycode_to_str(self.keycode);
+        let combo = if modifiers.is_empty() {
+            key
+        } else {
+            format!("{modifiers}+{key}")
+        };
+        write!(f, "{}  {combo}", self.keyboard_id)
     }
 }
 
+/// Состояние клавиатуры: `connected` — поток-ридер жив (устройство на
+/// месте), гасится им при выходе.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyboardState {
+    pub connected: bool,
+}
+
+impl Default for KeyboardState {
+    fn default() -> Self {
+        Self { connected: true }
+    }
+}
+
+/// Общий для ридера и GUI хэндл состояния клавиатуры.
+pub type SharedKeyboardState = Arc<AtomicCell<KeyboardState>>;
+
 /// Boot-protocol modifier bits with their short names.
-pub const MODIFIER_NAMES: [(u32, &str); 8] = [
+const MODIFIER_NAMES: [(u32, &str); 8] = [
     (0x01, "LCtrl"),
     (0x02, "LShift"),
     (0x04, "LAlt"),
@@ -333,11 +352,12 @@ pub struct ModifierTracker {
 
 impl ModifierTracker {
     /// Apply one mapped key action; returns the fresh mask.
-    pub fn apply(&mut self, hid_usage: u32, action: KeyAction) -> u32 {
+    pub fn apply(&mut self, hid_usage: u32, pressed: bool) -> u32 {
         if let Some(bit) = Self::bit_of(hid_usage) {
-            match action {
-                KeyAction::Press => self.mask |= bit,
-                KeyAction::Release => self.mask &= !bit,
+            if pressed {
+                self.mask |= bit;
+            } else {
+                self.mask &= !bit;
             }
         }
         self.mask
@@ -433,24 +453,17 @@ impl Display for AttachError {
 
 impl std::error::Error for AttachError {}
 
-/// Attach one configured keyboard: open the device it matches and
-/// return the event stream. The receiver disconnects when the device is
-/// unplugged or the thread dies.
 #[cfg(target_os = "linux")]
-pub fn open(
-    id: &str,
-    cfg: &KeyboardConfig,
-) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
-    linux::open(id, cfg)
-}
+pub use linux::attach;
 
 /// Platform stub until a real backend lands: nothing can match.
 #[cfg(not(target_os = "linux"))]
-pub fn open(
+pub fn attach(
+    events: crossbeam_channel::Sender<KeyPressed>,
     id: &str,
-    cfg: &KeyboardConfig,
-) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
-    let _ = (id, cfg);
+    cfg: &crate::config::keyboard::KeyboardConfig,
+) -> Result<SharedKeyboardState, AttachError> {
+    let _ = (events, id, cfg);
     Err(AttachError::NoMatch)
 }
 
@@ -484,13 +497,13 @@ mod tests {
     fn tracker_sets_and_clears_bits() {
         let mut t = ModifierTracker::default();
         // Press LShift then LCtrl: mask accumulates.
-        assert_eq!(t.apply(0xE1, KeyAction::Press), 0x02);
-        assert_eq!(t.apply(0xE0, KeyAction::Press), 0x03);
+        assert_eq!(t.apply(0xE1, true), 0x02);
+        assert_eq!(t.apply(0xE0, true), 0x03);
         // A regular key leaves the mask alone.
-        assert_eq!(t.apply(0x70, KeyAction::Press), 0x03);
+        assert_eq!(t.apply(0x70, true), 0x03);
         // Release LShift clears only its bit.
-        assert_eq!(t.apply(0xE1, KeyAction::Release), 0x01);
-        assert_eq!(t.apply(0xE0, KeyAction::Release), 0x00);
+        assert_eq!(t.apply(0xE1, false), 0x01);
+        assert_eq!(t.apply(0xE0, false), 0x00);
     }
 
     #[test]

@@ -9,16 +9,15 @@ use crate::config::setup::PadConfig;
 use crate::driver::audio::{Audio, Sound};
 use crate::driver::camera::Recorder;
 use crate::driver::dvr::{RecordParams, RecordState};
-use crate::driver::keyboard::KeyEvent;
+use crate::driver::keyboard::KeyPressed;
 use crate::model::flight::{Journal, JournalRecord};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
 use crossbeam_channel as crossbeam;
-use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -898,9 +897,7 @@ impl Race {
         assignments: HashMap<String, Pilot>,
         cameras: HashMap<String, CameraConfig>,
         recorders: HashMap<String, Recorder>,
-        mut keyboards: HashMap<String, crossbeam::Receiver<KeyEvent>>,
-        key_events: Arc<Mutex<Vec<KeyEvent>>>,
-        key_dead: Arc<Mutex<HashSet<String>>>,
+        keyboard_rx: crossbeam::Receiver<KeyPressed>,
         wake: Arc<dyn Fn() + Send + Sync>,
         audio: Audio,
     ) -> Race {
@@ -952,48 +949,36 @@ impl Race {
                 }
             };
 
+            let mut keyboard_rx = keyboard_rx;
             loop {
                 let now = Instant::now();
                 let until_deadline = core
                     .next_deadline()
                     .map(|d| d.saturating_duration_since(now))
                     .unwrap_or(POLL);
-                let effects = match intent_rx.recv_timeout(until_deadline.min(POLL)) {
-                    Ok(intent) => core.intent(intent, Instant::now()),
-                    Err(crossbeam::RecvTimeoutError::Timeout) => core.tick(Instant::now()),
-                    Err(crossbeam::RecvTimeoutError::Disconnected) => break,
+                // Ожидание: намерение GUI, клавиатура или дедлайн ядра
+                // (таймаут — тот же min(deadline, POLL)).
+                let effects = crossbeam::select! {
+                    recv(&intent_rx) -> intent => match intent {
+                        Ok(intent) => core.intent(intent, Instant::now()),
+                        Err(_) => break, // GUI ушёл без выхода
+                    },
+                    recv(&keyboard_rx) -> event => match event {
+                        // Регистрация нажатий — в RaceCore (пока лог).
+                        Ok(event) => {
+                            log::info!("keyboard: {event}");
+                            Vec::new()
+                        }
+                        // Отвал клавиатур отключает ветку: never не
+                        // готов никогда, цикл живёт.
+                        Err(_) => {
+                            keyboard_rx = crossbeam::never();
+                            Vec::new()
+                        }
+                    },
+                    default(until_deadline.min(POLL)) => core.tick(Instant::now()),
                 };
                 apply(&effects, &recorders, &audio);
-
-                // Клавиатуры: дрен каналов в общую очередь для GUI. Обрыв
-                // канала — id в dead-сет. Будим UI только когда что-то пришло.
-                if !keyboards.is_empty() {
-                    let mut got = false;
-                    let mut dead_now = Vec::new();
-                    for (id, rx) in keyboards.iter_mut() {
-                        loop {
-                            match rx.try_recv() {
-                                Ok(event) => {
-                                    key_events.lock().expect("key events").push(event);
-                                    got = true;
-                                }
-                                Err(crossbeam::TryRecvError::Disconnected) => {
-                                    dead_now.push(id.clone());
-                                    break;
-                                }
-                                Err(crossbeam::TryRecvError::Empty) => break,
-                            }
-                        }
-                    }
-                    for id in dead_now {
-                        keyboards.remove(&id);
-                        key_dead.lock().expect("key dead").insert(id);
-                        got = true;
-                    }
-                    if got {
-                        wake();
-                    }
-                }
 
                 // Поллинг first_frame_at: edge-детект — в ядре.
                 for (id, recorder) in &recorders {

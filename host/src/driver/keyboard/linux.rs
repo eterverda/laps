@@ -10,8 +10,11 @@
 //! EVIOCGRAB is never issued here — access is probed
 //! by a plain open/close of the node.
 
-use super::{AttachError, KeyAction, KeyEvent, KeyboardInfo, ModifierTracker};
+use super::{
+    AttachError, KeyPressed, KeyboardInfo, KeyboardState, ModifierTracker, SharedKeyboardState,
+};
 use crate::config::keyboard::{KeyboardConfig, KeyboardMode};
+use crossbeam_channel as crossbeam;
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs;
@@ -22,6 +25,7 @@ use std::mem;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -357,15 +361,14 @@ const EVDEV_TO_HID: [Option<u8>; 256] = [
     None,
 ];
 
-/// Attach one configured keyboard: match the filter against `scan()`,
-/// open the node (O_RDWR + EVIOCGRAB in `Grab` mode, O_RDONLY in
-/// `Listen`), spawn the reader thread. The returned channel
-/// disconnects when the device goes away: a read error ends the
-/// thread, the fd close releases the grab.
-pub fn open(
+/// Attach one configured keyboard: open the matched device and stream
+/// its events into `events` from a reader thread (one thread per
+/// device, lives while the device and the receiver do).
+pub fn attach(
+    events: crossbeam::Sender<KeyPressed>,
     id: &str,
     cfg: &KeyboardConfig,
-) -> Result<crossbeam_channel::Receiver<KeyEvent>, AttachError> {
+) -> Result<SharedKeyboardState, AttachError> {
     let devices = scan_devices().map_err(AttachError::Io)?;
     let matched: Vec<&Device> = devices.iter().filter(|d| cfg.matches(&d.info)).collect();
     let device = match matched.len() {
@@ -391,10 +394,11 @@ pub fn open(
         unsafe { libc::close(fd) };
         return Err(AttachError::Io(err));
     }
-    let (tx, rx) = crossbeam_channel::unbounded();
     let keyboard_id = id.to_owned();
-    thread::spawn(move || read_events(fd, keyboard_id, tx));
-    Ok(rx)
+    let state: SharedKeyboardState = Arc::default();
+    let thread_state = state.clone();
+    thread::spawn(move || read_events(fd, keyboard_id, events, thread_state));
+    Ok(state)
 }
 
 fn open_node(path: &Path, flags: libc::c_int) -> IoResult<RawFd> {
@@ -412,7 +416,12 @@ fn open_node(path: &Path, flags: libc::c_int) -> IoResult<RawFd> {
 /// pushed into the channel. EINTR retries; any other read error
 /// (ENODEV on unplug, EIO) ends the stream — the fd close also releases
 /// the grab, and the dropped sender disconnects the receiver.
-fn read_events(fd: RawFd, keyboard_id: String, tx: crossbeam_channel::Sender<KeyEvent>) {
+fn read_events(
+    fd: RawFd,
+    keyboard_id: String,
+    tx: crossbeam_channel::Sender<KeyPressed>,
+    state: SharedKeyboardState,
+) {
     let mut tracker = ModifierTracker::default();
     let mut buf = [0u8; INPUT_EVENT_SIZE * 64];
     let mut tail = 0usize;
@@ -440,13 +449,16 @@ fn read_events(fd: RawFd, keyboard_id: String, tx: crossbeam_channel::Sender<Key
         tail = filled - complete;
     }
     unsafe { libc::close(fd) };
+    // Поток-ридер завершился — устройство отвалилось (или получатель
+    // ушёл): состояние гасим по любому выходу.
+    state.store(KeyboardState { connected: false });
 }
 
 /// Decode raw `input_event` bytes (a multiple of 24) into KeyEvents.
 /// Only EV_KEY is consumed: value 0/1 map to Release/Press, autorepeat
 /// (value 2) is dropped, other event types (MSC_SCAN and friends) are
 /// ignored. Unmapped codes are skipped with a warning.
-fn decode(buf: &[u8], tracker: &mut ModifierTracker, keyboard_id: &str) -> Vec<KeyEvent> {
+fn decode(buf: &[u8], tracker: &mut ModifierTracker, keyboard_id: &str) -> Vec<KeyPressed> {
     debug_assert_eq!(buf.len() % INPUT_EVENT_SIZE, 0);
     let mut events = Vec::new();
     for chunk in buf.as_chunks::<INPUT_EVENT_SIZE>().0 {
@@ -456,23 +468,25 @@ fn decode(buf: &[u8], tracker: &mut ModifierTracker, keyboard_id: &str) -> Vec<K
         }
         let code = u16::from_le_bytes([chunk[18], chunk[19]]);
         let value = i32::from_le_bytes([chunk[20], chunk[21], chunk[22], chunk[23]]);
-        let action = match value {
-            0 => KeyAction::Release,
-            1 => KeyAction::Press,
+        let pressed = match value {
+            1 => true,
+            0 => false,
             _ => continue, // autorepeat — filtered by the driver
         };
         let Some(usage) = EVDEV_TO_HID[code as usize] else {
             log::warn!("keyboard {keyboard_id}: unmapped evdev code {code}, event skipped");
             continue;
         };
-        let modifiers = tracker.apply(usage as u32, action);
-        events.push(KeyEvent {
-            keyboard_id: keyboard_id.to_owned(),
-            modifiers,
-            keycode: usage as u32,
-            action,
-            at: Instant::now(),
-        });
+        // Релизы только в трекер (маска не застревает), в канал — фронт.
+        let modifiers = tracker.apply(usage as u32, pressed);
+        if pressed {
+            events.push(KeyPressed {
+                keyboard_id: keyboard_id.to_owned(),
+                modifiers,
+                keycode: usage as u32,
+                at: Instant::now(),
+            });
+        }
     }
     events
 }
@@ -644,7 +658,7 @@ mod tests {
     }
     #[test]
     fn evdev_to_hid_checkpoints() {
-        // Inversion of hid_keyboard[] (docs/keyboard.md ranges).
+        // Inversion of the kernel's hid_keyboard[] table.
         assert_eq!(EVDEV_TO_HID[30], Some(0x04)); // KEY_A
         assert_eq!(EVDEV_TO_HID[44], Some(0x1D)); // KEY_Z
         assert_eq!(EVDEV_TO_HID[2], Some(0x1E)); // KEY_1
@@ -706,18 +720,11 @@ mod tests {
             buf.extend_from_slice(&ev);
         }
         let events = decode(&buf, &mut tracker, "key-1");
-        let summary: Vec<_> = events
-            .iter()
-            .map(|e| (e.keycode, e.action, e.modifiers))
-            .collect();
+        // Релизы в канал не идут: только фронты, с живой маской.
+        let summary: Vec<_> = events.iter().map(|e| (e.keycode, e.modifiers)).collect();
         assert_eq!(
             summary,
-            [
-                (0xE1, KeyAction::Press, 0x02),   // LShift press sets its bit
-                (0x70, KeyAction::Press, 0x02),   // F21 carries the live mask
-                (0xE1, KeyAction::Release, 0x00), // mask clears on release
-                (0x70, KeyAction::Release, 0x00),
-            ]
+            [(0xE1, 0x02), (0x70, 0x02)] // LShift ставит бит, F21 несёт маску
         );
         assert!(events.iter().all(|e| e.keyboard_id == "key-1"));
     }

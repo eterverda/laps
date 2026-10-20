@@ -8,8 +8,8 @@ use crate::config::keyboard::{KeyBind, KeyboardConfig};
 pub struct Setup {
     pub cameras: BTreeMap<String, CameraConfig>,
     pub pads: BTreeMap<String, PadConfig>,
-    // Attached by `laps debug-keyboards`; parsed here so setup files can
-    // carry keyboards already.
+    // Аттачатся гоночной сессией (GUI → Race); парсинг здесь, чтобы
+    // сетап-файлы уже могли описывать клавиатуры.
     #[serde(default)]
     pub keyboards: BTreeMap<String, KeyboardConfig>,
 }

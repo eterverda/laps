@@ -11,6 +11,8 @@ use crate::driver::audio::Audio;
 use crate::driver::camera::Camera;
 use crate::driver::camera::CaptureState;
 use crate::driver::dvr::{CAPTURES_DIR, RecordState};
+use crate::driver::keyboard::egui::MainKeyboard;
+use crate::driver::keyboard::{KeyPressed, SharedKeyboardState, attach};
 use crate::driver::player::{Player, PlayerState};
 use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::gui::scrub::{
@@ -25,13 +27,13 @@ use crate::model::rules::RaceRules;
 use crate::remote::Response;
 use crate::service::race::{Notice, Race, RaceStage};
 use crate::service::transport::{Circle, Transport};
+use crossbeam_channel as crossbeam;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_PADS: usize = 4;
@@ -58,6 +60,12 @@ const RACE_IDLE: egui::Color32 = egui::Color32::from_rgb(0x75, 0x77, 0x48);
 /// обычных скоростях; шаттл уходит дальше — цифра честно = курсор).
 const DIAL_LAG_MS: u64 = 150;
 
+/// Единый «счётчик» перерисовок там, где кадры не гонят UI сами (мёртвый
+/// эфир, счётчик гонки без картинки, автономный транспорт): минимум
+/// ~23 Гц. Повторный вызов перевооружает таймер egui, состояние не
+/// нужно.
+const UI_TICK: Duration = Duration::from_millis(43);
+
 /// Машина состояний экрана: данные фаз инкапсулированы в вариантах.
 /// Гоночные фазы эфира живут в ядре (service::race::RaceStage) — здесь
 /// только разделение «эфир vs DVR».
@@ -73,6 +81,29 @@ enum Mode {
 /// и keepawake).
 struct Idle {
     webcams: HashMap<String, Camera>,
+    /// Main-клавиатура (фокусная, из egui) и канал клавиатур сетапа.
+    /// Живут с фазой: при Idle → Live уезжают в Race; новые строятся
+    /// при каждом входе в Idle (старые в Race не возвращаются).
+    main_keyboard: MainKeyboard,
+    keyboard_rx: crossbeam::Receiver<KeyPressed>,
+    /// Состояния подцепленных клавиатур (connected): опрос — у GUI,
+    /// плашки дисконнекта — дальше.
+    #[allow(dead_code)]
+    keyboard_states: HashMap<String, SharedKeyboardState>,
+}
+
+impl Default for Idle {
+    /// Пустышка для обмена через mem::replace: пустой канал (attach не
+    /// зовём — потоков нет), немедленно заменяется вызывающим кодом.
+    fn default() -> Self {
+        let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
+        Self {
+            webcams: HashMap::new(),
+            main_keyboard: MainKeyboard::new(&keyboard_tx),
+            keyboard_rx,
+            keyboard_states: HashMap::new(),
+        }
+    }
 }
 
 /// Данные эфира: гоночный поток, последний снапшот его состояния,
@@ -86,6 +117,11 @@ struct Live {
     state: RaceStage,
     rules: RaceRules,
     webcams: HashMap<String, Camera>,
+    /// Main-клавиатура: уехала сюда из Idle вместе с каналом клавиатур.
+    main_keyboard: MainKeyboard,
+    /// Состояния клавиатур — вместе с main из Idle.
+    #[allow(dead_code)]
+    keyboard_states: HashMap<String, SharedKeyboardState>,
     /// Подавление сна: держится ради Drop (inhibit снимается при
     /// разрушении), чтений нет.
     #[allow(dead_code)]
@@ -253,6 +289,9 @@ impl Flight {
             webcams.insert(id.clone(), Camera::open(camera.clone(), ctx.clone()));
         }
         log::info!("flight: webcams starting: {}", webcams.len());
+        let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
+        let keyboard_states = attach_keyboards(&setup, &keyboard_tx);
+        let main = MainKeyboard::new(&keyboard_tx);
         Self {
             setup,
             assignments,
@@ -263,7 +302,12 @@ impl Flight {
             res: None,
             exit_requested: false,
             header: header::Header::new(),
-            phase: Mode::Idle(Idle { webcams }),
+            phase: Mode::Idle(Idle {
+                webcams,
+                main_keyboard: main,
+                keyboard_rx,
+                keyboard_states,
+            }),
         }
     }
 
@@ -274,12 +318,8 @@ impl Flight {
         if !matches!(self.phase, Mode::Idle(_)) {
             return;
         }
-        let Mode::Idle(idle) = mem::replace(
-            &mut self.phase,
-            Mode::Idle(Idle {
-                webcams: HashMap::new(),
-            }),
-        ) else {
+        // Пустышка для обмена: немедленно заменяется ниже.
+        let Mode::Idle(idle) = mem::replace(&mut self.phase, Mode::Idle(Idle::default())) else {
             unreachable!()
         };
         let awake = keepawake::Builder::default()
@@ -309,9 +349,7 @@ impl Flight {
             self.assignments.clone(),
             self.shown_cameras.clone(),
             recorders,
-            HashMap::new(),
-            Arc::new(Mutex::new(Vec::new())),
-            Arc::new(Mutex::new(HashSet::new())),
+            idle.keyboard_rx,
             wake,
             self.audio.clone(),
         );
@@ -325,6 +363,8 @@ impl Flight {
             state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
+            main_keyboard: idle.main_keyboard,
+            keyboard_states: idle.keyboard_states,
             awake,
         });
     }
@@ -335,16 +375,18 @@ impl Flight {
         if !matches!(self.phase, Mode::Live(_)) {
             return;
         }
-        let Mode::Live(live) = mem::replace(
-            &mut self.phase,
-            Mode::Idle(Idle {
-                webcams: HashMap::new(),
-            }),
-        ) else {
+        // Пустышка для обмена: немедленно заменяется ниже.
+        let Mode::Live(live) = mem::replace(&mut self.phase, Mode::Idle(Idle::default())) else {
             unreachable!()
         };
+        let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
+        let keyboard_states = attach_keyboards(&self.setup, &keyboard_tx);
+        let main = MainKeyboard::new(&keyboard_tx);
         self.phase = Mode::Idle(Idle {
             webcams: live.webcams,
+            main_keyboard: main,
+            keyboard_rx,
+            keyboard_states,
         });
     }
 
@@ -416,7 +458,7 @@ impl Flight {
             {
                 // Самовзвод перерисовок счётчика гонки — только в живых
                 // фазах без кадров (в DVR кадры гонят перерисовки сами).
-                ctx.request_repaint_after(Duration::from_millis(43));
+                ctx.request_repaint_after(UI_TICK);
             }
         }
         if let Some(journal) = enter_review {
@@ -429,9 +471,14 @@ impl Flight {
             self.back_to_idle();
         }
         match &mut self.phase {
-            Mode::Idle(i) => {
-                Self::prepare_idle(i, &self.setup, &self.assignments, &self.shown_cameras, alt)
-            }
+            Mode::Idle(i) => Self::prepare_idle(
+                i,
+                &self.setup,
+                &self.assignments,
+                &self.shown_cameras,
+                ctx,
+                alt,
+            ),
             Mode::Live(l) => {
                 Self::prepare_live(l, &self.setup, &self.assignments, &self.shown_cameras, alt)
             }
@@ -623,8 +670,23 @@ impl Flight {
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
+        ctx: &egui::Context,
         alt: bool,
     ) -> FrameContents {
+        // Клавиатуры (Idle): эвенты (устройства + main) только
+        // логируются; в Live канал уехал в Race, там его дренит поток.
+        while let Ok(event) = i.keyboard_rx.try_recv() {
+            log::info!("keyboard: {event}");
+        }
+        // Клавиатурный дрен выше живёт на этом счётчике, пока эфир
+        // мёртв (живой — кадры гонят перерисовки сами).
+        if !i
+            .webcams
+            .values()
+            .any(|w| w.capture_state() == CaptureState::Live)
+        {
+            ctx.request_repaint_after(UI_TICK);
+        }
         let pads = Self::prepare_pads(&mut i.webcams, setup, assignments, shown_cameras, alt);
         let fps_lines = if alt {
             Self::fps_lines(&i.webcams, shown_cameras, false)
@@ -747,7 +809,7 @@ impl Flight {
             // UI на каждый «кадр» — пока время бежит, будим сами (~30 Гц);
             // стоит — тишина. С плеерами их публикации кадров будят сами,
             // этот будильник — дубль (egui склеивает).
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint_after(UI_TICK);
         }
         // Транспорт → плееры: позиция (сессия) и скорость синком на каждый
         // кадр; worker'ы экстраполируют между синками на своих часах.
@@ -848,6 +910,14 @@ impl Flight {
     }
 
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
+        // Main-клавиатура (Idle/Live): события egui уходят в общий
+        // канал клавиатур — тот, куда смотрит текущий хаб (локальный
+        // в Idle, в потоке гонки в Live). В Review нет ни хаба, ни main.
+        match &mut self.phase {
+            Mode::Idle(i) => i.main_keyboard.pump(ui),
+            Mode::Live(l) => l.main_keyboard.pump(ui),
+            Mode::Review(_) => {}
+        }
         enum Action {
             Exit,
             Rec,
@@ -1729,6 +1799,24 @@ impl Review {
 /// все символы клавиатуры и переводит аттач в Err — плашка дисконнекта.
 /// Возвращает true, если состояние могло измениться, — caller просит
 /// перерисовку.
+/// Аттач клавиатур сетапа в канал: warn на каждую неподцепленную,
+/// состояния (connected) — вызывающему.
+fn attach_keyboards(
+    setup: &Setup,
+    tx: &crossbeam::Sender<KeyPressed>,
+) -> HashMap<String, SharedKeyboardState> {
+    let mut states = HashMap::new();
+    for (id, cfg) in &setup.keyboards {
+        match attach(tx.clone(), id, cfg) {
+            Ok(state) => {
+                states.insert(id.clone(), state);
+            }
+            Err(e) => log::warn!("keyboard {id}: attach failed: {e}"),
+        }
+    }
+    states
+}
+
 /// Срез камер активных падов (дедуп по camera_id): захваты открываются
 /// по одному на камеру, гоночному потоку нужен owned срез. «Активные» =
 /// пады с пилотами, в пределах MAX_PADS (рендер падов идёт по всем —

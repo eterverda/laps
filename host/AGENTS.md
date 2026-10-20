@@ -75,6 +75,10 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 ## Window
 
 - app-id `ru.fpvladder.laps`, title `LAPS`
+- Self-wake in phases without frames: `UI_TICK` (43 ms) —
+  `ctx.request_repaint_after` в мёртвом Idle (клавиатурный дрен),
+  счётчике гонки без картинки, автономном транспорте; egui склеивает
+  повторные вызовы, состояние не нужно
 - Hidden titlebar with window buttons shown, fullsize content view
   (macOS-style chrome on both platforms); draggable top area, dblclick
   maximize are NOT implemented — don't assume
@@ -117,28 +121,48 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   our own crate in dev
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) signaled
   UI-ward via `crossbeam_utils::AtomicCell`
-- **Гоночное ядро** (сервис `service::race`; чистое ядро `RaceCore`,
-  тесты на FakeClock по образцу `Transport`): фазы эфира Before →
-  Countdown → Running → After → Finished; ядро ленивое — рождается
-  первым намерением REC/RACE (`RaceCore::born`, сразу в результате
-  намерения; журнал и ноль меток — от этого момента, файлы называются
-  временем первой записи), жизнь потока = одна сессия REC. REC-off
-  до старта гонки завершает сессию отменой: ядро дропается (журнала
-  на диске нет), GUI возвращается в Idle (`Notice::
-`);
-  REC-off после финиша отдаёт журнал в DVR (`Notice::EnterDvr`;
-  отличие — флаг `raced`). Часы гонки
+- **Гоночное ядро** (сервис `service::race`; чистое ядро `RaceCore` —
+  приватно, тесты на FakeClock по образцу `Transport`): фазы эфира
+  Before → Countdown → Running → After → Finished. `RaceCore::new` =
+  «REC нажали» (журнал и ноль меток — от этого момента, файлы называются
+  временем первой записи); рождение кнопкой RACE — GUI шлёт намерение
+  сразу после `Race::spawn`, оно ждёт поток в очереди. GUI ставит
+  `RaceStage::Before` на кадр рождения, дальше state приезжает
+  `Notice::State` (поток будит UI через `wake` на каждом уведомлении —
+  без этого state зависел бы от кадров камер). Жизнь потока = одна
+  сессия REC. REC-off до старта гонки завершает сессию отменой: ядро
+  дропается (журнала на диске нет), GUI возвращается в Idle
+  (`Notice::BackToIdle`); REC-off после финиша отдаёт журнал в DVR
+  (`Notice::EnterReview`; отличие — флаг `raced`). Часы гонки
   (отсчёт, авто-финиш по лимиту), политика записи (старт/стоп/abort),
-  журнал (события + файл). Намерения (`Intent`: RecPressed/RacePressed/Exit)
-  → решения; решения возвращаются эффектами (`Effect`) — ядро без IO.
-  Поток-обёртка (`service::race::spawn`) исполняет эффекты (команды рекордерам
-  через `Camera::recorder()` — отделённый хэндл, звук), поллит
-  `first_frame_at` и шлёт GUI `Notice::State` (при изменении) /
-  `EnterDvr` / `BackToIdle`. Правила гонки (сигнал старта, отсчёт, длительность) —
+  журнал (события + файл). Единая точка входа ядра —
+  `RaceCore::intent(Intent, now) -> Vec<Effect>`; решения возвращаются
+  эффектами — ядро без IO. Хэндл `Race` — типизированные методы
+  (`rec_pressed()`/`race_pressed()`/`exit()`), общий канал намерений.
+  Поток-обёртка (`Race::spawn`) исполняет эффекты (команды рекордерам
+  через `Camera::recorder()`, звук), крутит event loop
+  (`crossbeam::select!`: намерение / клавиатура / дедлайн ядра) и
+  шлёт GUI `Notice::State` (при изменении) / `EnterReview` /
+  `BackToIdle`. Правила гонки (сигнал старта, отсчёт, длительность) —
   `model::rules` (`RaceRules.duration: Option`, None — без авто-финиша).
-  GUI (`gui/flight.rs`) — только намерения и рендер снапшота
-  `race::Phase`, гоночного стейта не имеет; до старта гонки отжатия
+  GUI (`gui::flight.rs`) — только намерения и рендер снапшота
+  `RaceStage`, гоночного стейта не имеет; до старта гонки отжатия
   шагают назад, после — только вперёд
+- **Клавиатуры** (`driver::keyboard`): `attach(events, id, cfg) ->
+  Result<SharedKeyboardState, AttachError>` — ридер-поток устройства
+  шлёт `KeyPressed` (только фронт нажатия + HID-маска модификаторов;
+  релизы идут только в `ModifierTracker`, маска не застревает) прямо в
+  переданный канал, умирает с устройством, на выходе гасит `connected`
+  в state. Main-клавиатура (`driver::keyboard::egui::MainKeyboard`) —
+  адаптер фокусной клавиатуры egui: физические сканкоды → HID usages
+  (пунктуация layout-зависима — не мапится), шлёт в тот же канал из
+  потока UI. Хаб — голый канал: строится при входе в Idle
+  (`Idle::default` — пустышка для mem::replace), в Live переезжает в
+  гоночный поток (`Race::spawn`, ветка селекта), обратно не
+  возвращается; дисконнект в потоке глушит ветку через
+  `crossbeam::never()` (go-идиома ch = nil) — цикл живёт. Канал жив,
+  пока жив хоть один клон sender'а (ридеры + main). Состояния клавиатур
+  (`keyboard_states`) — у фаз, потребитель (плашки дисконнекта) — дальше
 - Инварианты переходов: `race-started` в журнале всегда с парным
   `race-finished` (лимит, RACE-кнопка, REC-стоп в Running, EXIT из Running);
   записи вне гонки удаляются (abort) на любом пути — REC-off до старта,
@@ -301,9 +325,7 @@ first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
   / --; evdev+sysfs+by-id discovery in `driver/keyboard/linux.rs`, other
   platforms return an empty list until their backend lands);
   `driver::keyboard` itself is unconditional — platform backends live in
-  submodules (linux today, mac later); `debug-keyboards` (temporary,
-  replaced by the doc'd `test-keyboard`) attaches every setup keyboard
-  via `driver::keyboard::open` and prints raw key events; no args → GUI mode
+  submodules (linux today, mac later); no args → GUI mode
 - **Remote control** (`src/remote/mod.rs`): the same binary controls a
   running instance. Invocation: `laps [+pid] +command [tail]` — `+pid`
   (at most one) addresses a specific instance; without it the command

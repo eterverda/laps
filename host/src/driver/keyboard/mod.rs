@@ -368,12 +368,14 @@ impl ModifierTracker {
 #[cfg(target_os = "linux")]
 pub use linux::scan;
 
+#[cfg(not(target_os = "linux"))]
+use std::io::Result as IoResult;
+
 /// Platform stub until a real backend lands: an empty device list.
 #[cfg(not(target_os = "linux"))]
 pub fn scan() -> IoResult<Vec<KeyboardInfo>> {
     Ok(Vec::new())
 }
-
 /// Canonical key name for a HID usage; unknown codes render as "0xNN".
 pub fn keycode_to_str(keycode: u32) -> String {
     match KEY_NAMES.get(keycode as usize).copied().flatten() {

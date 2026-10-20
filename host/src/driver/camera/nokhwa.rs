@@ -9,14 +9,14 @@
 //! (mod.rs) — только контракты из capture.rs.
 
 use super::Error;
-use crate::config::camera::CameraConfig;
+use crate::config::camera::{CameraConfig, PixelConfig};
 use crate::driver::camera::capture::{
     Capture, CaptureFormat, CaptureSession, DeviceInfo, Frame, FrameData, FrameError,
 };
+use nokhwa::NokhwaError;
 use nokhwa::pixel_format::RgbFormat;
 use nokhwa::utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 use std::io::Error as IoError;
-use std::mem;
 use std::time::Instant;
 
 pub struct NokhwaCapture;
@@ -120,7 +120,10 @@ impl CaptureSession for NokhwaSession {
             },
             PixelConfig::Yuyv => FrameData::Yuyv { buf },
         };
-        Ok(Frame { timestamp, data })
+        Ok(Frame {
+            at: timestamp,
+            data,
+        })
     }
 }
 

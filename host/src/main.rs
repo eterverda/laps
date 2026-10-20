@@ -175,7 +175,6 @@ fn main() {
 /// docs/keyboard.md): attach every keyboard configured in the embedded
 /// setup and print each event. All attach failures are listed before
 /// exiting 1; on success the command blocks until killed.
-#[cfg(target_os = "linux")]
 fn debug_keyboards() -> ! {
     let setup: config::setup::Setup = match from_yaml_string(assets::SETUP_YAML) {
         Ok(setup) => setup,
@@ -228,12 +227,6 @@ fn debug_keyboards() -> ! {
         );
     }
     process::exit(0); // all streams ended (devices unplugged)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn debug_keyboards() -> ! {
-    eprintln!("debug-keyboards is not supported on this platform");
-    process::exit(1);
 }
 
 #[cfg(test)]

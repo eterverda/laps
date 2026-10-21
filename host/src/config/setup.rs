@@ -56,7 +56,6 @@ impl ColorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::keyboard::KeyboardMode;
     use serde_yaml::from_str as from_yaml_string;
 
     const CAMERAS: &str = "cameras:\n  camera-1:\n    name: C7-1\n    resolution: 1920x1080\n    frame-rate: 30fps\n    format: mjpeg\n";
@@ -84,8 +83,10 @@ mod tests {
         assert!(setup.keyboards.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_keyboards_load() {
+        use crate::config::keyboard::KeyboardMode;
         let setup: Setup = from_yaml_string(&format!(
             "{CAMERAS}{PADS}keyboards:\n  pad-1:\n    name: RED\n    vid: 0x8089\n    mode: grab\n"
         ))

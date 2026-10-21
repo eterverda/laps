@@ -6,20 +6,22 @@
 use crate::driver::keyboard::{KeyboardInfo, keycode_from_str, keycode_to_str};
 use std::fmt::{Formatter, Result as FmtResult};
 
-/// How the driver attaches the device. Grab is exclusive (the system
-/// and other apps see nothing); listen is passive. Serialized lowercase
-/// (`mode: grab`). Required — a missing mode is an error, never a
-/// default: no silent grab.
+/// How the driver attaches the device. Sniff is passive. Grab is
+/// exclusive (the system and other apps see nothing) and Linux-only:
+/// no other platform has an equivalent of EVIOCGRAB, so the variant
+/// does not exist elsewhere. Serialized lowercase (`mode: grab`).
+/// Required — a missing mode is an error, never a default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyboardMode {
-    Listen,
+    Sniff,
+    #[cfg(target_os = "linux")]
     Grab,
 }
 
 impl Default for KeyboardMode {
     fn default() -> Self {
-        KeyboardMode::Listen
+        KeyboardMode::Sniff
     }
 }
 
@@ -196,22 +198,25 @@ mod tests {
 
     #[test]
     fn test_deserialize() {
-        let kb: KeyboardConfig = from_yaml_string(
-            "name: RED\nvid: 0x8089\npid: 0x000c\nserial: 03CDAB114071BC4FA8FFFFFFFF00\nmode: grab\n",
-        )
-        .unwrap();
-        assert_eq!(kb.name.as_deref(), Some("RED"));
-        assert_eq!(kb.vid, Some(0x8089));
-        assert_eq!(kb.pid, Some(0x000c));
-        assert_eq!(kb.serial.as_deref(), Some("03CDAB114071BC4FA8FFFFFFFF00"));
-        assert_eq!(kb.mode, KeyboardMode::Grab);
-        let kb: KeyboardConfig = from_yaml_string("name: RED\nmode: listen\n").unwrap();
-        assert_eq!(kb.mode, KeyboardMode::Listen);
+        #[cfg(target_os = "linux")]
+        {
+            let kb: KeyboardConfig = from_yaml_string(
+                "name: RED\nvid: 0x8089\npid: 0x000c\nserial: 03CDAB114071BC4FA8FFFFFFFF00\nmode: grab\n",
+            )
+            .unwrap();
+            assert_eq!(kb.name.as_deref(), Some("RED"));
+            assert_eq!(kb.vid, Some(0x8089));
+            assert_eq!(kb.pid, Some(0x000c));
+            assert_eq!(kb.serial.as_deref(), Some("03CDAB114071BC4FA8FFFFFFFF00"));
+            assert_eq!(kb.mode, KeyboardMode::Grab);
+        }
+        let kb: KeyboardConfig = from_yaml_string("name: RED\nmode: sniff\n").unwrap();
+        assert_eq!(kb.mode, KeyboardMode::Sniff);
     }
 
     #[test]
     fn test_serialize_hex_is_0x_prefixed() {
-        let kb: KeyboardConfig = from_yaml_string("vid: 0x8089\nmode: listen\n").unwrap();
+        let kb: KeyboardConfig = from_yaml_string("vid: 0x8089\nmode: sniff\n").unwrap();
         let yaml = to_yaml_string(&kb).unwrap();
         // The exact spelling of the hex scalar on output is the
         // emitter's call (it may quote the string to keep round-trip
@@ -224,23 +229,23 @@ mod tests {
         // Quoted input is accepted: serde_yaml quotes 0x-looking strings
         // on output to keep types stable, and our own serialization must
         // parse back.
-        let kb: KeyboardConfig = from_yaml_string("vid: \"0x8089\"\nmode: listen\n").unwrap();
+        let kb: KeyboardConfig = from_yaml_string("vid: \"0x8089\"\nmode: sniff\n").unwrap();
         assert_eq!(kb.vid, Some(0x8089));
         // Non-0x strings are errors.
-        assert!(from_yaml_string::<KeyboardConfig>("vid: \"000c\"\nmode: listen\n").is_err());
+        assert!(from_yaml_string::<KeyboardConfig>("vid: \"000c\"\nmode: sniff\n").is_err());
     }
 
     #[test]
     fn test_bare_number_is_decimal() {
         // A bare scalar arrives as an already-parsed integer; without
         // the 0x prefix there is no hex to speak of.
-        let kb: KeyboardConfig = from_yaml_string("vid: 8089\nmode: listen\n").unwrap();
+        let kb: KeyboardConfig = from_yaml_string("vid: 8089\nmode: sniff\n").unwrap();
         assert_eq!(kb.vid, Some(8089));
     }
 
     #[test]
     fn test_deserialize_empty() {
-        let kb: KeyboardConfig = from_yaml_string("name: RED\nmode: listen\n").unwrap();
+        let kb: KeyboardConfig = from_yaml_string("name: RED\nmode: sniff\n").unwrap();
         assert_eq!(kb.vid, None);
     }
 
@@ -248,7 +253,7 @@ mod tests {
     fn test_mode_is_required() {
         // No silent default from the file side: a keyboard entry without
         // `mode` is an error (the enum Default exists only for
-        // programmatic `KeyboardConfig::default()`, and it is Listen).
+        // programmatic `KeyboardConfig::default()`, and it is Sniff).
         assert!(from_yaml_string::<KeyboardConfig>("name: RED\n").is_err());
     }
 
@@ -305,12 +310,13 @@ mod tests {
 
         #[test]
         fn name_is_case_insensitive_substring() {
-            let cfg: KeyboardConfig = from_yaml_string("name: red\nmode: listen\n").unwrap();
+            let cfg: KeyboardConfig = from_yaml_string("name: red\nmode: sniff\n").unwrap();
             assert!(cfg.matches(&info("SayoDevice RED", 0x8089, 0x000c, None)));
             assert!(cfg.matches(&info("sayoDevice red", 0x8089, 0x000c, None)));
             assert!(!cfg.matches(&info("SayoDevice BLUE", 0x8089, 0x000c, None)));
         }
 
+        #[cfg(target_os = "linux")]
         #[test]
         fn exact_fields_when_set() {
             let cfg: KeyboardConfig =
@@ -320,7 +326,7 @@ mod tests {
             assert!(!cfg.matches(&info("SayoDevice 2x3B", 0x8089, 0x0008, None)));
             // Serial distinguishes two keyboards with the same vid:pid.
             let cfg: KeyboardConfig = from_yaml_string(
-                "vid: 0x8089\nserial: 03CDAB114071BC4FA8FFFFFFFF00\nmode: listen\n",
+                "vid: 0x8089\nserial: 03CDAB114071BC4FA8FFFFFFFF00\nmode: sniff\n",
             )
             .unwrap();
             assert!(cfg.matches(&info(

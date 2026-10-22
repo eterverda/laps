@@ -11,8 +11,9 @@ use crate::driver::audio::Audio;
 use crate::driver::camera::Camera;
 use crate::driver::camera::CaptureState;
 use crate::driver::dvr::{CAPTURES_DIR, RecordState};
-use crate::driver::keyboard::egui::MainKeyboard;
-use crate::driver::keyboard::{KeyPressed, SharedKeyboardState, attach};
+#[cfg(target_os = "linux")]
+use crate::driver::keyboard::ExclusiveKeyboard;
+use crate::driver::keyboard::{KeyPressed, Keyboard, combo};
 use crate::driver::player::{Player, PlayerState};
 use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::gui::scrub::{
@@ -84,12 +85,13 @@ struct Idle {
     /// Main-клавиатура (фокусная, из egui) и канал клавиатур сетапа.
     /// Живут с фазой: при Idle → Live уезжают в Race; новые строятся
     /// при каждом входе в Idle (старые в Race не возвращаются).
-    main_keyboard: MainKeyboard,
+    main_keyboard: Keyboard,
     keyboard_rx: crossbeam::Receiver<KeyPressed>,
     /// Состояния подцепленных клавиатур (connected): опрос — у GUI,
     /// плашки дисконнекта — дальше.
     #[allow(dead_code)]
-    keyboard_states: HashMap<String, SharedKeyboardState>,
+    #[cfg(target_os = "linux")]
+    exclusive_keyboards: HashMap<String, ExclusiveKeyboard>,
 }
 
 impl Default for Idle {
@@ -99,9 +101,10 @@ impl Default for Idle {
         let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
         Self {
             webcams: HashMap::new(),
-            main_keyboard: MainKeyboard::new(&keyboard_tx),
+            main_keyboard: Keyboard::new(&keyboard_tx),
             keyboard_rx,
-            keyboard_states: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            exclusive_keyboards: HashMap::new(),
         }
     }
 }
@@ -118,10 +121,11 @@ struct Live {
     rules: RaceRules,
     webcams: HashMap<String, Camera>,
     /// Main-клавиатура: уехала сюда из Idle вместе с каналом клавиатур.
-    main_keyboard: MainKeyboard,
+    main_keyboard: Keyboard,
     /// Состояния клавиатур — вместе с main из Idle.
     #[allow(dead_code)]
-    keyboard_states: HashMap<String, SharedKeyboardState>,
+    #[cfg(target_os = "linux")]
+    exclusive_keyboards: HashMap<String, ExclusiveKeyboard>,
     /// Подавление сна: держится ради Drop (inhibit снимается при
     /// разрушении), чтений нет.
     #[allow(dead_code)]
@@ -290,8 +294,9 @@ impl Flight {
         }
         log::info!("flight: webcams starting: {}", webcams.len());
         let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
-        let keyboard_states = attach_keyboards(&setup, &keyboard_tx);
-        let main = MainKeyboard::new(&keyboard_tx);
+        #[cfg(target_os = "linux")]
+        let exclusive_keyboards = attach_exclusive_keyboards(&setup, &keyboard_tx);
+        let main = Keyboard::new(&keyboard_tx);
         Self {
             setup,
             assignments,
@@ -306,7 +311,9 @@ impl Flight {
                 webcams,
                 main_keyboard: main,
                 keyboard_rx,
-                keyboard_states,
+                #[cfg(target_os = "linux")]
+                #[cfg(target_os = "linux")]
+                exclusive_keyboards,
             }),
         }
     }
@@ -364,7 +371,8 @@ impl Flight {
             rules: self.rules,
             webcams: idle.webcams,
             main_keyboard: idle.main_keyboard,
-            keyboard_states: idle.keyboard_states,
+            #[cfg(target_os = "linux")]
+            exclusive_keyboards: idle.exclusive_keyboards,
             awake,
         });
     }
@@ -380,13 +388,15 @@ impl Flight {
             unreachable!()
         };
         let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
-        let keyboard_states = attach_keyboards(&self.setup, &keyboard_tx);
-        let main = MainKeyboard::new(&keyboard_tx);
+        #[cfg(target_os = "linux")]
+        let exclusive_keyboards = attach_exclusive_keyboards(&self.setup, &keyboard_tx);
+        let main = Keyboard::new(&keyboard_tx);
         self.phase = Mode::Idle(Idle {
             webcams: live.webcams,
             main_keyboard: main,
             keyboard_rx,
-            keyboard_states,
+            #[cfg(target_os = "linux")]
+            exclusive_keyboards,
         });
     }
 
@@ -677,6 +687,15 @@ impl Flight {
         // логируются; в Live канал уехал в Race, там его дренит поток.
         while let Ok(event) = i.keyboard_rx.try_recv() {
             log::info!("keyboard: {event}");
+            // Матчинг по биндингам сетапа: сматчившийся аккорд и его
+            // action в лог. Код намеренно не обобщён с Live-дрейном.
+            for (pad_id, pad) in &setup.pads {
+                for bind in &pad.keybinds {
+                    if bind.matches(&event) {
+                        log::info!("keybind: {pad_id} {} -> {}", combo(&bind.keys), bind.action);
+                    }
+                }
+            }
         }
         // Клавиатурный дрен выше живёт на этом счётчике, пока эфир
         // мёртв (живой — кадры гонят перерисовки сами).
@@ -1800,21 +1819,22 @@ impl Review {
 /// Возвращает true, если состояние могло измениться, — caller просит
 /// перерисовку.
 /// Аттач клавиатур сетапа в канал: warn на каждую неподцепленную,
+#[cfg(target_os = "linux")]
 /// состояния (connected) — вызывающему.
-fn attach_keyboards(
+fn attach_exclusive_keyboards(
     setup: &Setup,
     tx: &crossbeam::Sender<KeyPressed>,
-) -> HashMap<String, SharedKeyboardState> {
-    let mut states = HashMap::new();
-    for (id, cfg) in &setup.keyboards {
-        match attach(tx.clone(), id, cfg) {
-            Ok(state) => {
-                states.insert(id.clone(), state);
+) -> HashMap<String, ExclusiveKeyboard> {
+    let mut keyboards = HashMap::new();
+    for (id, cfg) in &setup.exclusive_keyboards {
+        match ExclusiveKeyboard::new(tx, id, cfg) {
+            Ok(keyboard) => {
+                keyboards.insert(id.clone(), keyboard);
             }
-            Err(e) => log::warn!("keyboard {id}: attach failed: {e}"),
+            Err(e) => log::warn!("exclusive keyboard {id}: attach failed: {e}"),
         }
     }
-    states
+    keyboards
 }
 
 /// Срез камер активных падов (дедуп по camera_id): захваты открываются

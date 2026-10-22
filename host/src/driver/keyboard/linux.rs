@@ -1,22 +1,25 @@
-//! Keyboard discovery over evdev/sysfs (Linux). A device is a keyboard
-//! when it supplies key presses our driver can consume (EV_KEY): either
-//! it declares a HID Keyboard collection (a `-event-kbd` by-id symlink
-//! without `if01`) or it is the built-in serio (AT) keyboard with
-//! keycodes in the keyboard range. Mice, touchpads, buttons and hotkey
-//! handlers are excluded even if they carry a few key bits. No
-//! dependencies beyond std::fs: identification reads
-//! `/sys/class/input/eventN/device/` (name, id/vendor, id/product, uniq,
-//! id/bustype, capabilities/key) plus by-id symlinks in /dev/input.
-//! EVIOCGRAB is never issued here — access is probed
-//! by a plain open/close of the node.
+//! Keyboard driver (Linux): discovery and attach of external keyboards over
+//! evdev/sysfs. A device is a keyboard when it supplies key presses our
+//! driver can consume (EV_KEY): either it declares a HID Keyboard
+//! collection (a `-event-kbd` by-id symlink without `if01`) or it is the
+//! built-in serio (AT) keyboard with keycodes in the keyboard range.
+//! Mice, touchpads, buttons and hotkey handlers are excluded even if
+//! they carry a few key bits. No dependencies beyond std::fs:
+//! identification reads `/sys/class/input/eventN/device/` (name,
+//! id/vendor, id/product, uniq, id/bustype, capabilities/key) plus
+//! by-id symlinks in /dev/input. EVIOCGRAB is never issued here —
+//! access is probed by a plain open/close of the node.
+//!
+//! Device backend of the `keyboard` driver (the egui focus keyboard
+//! lives in the parent module); shares `KeyPressed` with it.
 
-use super::{
-    AttachError, KeyPressed, KeyboardInfo, KeyboardState, ModifierTracker, SharedKeyboardState,
-};
-use crate::config::keyboard::{KeyboardConfig, KeyboardMode};
+use super::KeyPressed;
+use crate::config::keyboard::ExclusiveKeyboardConfig;
 use crossbeam_channel as crossbeam;
+use crossbeam_utils::atomic::AtomicCell;
 use std::collections::HashSet;
 use std::ffi::CString;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::fs;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
@@ -33,23 +36,302 @@ use std::time::Instant;
 // is tied to the fd — closing it (thread end, process death) releases.
 nix::ioctl_write_int!(eviocgrab, b'E', 0x90);
 
-/// A discovered keyboard plus its evdev node path. `KeyboardInfo` is
-/// platform-neutral and deliberately carries no path; attach needs it.
-struct Device {
-    info: KeyboardInfo,
-    node: PathBuf,
+/// An exclusive keyboard: a grabbed (EVIOCGRAB) device streaming
+/// presses into the shared channel from a reader thread. Owned by
+/// the screen (like `Keyboard` in the GUI air): lives while the
+/// screen does; dropping the handle stops the reader by disconnecting
+/// the receiver.
+pub struct ExclusiveKeyboard {
+    /// Reader liveness.
+    #[allow(dead_code)] // the keyboard-status screen will read this
+    state: SharedExclusiveKeyboardState,
 }
 
-/// Enumerate keyboards: event nodes in /dev/input passing
-/// `is_keyboard_node`, sorted by `sort_key`. Devices that vanish
-/// mid-scan are skipped.
-pub fn scan() -> IoResult<Vec<KeyboardInfo>> {
-    Ok(scan_devices()?.into_iter().map(|d| d.info).collect())
+impl ExclusiveKeyboard {
+    /// Discovered exclusive keyboards: the event nodes in
+    /// /dev/input passing `is_keyboard_node`, sorted by `sort_key`.
+    /// Devices vanishing mid-scan are skipped.
+    pub fn list() -> IoResult<Vec<ExclusiveKeyboardInfo>> {
+        Ok(scan_devices()?.into_iter().map(|d| d.info).collect())
+    }
+
+    /// Attach one configured keyboard: open the matched device and
+    /// stream its events into `events` from a reader thread (one
+    /// thread per device, lives while the device and the receiver
+    /// do). EVIOCGRAB is released by the fd close in the reader.
+    pub fn new(
+        events: &crossbeam::Sender<KeyPressed>,
+        id: &str,
+        cfg: &ExclusiveKeyboardConfig,
+    ) -> Result<Self, AttachError> {
+        let state = attach(events.clone(), id, cfg)?;
+        Ok(Self { state })
+    }
+
+    /// Connection state: connected while the reader thread is alive.
+    #[allow(dead_code)] // the keyboard-status screen will read this
+    pub fn state(&self) -> &SharedExclusiveKeyboardState {
+        &self.state
+    }
 }
 
 /// One device: sysfs identity + node path. Returns None when the
 /// mandatory reads fail or the node is not a keyboard by
 /// `is_keyboard_node`.
+/// A discovered exclusive keyboard. Identity fields mirror the matcher
+/// of `ExclusiveKeyboardConfig` (name substring, exact vid/pid/serial).
+/// No Eq/Ord: matching a config entry is a filter, not equality, and
+/// the only ordering need is the deterministic listing (a plain sort
+/// key in `scan`).
+#[derive(Debug, Clone)]
+pub struct ExclusiveKeyboardInfo {
+    pub name: String,
+    pub vid: u16,
+    pub pid: u16,
+    pub serial: Option<String>,
+}
+
+impl ExclusiveKeyboardInfo {
+    /// Mirror of `CameraConfig::matches` (inverted ownership: the
+    /// candidate tests itself against the filter): name is a
+    /// case-insensitive substring, vid/pid/serial are exact when set.
+    /// Requires at least one criterion — an empty config matches
+    /// nothing.
+    pub fn matches(&self, cfg: &ExclusiveKeyboardConfig) -> bool {
+        let has_criterion =
+            cfg.name.is_some() || cfg.vid.is_some() || cfg.pid.is_some() || cfg.serial.is_some();
+        if !has_criterion {
+            return false;
+        }
+        let name_ok = cfg
+            .name
+            .as_ref()
+            .is_none_or(|n| self.name.to_lowercase().contains(&n.to_lowercase()));
+        let vid_ok = cfg.vid.is_none_or(|v| v == self.vid);
+        let pid_ok = cfg.pid.is_none_or(|p| p == self.pid);
+        let serial_ok = cfg
+            .serial
+            .as_ref()
+            .is_none_or(|s| self.serial.as_deref() == Some(s.as_str()));
+        name_ok && vid_ok && pid_ok && serial_ok
+    }
+}
+
+/// Why attaching one configured keyboard failed. Per-device: one
+/// keyboard failing does not affect the others.
+#[derive(Debug)]
+pub enum AttachError {
+    /// The filter matched no discovered keyboard.
+    NoMatch,
+    /// The filter matched more than one; the list is the candidates.
+    AmbiguousMatch(Vec<ExclusiveKeyboardInfo>),
+    /// Open or EVIOCGRAB failed (permissions, busy, gone mid-way).
+    /// Attach is grab-only: no fallback, a failure fails the keyboard.
+    Io(IoError),
+}
+
+impl Display for AttachError {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            AttachError::NoMatch => write!(f, "no keyboard matches the filter"),
+            AttachError::AmbiguousMatch(candidates) => {
+                write!(f, "filter matches {} keyboards:", candidates.len())?;
+                for c in candidates {
+                    write!(f, " {} ({:04x}:{:04x}", c.name, c.vid, c.pid)?;
+                    if let Some(s) = &c.serial {
+                        write!(f, ", {s}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            AttachError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for AttachError {}
+
+/// Keyboard state: `connected` — the reader thread is alive (the
+/// device is in place); cleared by the reader on exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExclusiveKeyboardState {
+    pub connected: bool,
+}
+
+impl Default for ExclusiveKeyboardState {
+    fn default() -> Self {
+        Self { connected: true }
+    }
+}
+
+/// The keyboard state handle, shared by the reader and the GUI.
+pub type SharedExclusiveKeyboardState = Arc<AtomicCell<ExclusiveKeyboardState>>;
+
+/// Attach one configured keyboard: open the matched device and stream
+/// its events into `events` from a reader thread (one thread per
+/// device, lives while the device and the receiver do).
+fn attach(
+    events: crossbeam::Sender<KeyPressed>,
+    id: &str,
+    cfg: &ExclusiveKeyboardConfig,
+) -> Result<SharedExclusiveKeyboardState, AttachError> {
+    let devices = scan_devices().map_err(AttachError::Io)?;
+    let matched: Vec<&Device> = devices.iter().filter(|d| d.info.matches(cfg)).collect();
+    let device = match matched.len() {
+        0 => return Err(AttachError::NoMatch),
+        1 => matched[0],
+        _ => {
+            return Err(AttachError::AmbiguousMatch(
+                matched.into_iter().map(|d| d.info.clone()).collect(),
+            ));
+        }
+    };
+    // Attach is always a grab: EVIOCGRAB needs the node opened
+    // O_RDWR. A failed open/grab fails the keyboard — no fallback.
+    let fd = open_node(&device.node, libc::O_RDWR).map_err(AttachError::Io)?;
+    if unsafe { eviocgrab(fd, 1) }.is_err() {
+        let err = IoError::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(AttachError::Io(err));
+    }
+    let exclusive_keyboard_id = id.to_owned();
+    let state: SharedExclusiveKeyboardState = Arc::default();
+    let thread_state = state.clone();
+    thread::spawn(move || read_events(fd, exclusive_keyboard_id, events, thread_state));
+    Ok(state)
+}
+
+fn open_node(path: &Path, flags: libc::c_int) -> IoResult<RawFd> {
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| IoError::new(IoErrorKind::InvalidInput, "node path with NUL"))?;
+    let fd = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC) };
+    if fd == -1 {
+        Err(IoError::last_os_error())
+    } else {
+        Ok(fd)
+    }
+}
+
+/// Reader thread body: blocking reads on the node fd, decoded events
+/// pushed into the channel. EINTR retries; any other read error
+/// (ENODEV on unplug, EIO) ends the stream — the fd close also releases
+/// the grab, and the dropped sender disconnects the receiver.
+fn read_events(
+    fd: RawFd,
+    exclusive_keyboard_id: String,
+    tx: crossbeam_channel::Sender<KeyPressed>,
+    state: SharedExclusiveKeyboardState,
+) {
+    let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
+    let mut buf = [0u8; INPUT_EVENT_SIZE * 64];
+    let mut tail = 0usize;
+    'read: loop {
+        let n = unsafe { libc::read(fd, buf[tail..].as_mut_ptr().cast(), buf.len() - tail) };
+        if n == 0 {
+            break;
+        }
+        if n < 0 {
+            let err = IoError::last_os_error();
+            if err.kind() == IoErrorKind::Interrupted {
+                continue;
+            }
+            log::debug!("keyboard {exclusive_keyboard_id}: read ended: {err}");
+            break;
+        }
+        let filled = tail + n as usize;
+        let complete = filled / INPUT_EVENT_SIZE * INPUT_EVENT_SIZE;
+        for event in decode(&buf[..complete], &mut pressed, &exclusive_keyboard_id) {
+            if tx.send(event).is_err() {
+                break 'read; // receiver gone
+            }
+        }
+        buf.copy_within(complete..filled, 0);
+        tail = filled - complete;
+    }
+    unsafe { libc::close(fd) };
+    // The reader ended — the device is gone (or the receiver left):
+    // the state is cleared on every exit.
+    state.store(ExclusiveKeyboardState { connected: false });
+}
+
+/// Decode raw `input_event` bytes (a multiple of 24) into KeyEvents.
+/// Only EV_KEY is consumed: value 0/1 map to Release/Press, autorepeat
+/// (value 2) is dropped, other event types (MSC_SCAN and friends) are
+/// ignored. Unmapped codes are skipped with a warning. `pressed` —
+/// the set of all held keys: a front inserts, a release removes;
+/// each event carries a snapshot of the set.
+fn decode(
+    buf: &[u8],
+    pressed: &mut fixedbitset::FixedBitSet,
+    exclusive_keyboard_id: &str,
+) -> Vec<KeyPressed> {
+    debug_assert_eq!(buf.len() % INPUT_EVENT_SIZE, 0);
+    let mut events = Vec::new();
+    for chunk in buf.as_chunks::<INPUT_EVENT_SIZE>().0 {
+        let kind = u16::from_le_bytes([chunk[16], chunk[17]]);
+        if kind != EV_KEY {
+            continue;
+        }
+        let code = u16::from_le_bytes([chunk[18], chunk[19]]);
+        let value = i32::from_le_bytes([chunk[20], chunk[21], chunk[22], chunk[23]]);
+        let press = match value {
+            1 => true,
+            0 => false,
+            _ => continue, // autorepeat — filtered by the driver
+        };
+        let Some(usage) = EVDEV_TO_HID[code as usize] else {
+            log::warn!(
+                "keyboard {exclusive_keyboard_id}: unmapped evdev code {code}, event skipped"
+            );
+            continue;
+        };
+        if press {
+            pressed.insert(usage as usize);
+            events.push(KeyPressed {
+                exclusive_keyboard_id: Some(exclusive_keyboard_id.to_owned()),
+                keys: pressed.clone(),
+                at: Instant::now(),
+            });
+        } else {
+            pressed.remove(usage as usize);
+        }
+    }
+    events
+}
+
+/// sysfs id/bustype value of the serio bus (built-in AT keyboard).
+/// Deterministic listing order: vid, pid, serial, name. Two keyboards
+/// equal in all four are indistinguishable — no further ordering.
+fn sort_key(k: &ExclusiveKeyboardInfo) -> (u16, u16, &Option<String>, &String) {
+    (k.vid, k.pid, &k.serial, &k.name)
+}
+
+/// Enumerate keyboard devices (info + node path), sorted by `sort_key`.
+fn scan_devices() -> IoResult<Vec<Device>> {
+    let mut devices = Vec::new();
+    let kbd_by_id = kbd_nodes_by_id();
+    for entry in fs::read_dir("/dev/input")? {
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let sys = Path::new("/sys/class/input").join(&name).join("device");
+        if let Some(device) = read_device(&sys, entry.path(), kbd_by_id.contains(&name)) {
+            devices.push(device);
+        }
+    }
+    devices.sort_by(|a, b| sort_key(&a.info).cmp(&sort_key(&b.info)));
+    Ok(devices)
+}
+
+/// A discovered keyboard plus its evdev node path. `ExclusiveKeyboardInfo` is
+/// platform-neutral and deliberately carries no path; attach needs it.
+struct Device {
+    info: ExclusiveKeyboardInfo,
+    node: PathBuf,
+}
+
 fn read_device(sys: &Path, node: PathBuf, has_kbd_by_id: bool) -> Option<Device> {
     let name = fs::read_to_string(sys.join("name")).ok()?;
     let vid = parse_hex(&fs::read_to_string(sys.join("id/vendor")).ok()?)?;
@@ -63,15 +345,12 @@ fn read_device(sys: &Path, node: PathBuf, has_kbd_by_id: bool) -> Option<Device>
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
-    let (listenable, grabbable) = probe(&node);
     Some(Device {
-        info: KeyboardInfo {
+        info: ExclusiveKeyboardInfo {
             name: name.trim().to_owned(),
             vid,
             pid,
             serial,
-            listenable,
-            grabbable,
         },
         node,
     })
@@ -79,6 +358,58 @@ fn read_device(sys: &Path, node: PathBuf, has_kbd_by_id: bool) -> Option<Device>
 
 fn parse_hex(s: &str) -> Option<u16> {
     u16::from_str_radix(s.trim(), 16).ok()
+}
+
+const BUS_SERIO: u16 = 0x0011;
+
+/// Show decision for an event node: a qualifying `-event-kbd` by-id
+/// symlink (HID Keyboard collection, `if01`-less) is sufficient on its
+/// own — this is what lets USB pedals/macro pads in and keeps mice and
+/// touchpads (mouse collections or no by-id) out. The fallback is the
+/// serio path: the built-in AT keyboard has no by-id but keycodes in
+/// the keyboard range.
+fn is_keyboard_node(has_kbd_by_id: bool, bustype: u16, keyboard_keys: bool) -> bool {
+    has_kbd_by_id || (bustype == BUS_SERIO && keyboard_keys)
+}
+
+/// Event node names (`eventN`) that have at least one by-id symlink
+/// ending in `-event-kbd` without `if01`. Missing by-id dir means an
+/// empty set (the serio fallback still covers the AT keyboard).
+fn kbd_nodes_by_id() -> HashSet<String> {
+    let mut nodes = HashSet::new();
+    let Ok(entries) = fs::read_dir("/dev/input/by-id") else {
+        return nodes;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(link) = name.to_str() else { continue };
+        if !link.ends_with("-event-kbd") || link.contains("if01") {
+            continue;
+        }
+        if let Ok(target) = fs::read_link(entry.path()) {
+            if let Some(node) = target.file_name().and_then(|n| n.to_str()) {
+                nodes.insert(node.to_owned());
+            }
+        }
+    }
+    nodes
+}
+
+/// sysfs capabilities/key is a hex bitmask, one u64 word (kernel
+/// unsigned long) per 64 keycodes, least significant bit first. A
+/// device counts as a keyboard if any bit in the keyboard keycode range
+/// 1..=0xE7 (KEY_ESC..=KEY_MICMUTE) is set; keycode 0 (KEY_RESERVED)
+/// does not count.
+fn has_keyboard_keys(caps: &str) -> bool {
+    caps.split_whitespace().enumerate().any(|(word, hex)| {
+        let bits = u64::from_str_radix(hex, 16).unwrap_or(0);
+        (0..64).any(|bit| {
+            bits & (1 << bit) != 0 && {
+                let code = word * 64 + bit;
+                (1..=0xE7).contains(&code)
+            }
+        })
+    })
 }
 
 /// Wire size of one `struct input_event` on x86_64 (16-byte timeval +
@@ -361,222 +692,6 @@ const EVDEV_TO_HID: [Option<u8>; 256] = [
     None,
 ];
 
-/// Attach one configured keyboard: open the matched device and stream
-/// its events into `events` from a reader thread (one thread per
-/// device, lives while the device and the receiver do).
-pub fn attach(
-    events: crossbeam::Sender<KeyPressed>,
-    id: &str,
-    cfg: &KeyboardConfig,
-) -> Result<SharedKeyboardState, AttachError> {
-    let devices = scan_devices().map_err(AttachError::Io)?;
-    let matched: Vec<&Device> = devices.iter().filter(|d| cfg.matches(&d.info)).collect();
-    let device = match matched.len() {
-        0 => return Err(AttachError::NoMatch),
-        1 => matched[0],
-        _ => {
-            return Err(AttachError::Ambiguous(
-                matched.into_iter().map(|d| d.info.clone()).collect(),
-            ));
-        }
-    };
-    let grab = matches!(cfg.mode, KeyboardMode::Grab);
-    if grab && !device.info.grabbable {
-        return Err(AttachError::ModeUnsupported);
-    }
-    let fd = open_node(
-        &device.node,
-        if grab { libc::O_RDWR } else { libc::O_RDONLY },
-    )
-    .map_err(AttachError::Io)?;
-    if grab && unsafe { eviocgrab(fd, 1) }.is_err() {
-        let err = IoError::last_os_error();
-        unsafe { libc::close(fd) };
-        return Err(AttachError::Io(err));
-    }
-    let keyboard_id = id.to_owned();
-    let state: SharedKeyboardState = Arc::default();
-    let thread_state = state.clone();
-    thread::spawn(move || read_events(fd, keyboard_id, events, thread_state));
-    Ok(state)
-}
-
-fn open_node(path: &Path, flags: libc::c_int) -> IoResult<RawFd> {
-    let cpath = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| IoError::new(IoErrorKind::InvalidInput, "node path with NUL"))?;
-    let fd = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC) };
-    if fd == -1 {
-        Err(IoError::last_os_error())
-    } else {
-        Ok(fd)
-    }
-}
-
-/// Reader thread body: blocking reads on the node fd, decoded events
-/// pushed into the channel. EINTR retries; any other read error
-/// (ENODEV on unplug, EIO) ends the stream — the fd close also releases
-/// the grab, and the dropped sender disconnects the receiver.
-fn read_events(
-    fd: RawFd,
-    keyboard_id: String,
-    tx: crossbeam_channel::Sender<KeyPressed>,
-    state: SharedKeyboardState,
-) {
-    let mut tracker = ModifierTracker::default();
-    let mut buf = [0u8; INPUT_EVENT_SIZE * 64];
-    let mut tail = 0usize;
-    'read: loop {
-        let n = unsafe { libc::read(fd, buf[tail..].as_mut_ptr().cast(), buf.len() - tail) };
-        if n == 0 {
-            break;
-        }
-        if n < 0 {
-            let err = IoError::last_os_error();
-            if err.kind() == IoErrorKind::Interrupted {
-                continue;
-            }
-            log::debug!("keyboard {keyboard_id}: read ended: {err}");
-            break;
-        }
-        let filled = tail + n as usize;
-        let complete = filled / INPUT_EVENT_SIZE * INPUT_EVENT_SIZE;
-        for event in decode(&buf[..complete], &mut tracker, &keyboard_id) {
-            if tx.send(event).is_err() {
-                break 'read; // receiver gone
-            }
-        }
-        buf.copy_within(complete..filled, 0);
-        tail = filled - complete;
-    }
-    unsafe { libc::close(fd) };
-    // Поток-ридер завершился — устройство отвалилось (или получатель
-    // ушёл): состояние гасим по любому выходу.
-    state.store(KeyboardState { connected: false });
-}
-
-/// Decode raw `input_event` bytes (a multiple of 24) into KeyEvents.
-/// Only EV_KEY is consumed: value 0/1 map to Release/Press, autorepeat
-/// (value 2) is dropped, other event types (MSC_SCAN and friends) are
-/// ignored. Unmapped codes are skipped with a warning.
-fn decode(buf: &[u8], tracker: &mut ModifierTracker, keyboard_id: &str) -> Vec<KeyPressed> {
-    debug_assert_eq!(buf.len() % INPUT_EVENT_SIZE, 0);
-    let mut events = Vec::new();
-    for chunk in buf.as_chunks::<INPUT_EVENT_SIZE>().0 {
-        let kind = u16::from_le_bytes([chunk[16], chunk[17]]);
-        if kind != EV_KEY {
-            continue;
-        }
-        let code = u16::from_le_bytes([chunk[18], chunk[19]]);
-        let value = i32::from_le_bytes([chunk[20], chunk[21], chunk[22], chunk[23]]);
-        let pressed = match value {
-            1 => true,
-            0 => false,
-            _ => continue, // autorepeat — filtered by the driver
-        };
-        let Some(usage) = EVDEV_TO_HID[code as usize] else {
-            log::warn!("keyboard {keyboard_id}: unmapped evdev code {code}, event skipped");
-            continue;
-        };
-        // Релизы только в трекер (маска не застревает), в канал — фронт.
-        let modifiers = tracker.apply(usage as u32, pressed);
-        if pressed {
-            events.push(KeyPressed {
-                keyboard_id: keyboard_id.to_owned(),
-                modifiers,
-                keycode: usage as u32,
-                at: Instant::now(),
-            });
-        }
-    }
-    events
-}
-
-/// Probe the node: open read, then write (no create/truncate), close
-/// immediately. Returns (listenable, grabbable). EVIOCGRAB is never
-/// issued.
-pub fn probe(node: &Path) -> (bool, bool) {
-    let listenable = fs::OpenOptions::new().read(true).open(node).is_ok();
-    let grabbable = fs::OpenOptions::new().write(true).open(node).is_ok();
-    (listenable, grabbable)
-}
-
-/// sysfs id/bustype value of the serio bus (built-in AT keyboard).
-const BUS_SERIO: u16 = 0x0011;
-
-/// Show decision for an event node: a qualifying `-event-kbd` by-id
-/// symlink (HID Keyboard collection, `if01`-less) is sufficient on its
-/// own — this is what lets USB pedals/macro pads in and keeps mice and
-/// touchpads (mouse collections or no by-id) out. The fallback is the
-/// serio path: the built-in AT keyboard has no by-id but keycodes in
-/// the keyboard range.
-fn is_keyboard_node(has_kbd_by_id: bool, bustype: u16, keyboard_keys: bool) -> bool {
-    has_kbd_by_id || (bustype == BUS_SERIO && keyboard_keys)
-}
-
-/// Event node names (`eventN`) that have at least one by-id symlink
-/// ending in `-event-kbd` without `if01`. Missing by-id dir means an
-/// empty set (the serio fallback still covers the AT keyboard).
-fn kbd_nodes_by_id() -> HashSet<String> {
-    let mut nodes = HashSet::new();
-    let Ok(entries) = fs::read_dir("/dev/input/by-id") else {
-        return nodes;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(link) = name.to_str() else { continue };
-        if !link.ends_with("-event-kbd") || link.contains("if01") {
-            continue;
-        }
-        if let Ok(target) = fs::read_link(entry.path()) {
-            if let Some(node) = target.file_name().and_then(|n| n.to_str()) {
-                nodes.insert(node.to_owned());
-            }
-        }
-    }
-    nodes
-}
-
-/// sysfs capabilities/key is a hex bitmask, one u64 word (kernel
-/// unsigned long) per 64 keycodes, least significant bit first. A
-/// device counts as a keyboard if any bit in the keyboard keycode range
-/// 1..=0xE7 (KEY_ESC..=KEY_MICMUTE) is set; keycode 0 (KEY_RESERVED)
-/// does not count.
-fn has_keyboard_keys(caps: &str) -> bool {
-    caps.split_whitespace().enumerate().any(|(word, hex)| {
-        let bits = u64::from_str_radix(hex, 16).unwrap_or(0);
-        (0..64).any(|bit| {
-            bits & (1 << bit) != 0 && {
-                let code = word * 64 + bit;
-                (1..=0xE7).contains(&code)
-            }
-        })
-    })
-}
-
-/// Deterministic listing order: vid, pid, serial, name. Two keyboards
-/// equal in all four are indistinguishable — no further ordering.
-fn sort_key(k: &KeyboardInfo) -> (u16, u16, &Option<String>, &String) {
-    (k.vid, k.pid, &k.serial, &k.name)
-}
-
-/// Enumerate keyboard devices (info + node path), sorted by `sort_key`.
-fn scan_devices() -> IoResult<Vec<Device>> {
-    let mut devices = Vec::new();
-    let kbd_by_id = kbd_nodes_by_id();
-    for entry in fs::read_dir("/dev/input")? {
-        let Ok(entry) = entry else { continue };
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let sys = Path::new("/sys/class/input").join(&name).join("device");
-        if let Some(device) = read_device(&sys, entry.path(), kbd_by_id.contains(&name)) {
-            devices.push(device);
-        }
-    }
-    devices.sort_by(|a, b| sort_key(&a.info).cmp(&sort_key(&b.info)));
-    Ok(devices)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,15 +740,13 @@ mod tests {
 
     #[test]
     fn sorting_is_by_identity_vid_pid_serial_name() {
-        let dev = |vid: u16, pid: u16, serial: Option<&str>, name: &str| KeyboardInfo {
+        let dev = |vid: u16, pid: u16, serial: Option<&str>, name: &str| ExclusiveKeyboardInfo {
             name: name.to_owned(),
             vid,
             pid,
             serial: serial.map(str::to_owned),
-            listenable: true,
-            grabbable: true,
         };
-        let mut devices = vec![
+        let mut devices = [
             dev(0x8089, 0x000c, None, "zz"),
             dev(0x8089, 0x000c, Some("b"), "aa"),
             dev(0x8089, 0x0008, None, "mm"),
@@ -704,8 +817,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_maps_and_tracks_modifiers() {
-        let mut tracker = ModifierTracker::default();
+    fn decode_maps_and_tracks_pressed_set() {
+        let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
         // Press LShift (evdev 42), press F21 (evdev 191), repeat F21,
         // release LShift, release F21.
         let mut buf = Vec::new();
@@ -719,22 +832,27 @@ mod tests {
         ] {
             buf.extend_from_slice(&ev);
         }
-        let events = decode(&buf, &mut tracker, "key-1");
-        // Релизы в канал не идут: только фронты, с живой маской.
-        let summary: Vec<_> = events.iter().map(|e| (e.keycode, e.modifiers)).collect();
-        assert_eq!(
-            summary,
-            [(0xE1, 0x02), (0x70, 0x02)] // LShift ставит бит, F21 несёт маску
+        let events = decode(&buf, &mut pressed, "key-1");
+        // Релизы в канал не идут: только фронты, с снимком сета.
+        let summary: Vec<String> = events
+            .iter()
+            .map(|e| super::super::combo(&e.keys))
+            .collect();
+        assert_eq!(summary, ["LShift", "LShift+F21"]);
+        assert!(
+            events
+                .iter()
+                .all(|e| e.exclusive_keyboard_id.as_deref() == Some("key-1"))
         );
-        assert!(events.iter().all(|e| e.keyboard_id == "key-1"));
+        assert!(pressed.ones().next().is_none()); // всё отпущено
     }
 
     #[test]
     fn decode_skips_unmapped_codes() {
-        let mut tracker = ModifierTracker::default();
+        let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
         let mut buf = Vec::new();
         buf.extend_from_slice(&raw_event(EV_KEY, 240, 1)); // KEY_UNKNOWN
         buf.extend_from_slice(&raw_event(EV_KEY, 0, 1)); // KEY_RESERVED
-        assert!(decode(&buf, &mut tracker, "key-1").is_empty());
+        assert!(decode(&buf, &mut pressed, "key-1").is_empty());
     }
 }

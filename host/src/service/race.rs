@@ -9,7 +9,7 @@ use crate::config::setup::PadConfig;
 use crate::driver::audio::{Audio, Sound};
 use crate::driver::camera::Recorder;
 use crate::driver::dvr::{RecordParams, RecordState};
-use crate::driver::keyboard::KeyPressed;
+use crate::driver::keyboard::{KeyPressed, combo};
 use crate::model::flight::{Journal, JournalRecord};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
@@ -903,6 +903,17 @@ impl Race {
     ) -> Race {
         let (intent_tx, intent_rx) = crossbeam::bounded(16);
         let (notice_tx, notice_rx) = crossbeam::bounded(64);
+        // Биндинги с id пада для матчинга в дрейне: pads дальше
+        // уйдут в ядро.
+        let keybinds: Vec<(String, crate::config::keyboard::KeyBind)> = pads
+            .iter()
+            .flat_map(|(pad_id, pad)| {
+                pad.keybinds
+                    .clone()
+                    .into_iter()
+                    .map(move |bind| (pad_id.clone(), bind))
+            })
+            .collect();
         let (core, effects) = RaceCore::new(
             Instant::now(),
             rules,
@@ -967,6 +978,18 @@ impl Race {
                         // Регистрация нажатий — в RaceCore (пока лог).
                         Ok(event) => {
                             log::info!("keyboard: {event}");
+                            // Матчинг по биндингам падов: аккорд и его
+                            // action в лог. Код намеренно не обобщён с
+                            // Idle-дрейном: реакции разойдутся.
+                            for (pad_id, bind) in &keybinds {
+                                if bind.matches(&event) {
+                                    log::info!(
+                                        "keybind: {pad_id} {} -> {}",
+                                        combo(&bind.keys),
+                                        bind.action
+                                    );
+                                }
+                            }
                             Vec::new()
                         }
                         // Отвал клавиатур отключает ветку: never не

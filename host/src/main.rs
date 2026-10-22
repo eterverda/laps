@@ -21,40 +21,31 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    ListCameras,
+    #[cfg(target_os = "linux")]
     ListKeyboards,
+    ListCameras,
     ListInstances,
     /// Воспроизведение последней записи из captures/.
     Scrub,
 }
 
-/// Modes column of the listing: `listen,grab`, `listen` or `--` (no
-/// access at all). Pure presentation of the probed flags.
-fn modes_column(k: &driver::keyboard::KeyboardInfo) -> &'static str {
-    match (k.listenable, k.grabbable) {
-        (true, true) => "listen,grab",
-        (true, false) => "listen",
-        (false, _) => "--",
-    }
-}
-
-/// Aligned table of keyboards: name, vid:pid, serial (empty when the
-/// device has none), modes. Modes are the probed access truth
-/// (listen,grab / listen / --), not policy. Column widths follow the
-/// longest cell; the serial column carries no prefix.
-fn print_keyboards(keyboards: &[driver::keyboard::KeyboardInfo]) {
-    let rows: Vec<[String; 4]> = keyboards
+/// Aligned table of exclusive keyboards: name, vid:pid, serial (empty
+/// when the device has none). Attach — всегда grab: колонок режимов
+/// нет. Column widths follow the longest cell; the serial column
+/// carries no prefix.
+#[cfg(target_os = "linux")]
+fn print_keyboards(exclusive_keyboards: &[driver::keyboard::ExclusiveKeyboardInfo]) {
+    let rows: Vec<[String; 3]> = exclusive_keyboards
         .iter()
         .map(|k| {
             [
                 k.name.clone(),
                 format!("{:04x}:{:04x}", k.vid, k.pid),
                 k.serial.clone().unwrap_or_default(),
-                modes_column(k).to_owned(),
             ]
         })
         .collect();
-    let mut widths = [0usize; 4];
+    let mut widths = [0usize; 3];
     for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             widths[i] = widths[i].max(cell.chars().count());
@@ -120,7 +111,8 @@ fn main() {
                 println!("Error: {}", e);
             }
         },
-        Some(Commands::ListKeyboards) => match driver::keyboard::scan() {
+        #[cfg(target_os = "linux")]
+        Some(Commands::ListKeyboards) => match driver::keyboard::ExclusiveKeyboard::list() {
             Ok(keyboards) => print_keyboards(&keyboards),
             Err(e) => {
                 println!("Error: {}", e);
@@ -162,26 +154,5 @@ fn main() {
         None => {
             gui::run(None);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn modes_column_follows_the_flags() {
-        let dev = |listenable: bool, grabbable: bool| driver::keyboard::KeyboardInfo {
-            name: String::new(),
-            vid: 0,
-            pid: 0,
-            serial: None,
-            listenable,
-            grabbable,
-        };
-        assert_eq!(modes_column(&dev(true, true)), "listen,grab");
-        assert_eq!(modes_column(&dev(true, false)), "listen");
-        assert_eq!(modes_column(&dev(false, true)), "--");
-        assert_eq!(modes_column(&dev(false, false)), "--");
     }
 }

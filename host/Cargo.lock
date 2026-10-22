@@ -2430,6 +2430,7 @@ dependencies = [
  "eframe",
  "egui",
  "env_logger",
+ "fixedbitset",
  "jpeg-encoder",
  "jpeg-rusturbo",
  "keepawake",

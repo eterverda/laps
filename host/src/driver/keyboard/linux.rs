@@ -260,7 +260,9 @@ fn read_events(
 /// (value 2) is dropped, other event types (MSC_SCAN and friends) are
 /// ignored. Unmapped codes are skipped with a warning. `pressed` —
 /// the set of all held keys: a front inserts, a release removes;
-/// each event carries a snapshot of the set.
+/// each event carries a snapshot of the set. The right half of the
+/// modifiers collapses into the left one (`normalize_usage`); fronts
+/// follow the shared rule `is_front`.
 fn decode(
     buf: &[u8],
     pressed: &mut fixedbitset::FixedBitSet,
@@ -286,13 +288,17 @@ fn decode(
             );
             continue;
         };
+        let usage = super::normalize_usage(usage as u32);
         if press {
             pressed.insert(usage as usize);
-            events.push(KeyPressed {
-                exclusive_keyboard_id: Some(exclusive_keyboard_id.to_owned()),
-                keys: pressed.clone(),
-                at: Instant::now(),
-            });
+            // Fronts follow the shared policy.
+            if super::is_front(usage, pressed) {
+                events.push(KeyPressed {
+                    exclusive_keyboard_id: Some(exclusive_keyboard_id.to_owned()),
+                    keys: pressed.clone(),
+                    at: Instant::now(),
+                });
+            }
         } else {
             pressed.remove(usage as usize);
         }
@@ -823,8 +829,8 @@ mod tests {
         // release LShift, release F21.
         let mut buf = Vec::new();
         for ev in [
-            raw_event(EV_KEY, 42, 1),
-            raw_event(EV_KEY, 191, 1),
+            raw_event(EV_KEY, 42, 1),  // LShift: в сет, фронта нет
+            raw_event(EV_KEY, 191, 1), // F21: фронт со снимком "Shift+F21"
             raw_event(EV_KEY, 191, 2), // autorepeat: dropped
             raw_event(4, 4, 16),       // MSC_SCAN: ignored
             raw_event(EV_KEY, 42, 0),
@@ -833,18 +839,105 @@ mod tests {
             buf.extend_from_slice(&ev);
         }
         let events = decode(&buf, &mut pressed, "key-1");
-        // Релизы в канал не идут: только фронты, с снимком сета.
+        // Релизы в канал не идут, фронты — только от обычных клавиш.
         let summary: Vec<String> = events
             .iter()
             .map(|e| super::super::combo(&e.keys))
             .collect();
-        assert_eq!(summary, ["LShift", "LShift+F21"]);
+        assert_eq!(summary, ["Shift+F21"]);
         assert!(
             events
                 .iter()
                 .all(|e| e.exclusive_keyboard_id.as_deref() == Some("key-1"))
         );
         assert!(pressed.ones().next().is_none()); // всё отпущено
+    }
+
+    #[test]
+    fn decode_collapses_right_modifiers_and_silences_their_fronts() {
+        let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
+        // RCtrl (evdev 97 -> 0xE4) жмём и держим: фронта нет, в сету —
+        // левый бит; затем A (evdev 30) — фронт "Ctrl+A".
+        let mut buf = Vec::new();
+        for ev in [raw_event(EV_KEY, 97, 1), raw_event(EV_KEY, 30, 1)] {
+            buf.extend_from_slice(&ev);
+        }
+        let events = decode(&buf, &mut pressed, "key-1");
+        let summary: Vec<String> = events
+            .iter()
+            .map(|e| super::super::combo(&e.keys))
+            .collect();
+        assert_eq!(summary, ["Ctrl+A"]);
+    }
+
+    #[test]
+    fn decode_modifier_after_plain_key_emits_a_front() {
+        let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
+        // A (evdev 30), потом LCtrl (evdev 29): фронт от A, затем
+        // фронт "Ctrl+A" — в сете уже есть обычная клавиша.
+        let mut buf = Vec::new();
+        for ev in [raw_event(EV_KEY, 30, 1), raw_event(EV_KEY, 29, 1)] {
+            buf.extend_from_slice(&ev);
+        }
+        let events = decode(&buf, &mut pressed, "key-1");
+        let summary: Vec<String> = events
+            .iter()
+            .map(|e| super::super::combo(&e.keys))
+            .collect();
+        assert_eq!(summary, ["A", "Ctrl+A"]);
+    }
+
+    #[test]
+    fn decode_lone_modifier_is_silent() {
+        let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
+        // Только LCtrl: сет из одних модификаторов — фронтов нет.
+        let mut buf = Vec::new();
+        for ev in [raw_event(EV_KEY, 29, 1), raw_event(EV_KEY, 42, 1)] {
+            buf.extend_from_slice(&ev);
+        }
+        assert!(decode(&buf, &mut pressed, "key-1").is_empty());
+    }
+
+    #[test]
+    fn decode_accumulates_modifiers_into_one_combo_front() {
+        let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
+        // LCtrl (29), LShift (42) вхолостую, затем A (30): один фронт
+        // со всем комбо.
+        let mut buf = Vec::new();
+        for ev in [
+            raw_event(EV_KEY, 29, 1),
+            raw_event(EV_KEY, 42, 1),
+            raw_event(EV_KEY, 30, 1),
+        ] {
+            buf.extend_from_slice(&ev);
+        }
+        let events = decode(&buf, &mut pressed, "key-1");
+        let summary: Vec<String> = events
+            .iter()
+            .map(|e| super::super::combo(&e.keys))
+            .collect();
+        assert_eq!(summary, ["Ctrl+Shift+A"]);
+    }
+
+    #[test]
+    fn decode_modifier_presses_after_releasing_the_plain_key_are_silent() {
+        let mut pressed = fixedbitset::FixedBitSet::with_capacity(0x100);
+        // A вниз (фронт "A"), A вверх, затем LCtrl: обычной клавиши в
+        // сете нет — модификатор молчит.
+        let mut buf = Vec::new();
+        for ev in [
+            raw_event(EV_KEY, 30, 1),
+            raw_event(EV_KEY, 30, 0),
+            raw_event(EV_KEY, 29, 1),
+        ] {
+            buf.extend_from_slice(&ev);
+        }
+        let events = decode(&buf, &mut pressed, "key-1");
+        let summary: Vec<String> = events
+            .iter()
+            .map(|e| super::super::combo(&e.keys))
+            .collect();
+        assert_eq!(summary, ["A"]);
     }
 
     #[test]

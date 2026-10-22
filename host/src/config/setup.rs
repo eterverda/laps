@@ -12,7 +12,7 @@ pub struct Setup {
     pub pads: BTreeMap<String, PadConfig>,
     // Аттачатся гоночной сессией (GUI → Race); парсинг здесь, чтобы
     // сетап-файлы уже могли описывать клавиатуры.
-    #[serde(default)]
+    #[serde(default, rename = "exclusive-keyboards")]
     #[cfg(target_os = "linux")]
     pub exclusive_keyboards: BTreeMap<String, ExclusiveKeyboardConfig>,
 }

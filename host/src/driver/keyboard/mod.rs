@@ -16,13 +16,14 @@ use std::borrow::Cow;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::time::Instant;
 
-/// Bitset capacity: usages run to 0xE7; the headroom to 0xFF keeps
-/// the unknown-code render ("0xNN") from panicking on insert.
 /// One key press in the canonical cross-platform shape: `keys` — all
 /// keys of the keyboard held at the press front (HID usages, page
-/// 0x07; modifiers are keys too, 0xE0..=0xE7). Press fronts only:
-/// releases never reach the channel (each source tracks the held set
-/// itself: egui — `keys_down`, linux — a set in the reader).
+/// 0x07; modifiers are keys too, `0xE0..=0xE3` — the right half
+/// collapsed into the left one, `normalize_usage`). Press fronts only,
+/// and releases never reach the channel (each source tracks the held
+/// set itself: egui — `keys_down`, linux — a set in the reader). A
+/// front follows the shared rule `is_front`: a plain key, or a
+/// modifier with a plain key held.
 ///
 /// `exclusive_keyboard_id` (Linux-only): Some — the event came from
 /// an exclusive keyboard (an id of `Setup.exclusive_keyboards`),
@@ -37,7 +38,7 @@ pub struct KeyPressed {
     pub at: Instant,
 }
 
-/// Linux: "key-1  LCtrl+LShift+A" with the id; main — combo only.
+/// Linux: "key-1  Ctrl+Shift+A" with the id; main — combo only.
 #[cfg(target_os = "linux")]
 impl Display for KeyPressed {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
@@ -99,13 +100,13 @@ impl Keyboard {
                 }
                 // The physical keycode, layout-free; fall back to the
                 // logical one when absent (web, legacy backends).
-                if egui_key_usage(physical_key.unwrap_or(key)).is_none() {
-                    continue; // the front only triggers; only mapped keys enter the set
-                }
+                let Some(usage) = egui_key_usage(physical_key.unwrap_or(key)) else {
+                    continue;
+                };
                 let keys = ui.input(|i| {
                     let mut set = FixedBitSet::with_capacity(KEY_USAGES);
                     for usage in i.keys_down.iter().filter_map(|k| egui_key_usage(*k)) {
-                        set.insert(usage as usize);
+                        set.insert(normalize_usage(usage) as usize);
                     }
                     // Modifiers are keys too: from the egui snapshot.
                     let m = i.modifiers;
@@ -123,6 +124,10 @@ impl Keyboard {
                     }
                     set
                 });
+                // Fronts follow the shared policy; the set is built above.
+                if !is_front(usage, &keys) {
+                    continue;
+                }
                 let _ = self.tx.send(KeyPressed {
                     #[cfg(target_os = "linux")]
                     exclusive_keyboard_id: None, // main
@@ -134,52 +139,66 @@ impl Keyboard {
     }
 }
 
-/// egui keycode → HID usage (page 0x07): letters, digits, F1-F24,
-/// navigation — the race control keys. egui punctuation is
-/// layout-dependent (the variant name is the produced glyph), no
-/// reliable physical mapping — None.
-/// Boot-protocol modifier bits with their short names.
-const MODIFIER_NAMES: [(u32, &str); 8] = [
-    (0x01, "LCtrl"),
-    (0x02, "LShift"),
-    (0x04, "LAlt"),
-    (0x08, "LGui"),
-    (0x10, "RCtrl"),
-    (0x20, "RShift"),
-    (0x40, "RAlt"),
-    (0x80, "RGui"),
-];
+/// Universal modifier names: no left/right distinction in events or
+/// in the text form — `MODIFIER_NAMES[i]` is the usage `0xE0 + i`. The
+/// right half (`0xE4..=0xE7`) collapses into the left one on entry into
+/// the held set (`normalize_usage`).
+const MODIFIER_NAMES: [&str; 4] = ["Ctrl", "Shift", "Alt", "Gui"];
 
-/// "LCtrl+LShift+A" — the held-keys combo joined by "+": modifiers
-/// first (`MODIFIER_NAMES` order), the rest by ascending usage.
-/// An empty set renders as an empty string.
+/// "Ctrl+Shift+A" — the held-keys combo joined by "+": modifiers first
+/// (`MODIFIER_NAMES` order), the rest by ascending usage. An empty set
+/// renders as an empty string.
 pub fn combo(keys: &FixedBitSet) -> String {
     let mut parts: Vec<Cow<'static, str>> = Vec::new();
-    for (i, (_, name)) in MODIFIER_NAMES.iter().enumerate() {
+    for (i, name) in MODIFIER_NAMES.iter().enumerate() {
         if keys.contains(0xE0 + i) {
             parts.push(Cow::Borrowed(name));
         }
     }
     for usage in keys.ones() {
-        if !(0xE0..0xE8).contains(&usage) {
+        if !is_modifier(usage as u32) {
             parts.push(key_name(usage as u32));
         }
     }
     parts.join("+")
 }
 
-/// The modifier usage (0xE0..=0xE7) for a name: full names (`LCtrl`)
-/// and short aliases (`Ctrl` — the left one). Non-modifiers — None.
+/// The modifier usage for a universal name (`Ctrl`/`Shift`/`Alt`/`Gui`).
+/// Sided names (`LCtrl`/`RCtrl`) are rejected — config modifiers are
+/// universal only. Non-modifiers — None.
 pub fn modifier_usage(name: &str) -> Option<u32> {
-    if let Some(i) = MODIFIER_NAMES.iter().position(|(_, n)| *n == name) {
-        return Some(0xE0 + i as u32);
-    }
-    match name {
-        "Ctrl" => Some(0xE0),
-        "Shift" => Some(0xE1),
-        "Alt" => Some(0xE2),
-        "Gui" => Some(0xE3),
-        _ => None,
+    MODIFIER_NAMES
+        .iter()
+        .position(|n| *n == name)
+        .map(|i| 0xE0 + i as u32)
+}
+
+/// The modifier usages: `0xE0..=0xE7`, both halves.
+pub fn is_modifier(usage: u32) -> bool {
+    (0xE0..=0xE7).contains(&usage)
+}
+
+/// The set holds at least one non-modifier key.
+pub fn has_plain_key(keys: &FixedBitSet) -> bool {
+    keys.ones().any(|u| !is_modifier(u as u32))
+}
+
+/// Whether a press is a front: a plain key always, a modifier only
+/// when a plain key is already held; a lone modifier is not. The
+/// emission policy is shared by every source (linux reader, egui);
+/// each source keeps its own held set.
+pub fn is_front(pressed: u32, held: &FixedBitSet) -> bool {
+    !is_modifier(pressed) || has_plain_key(held)
+}
+
+/// The right half of the modifiers collapses into the left one
+/// (`RCtrl` -> `LCtrl`); everything else passes through. Applied when
+/// building the held set.
+pub fn normalize_usage(usage: u32) -> u32 {
+    if (0xE4..=0xE7).contains(&usage) {
+        usage - 4
+    } else {
+        usage
     }
 }
 
@@ -202,7 +221,9 @@ pub fn keycode_from_str(name: &str) -> Option<u32> {
         .map(|usage| usage as u32)
 }
 
-const KEY_USAGES: usize = 0x100;
+/// Bitset capacity: usages run to 0xE7; the headroom to 0xFF keeps
+/// the unknown-code render ("0xNN") from panicking on insert.
+pub const KEY_USAGES: usize = 0x100;
 
 const X: Option<&str> = None;
 // Keyboard/keyboard page (0x07) usages 0x00..=0xE7, one entry per usage:
@@ -446,6 +467,10 @@ const KEY_NAMES: [Option<&str>; 0xE8] = [
 ];
 const _: () = assert!(KEY_NAMES.len() == 0xE8);
 
+/// egui keycode → HID usage (page 0x07): letters, digits, F1-F24,
+/// navigation — the race control keys. egui punctuation is
+/// layout-dependent (the variant name is the produced glyph), no
+/// reliable physical mapping — None.
 fn egui_key_usage(key: egui::Key) -> Option<u32> {
     use egui::Key as K;
     Some(match key {
@@ -539,7 +564,7 @@ mod tests {
         assert_eq!(combo(&set(&[0x70])), "F21");
         assert_eq!(combo(&set(&[0x04])), "A");
         assert_eq!(combo(&set(&[0x52])), "UpArrow");
-        assert_eq!(combo(&set(&[0xE0])), "LCtrl"); // короткие имена модификаторов
+        assert_eq!(combo(&set(&[0xE0])), "Ctrl"); // универсальные имена модификаторов
         assert_eq!(combo(&set(&[0x2C])), "Spacebar");
         // Unknown / reserved usages render as 0xNN.
         assert_eq!(combo(&set(&[0x00])), "0x00");
@@ -571,19 +596,47 @@ mod tests {
         let set = key_set;
         assert_eq!(combo(&set(&[])), "");
         assert_eq!(combo(&set(&[0x04])), "A");
-        assert_eq!(combo(&set(&[0xE0, 0x04])), "LCtrl+A");
-        assert_eq!(combo(&set(&[0xE1, 0xE0, 0x04])), "LCtrl+LShift+A");
+        assert_eq!(combo(&set(&[0xE0, 0x04])), "Ctrl+A");
+        assert_eq!(combo(&set(&[0xE1, 0xE0, 0x04])), "Ctrl+Shift+A");
         assert_eq!(combo(&set(&[0x68, 0x69])), "F13+F14");
-        assert_eq!(combo(&set(&[0xE7, 0x04])), "RGui+A"); // модификаторы всегда первыми
+        assert_eq!(combo(&set(&[0xE7, 0x04])), "A"); // правая половина вне сета после normalize
         assert_eq!(combo(&set(&[0xA5])), "0xA5");
     }
 
     #[test]
-    fn modifier_usage_parses_full_and_short_names() {
-        assert_eq!(modifier_usage("LCtrl"), Some(0xE0));
-        assert_eq!(modifier_usage("RGui"), Some(0xE7));
+    fn modifier_usage_accepts_universal_names_only() {
         assert_eq!(modifier_usage("Ctrl"), Some(0xE0));
         assert_eq!(modifier_usage("Shift"), Some(0xE1));
+        assert_eq!(modifier_usage("Alt"), Some(0xE2));
+        assert_eq!(modifier_usage("Gui"), Some(0xE3));
+        // Стороны не принимаются.
+        assert_eq!(modifier_usage("LCtrl"), None);
+        assert_eq!(modifier_usage("RCtrl"), None);
         assert_eq!(modifier_usage("A"), None);
+    }
+
+    #[test]
+    fn is_front_policy() {
+        use super::is_front;
+        let set = key_set;
+        // Обычная клавиша — всегда фронт.
+        assert!(is_front(0x04, &set(&[])));
+        // Модификатор — только при обычной клавише в сете.
+        assert!(!is_front(0xE0, &set(&[])));
+        assert!(!is_front(0xE0, &set(&[0xE1])));
+        assert!(is_front(0xE0, &set(&[0x04])));
+        assert!(is_front(0xE0, &set(&[0x04, 0xE1])));
+    }
+
+    #[test]
+    fn normalize_usage_collapses_the_right_half() {
+        assert_eq!(normalize_usage(0xE4), 0xE0);
+        assert_eq!(normalize_usage(0xE5), 0xE1);
+        assert_eq!(normalize_usage(0xE6), 0xE2);
+        assert_eq!(normalize_usage(0xE7), 0xE3);
+        assert_eq!(normalize_usage(0x04), 0x04);
+        assert!(!is_modifier(0x04));
+        assert!(is_modifier(0xE0));
+        assert!(is_modifier(0xE7));
     }
 }

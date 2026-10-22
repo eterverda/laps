@@ -10,7 +10,7 @@ use std::fmt::{Formatter, Result as FmtResult};
 
 /// One pad keybind: a combo of keys (`Ctrl+A`, `1`, `F13+F14`) bound
 /// to a pad action. `keys` — a set of HID usages; parsed from a "+"
-/// string: modifiers by full (`LCtrl`) or short (`Ctrl`) names, keys
+/// string: universal modifier names (`Ctrl`/`Shift`/`Alt`/`Gui`), keys
 /// by canonical names. Matching is by subset: the event matches when
 /// every binding key is held.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -46,8 +46,9 @@ impl KeyBind {
     }
 }
 
-/// `keys:` — a "+"-joined combo: each token is a modifier
-/// (`modifier_usage`: LCtrl/Ctrl/…) or a canonical key name
+/// `keys:` — a "+"-joined combo: each token is a universal modifier
+/// (`Ctrl`/`Shift`/`Alt`/`Gui` — sided names are rejected) or a
+/// canonical key name
 /// (`keycode_from_str`); a bare yaml number reads as the digit-key
 /// names. Any unknown token is a parse error.
 fn de_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<FixedBitSet, D::Error> {
@@ -60,7 +61,7 @@ fn de_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<FixedBitSet, D::Err
         }
 
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            let mut set = FixedBitSet::with_capacity(0xE8);
+            let mut set = FixedBitSet::with_capacity(crate::driver::keyboard::KEY_USAGES);
             for token in v.split('+').map(str::trim) {
                 let usage = modifier_usage(token)
                     .or_else(|| keycode_from_str(token))
@@ -260,9 +261,9 @@ action: lap
         .unwrap();
         assert_eq!(bind.keys, key_set(&[0xE0, 0x04]));
         assert_eq!(bind.exclusive_keyboard_id.as_deref(), Some("key-1"));
-        // Полные имена модификаторов.
+        // Универсальные имена модификаторов.
         let bind: KeyBind = from_yaml_string(
-            "keys: LCtrl+LShift
+            "keys: Ctrl+Shift
 action: lap
 ",
         )

@@ -168,13 +168,16 @@ impl Recorder {
     /// Дождаться завершения фоновой финализации записи (bounded).
     /// Тёплый DVR открывает файлы немедленно по закрытию гонки — без
     /// ожидания open попадает в дописываемый файл. Флаг — поле
-    /// RecordState.done (централизовано, отдельной ячейки нет).
+    /// RecordState.done (централизовано, отдельной ячейки нет). Idle —
+    /// тоже конец ожидания: сессия не создалась (мёртвый capture-поток,
+    /// команда старта потеряна), writer'а нет и не будет.
     pub fn wait_finalized(&self, timeout: Duration) {
+        let finalized = |s: RecordState| matches!(s, RecordState::Done | RecordState::Idle);
         let deadline = Instant::now() + timeout;
-        while !matches!(self.record_state.load(), RecordState::Done) && Instant::now() < deadline {
+        while !finalized(self.record_state.load()) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        if !matches!(self.record_state.load(), RecordState::Done) {
+        if !finalized(self.record_state.load()) {
             log::warn!("dvr: finalize wait timed out");
         }
     }

@@ -8,9 +8,6 @@ cameras:
     dvr:
       container: mkv
       frame-rate: 30fps
-# exclusive-keyboards:
-#   key-1:
-#     serial: 036D12307772CDBD420000000000
 pads:
   pad-1:
     label: CH1
@@ -19,9 +16,8 @@ pads:
       camera-id: camera-1
       viewport: 2x2-r1c1-narrow
     keybinds:
-      - keys: 1+A
+      - keys: 1
         action: lap
-        # exclusive-keyboard-id: key-1
   pad-2:
     label: CH2
     color: blue
@@ -29,9 +25,8 @@ pads:
       camera-id: camera-1
       viewport: 2x2-r1c2-narrow
     keybinds:
-      - keys: 2+B
+      - keys: 2
         action: lap
-        # exclusive-keyboard-id: key-1
   pad-3:
     label: CH3
     color: green
@@ -39,9 +34,8 @@ pads:
       camera-id: camera-1
       viewport: 2x2-r2c1-narrow
     keybinds:
-      - keys: 3+C
+      - keys: 3
         action: lap
-        # exclusive-keyboard-id: key-1
   pad-4:
     label: CH4
     color: yellow
@@ -49,12 +43,5 @@ pads:
       camera-id: camera-1
       viewport: 2x2-r2c2-narrow
     keybinds:
-      - keys: 4+D
+      - keys: 4
         action: lap
-        # exclusive-keyboard-id: key-1
-      - keys: 5+D
-        action: lap
-        # exclusive-keyboard-id: key-1
-      - keys: 6+D
-        action: lap
-        # exclusive-keyboard-id: key-1

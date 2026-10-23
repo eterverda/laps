@@ -19,7 +19,7 @@ use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::gui::scrub::{
     CIRCLE_MIN_WIDTH_PX, HScroll, PLAY_SPEEDS, RPT_SIZES, SCROLL_REARM, SCROLL_STEP,
     SEEK_CLICK_MAX, SEEK_HOLD_DELAY, SEEK_RELEASE_RAMP, SEEK_SPEEDS, SEEK_TAP, ScrollGate,
-    SeekButton, Timeline, TimelineEvent, latest_capture, latest_journal,
+    SeekButton, Timeline, TimelineEvent, latest_journal,
 };
 use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
 use crate::model::flight::{Journal, RaceClip};
@@ -259,8 +259,6 @@ pub struct Flight {
     /// захватов; снятие лимита MAX_PADS ролей не меняет — только фильтр
     /// в shown_pads.
     shown_cameras: HashMap<String, CameraConfig>,
-    /// Каталог записей: для входа в DVR.
-    captures: Option<PathBuf>,
     res: Option<Res>,
     /// Запрошен выход (remote/кнопка/⌘W): ядру Intent::Exit уходит
     /// сразу, флаг — для навигации в меню из update (нужен Navigator).
@@ -282,7 +280,6 @@ impl Flight {
         setup: Setup,
         assignments: HashMap<String, Pilot>,
         rules: RaceRules,
-        captures: Option<PathBuf>,
     ) -> Self {
         let shown_cameras = filter_cameras(&setup, &assignments);
         // Захваты — данные фазы Idle; поток гонки и keepawake рождаются
@@ -303,7 +300,6 @@ impl Flight {
             rules,
             audio: Audio::spawn(),
             shown_cameras,
-            captures,
             res: None,
             exit_requested: false,
             header: header::Header::new(),
@@ -402,12 +398,7 @@ impl Flight {
 
     /// Режим просмотра (CLI `laps scrub`) — без эфира, плееры открыты
     /// на старте, экран сразу в DVR (opening-транзит).
-    pub fn dvr(
-        ctx: &egui::Context,
-        setup: Setup,
-        assignments: HashMap<String, Pilot>,
-        captures: PathBuf,
-    ) -> Self {
+    pub fn dvr(ctx: &egui::Context, setup: Setup, assignments: HashMap<String, Pilot>) -> Self {
         // Холодный вход: последний журнал из captures/ → DVR; журнала
         // нет — деградация на последние записи камер (пустая рамка).
         let journal = latest_journal(Path::new(CAPTURES_DIR))
@@ -424,20 +415,13 @@ impl Flight {
                 })
             });
         let shown_cameras = filter_cameras(&setup, &assignments);
-        let phase = Mode::Review(Review::open(
-            ctx,
-            journal,
-            &setup,
-            &shown_cameras,
-            Some(captures.clone()),
-        ));
+        let phase = Mode::Review(Review::open(ctx, journal, &setup));
         Self {
             setup,
             assignments,
             rules: RaceRules::default(),
             audio: Audio::spawn(),
             shown_cameras,
-            captures: Some(captures),
             res: None,
             exit_requested: false,
             header: header::Header::new(),
@@ -1460,13 +1444,7 @@ impl Flight {
     /// Переход эфир → DVR по закрытию гонки: строим Review, дроп Live
     /// гасит эфир (камеры, keepawake, гоночный поток).
     fn enter_review(&mut self, ctx: &egui::Context, journal: Journal) {
-        let dvr = Review::open(
-            ctx,
-            Some(journal),
-            &self.setup,
-            &self.shown_cameras,
-            self.captures.clone(),
-        );
+        let dvr = Review::open(ctx, Some(journal), &self.setup);
         self.phase = Mode::Review(dvr);
     }
 
@@ -1728,16 +1706,10 @@ impl Flight {
 }
 
 impl Review {
-    /// Полный набор данных DVR из журнала (None — деградация на
-    /// последние записи камер). Плееры открываются асинхронно —
-    /// `opening` — транзит, пока все не открылись (Ready/Failed).
-    fn open(
-        ctx: &egui::Context,
-        journal: Option<Journal>,
-        setup: &Setup,
-        shown_cameras: &HashMap<String, CameraConfig>,
-        captures: Option<PathBuf>,
-    ) -> Self {
+    /// Полный набор данных DVR из журнала (None — пустой DVR: никаких
+    /// чужих записей, только файлы журнала). Плееры открываются
+    /// асинхронно — транзит, пока все не открылись (Ready/Failed).
+    fn open(ctx: &egui::Context, journal: Option<Journal>, setup: &Setup) -> Self {
         let journal = journal.unwrap_or_else(|| {
             let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
                 log::warn!("flight: local time unavailable, journal falls back to UTC");
@@ -1748,24 +1720,12 @@ impl Review {
         let clip = RaceClip::from_events(journal.iter_ms());
         let mut players = HashMap::new();
         let dir = Path::new(CAPTURES_DIR);
-        let mut opened = 0;
         for (camera_id, (filename, _)) in &clip.files {
             let path = dir.join(filename);
             if path.exists() {
                 players.insert(camera_id.clone(), Player::open(&path, ctx.clone()));
-                opened += 1;
             } else {
                 log::warn!("flight: recording of {camera_id} missing: {path:?}");
-            }
-        }
-        if opened == 0 && clip.files.is_empty() {
-            // Рамки нет: деградация на последние файлы камер.
-            if let Some(captures) = &captures {
-                for camera_id in shown_cameras.keys() {
-                    if let Some(path) = latest_capture(captures, camera_id) {
-                        players.insert(camera_id.clone(), Player::open(&path, ctx.clone()));
-                    }
-                }
             }
         }
         // Мастер — первая по порядку сетапа камера с файлом.

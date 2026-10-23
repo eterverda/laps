@@ -1,5 +1,4 @@
 use crate::config::setup::Setup;
-use crate::driver::dvr::CAPTURES_DIR;
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::{RESPONSE_TIMEOUT, Response, Server};
@@ -99,18 +98,18 @@ impl App {
             state: match &scrub {
                 // CLI `laps scrub` — Flight, стартующий в режиме
                 // просмотра записи.
-                Some(captures) => State::Flight(Box::new(flight::Flight::dvr(
+                // Каталог нужен только как флаг режима: журнал DVR
+                // парсится из captures/ сам.
+                Some(_) => State::Flight(Box::new(flight::Flight::dvr(
                     &cc.egui_ctx,
                     setup.clone(),
                     assignments.clone(),
-                    captures.clone(),
                 ))),
                 None => State::Flight(Box::new(flight::Flight::live(
                     &cc.egui_ctx,
                     setup.clone(),
                     assignments.clone(),
                     RaceRules::default(),
-                    Some(PathBuf::from(CAPTURES_DIR)),
                 ))),
             },
             setup,
@@ -172,7 +171,6 @@ impl eframe::App for App {
                             self.setup.clone(),
                             self.assignments.clone(),
                             RaceRules::default(),
-                            Some(PathBuf::from(CAPTURES_DIR)),
                         ))),
                         menu::Action::None => {}
                     },

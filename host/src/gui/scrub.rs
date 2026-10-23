@@ -395,25 +395,6 @@ impl SeekButton {
     }
 }
 
-/// Последний по имени файл записи камеры: `{anything}-{camera_id}-mjpeg`
-/// + любой из поддержанных контейнеров. Таймстамп-префикс сортируется
-/// лексикографически.
-pub fn latest_capture(dir: &Path, camera_id: &str) -> Option<PathBuf> {
-    let stem = format!("-{camera_id}-mjpeg.");
-    let exts = ["mkv", "mp4", "mov"];
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name().is_some_and(|n| {
-                let n = n.to_string_lossy();
-                exts.iter().any(|ext| n.ends_with(&format!("{stem}{ext}")))
-            })
-        })
-        .max()
-}
-
 /// Последний журнал полёта в каталоге: стемы сортируются лексикографически.
 pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
     fs::read_dir(dir)

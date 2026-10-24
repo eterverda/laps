@@ -67,6 +67,23 @@ const DIAL_LAG_MS: u64 = 150;
 /// нужно.
 const UI_TICK: Duration = Duration::from_millis(43);
 
+/// Пара основного таймера: горящий и потухший. Потухший — 0.2
+/// яркости (тот же сигнал мигания, что у таймера: вторая половина
+/// секунды отсчёта).
+const TIMER_ACTIVE: egui::Color32 = TRANSPORT_ACTIVE;
+const TIMER_INACTIVE: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(0x2E, 0x2D, 0x29, 0x33);
+
+/// Пара микро-таймеров отсчёта в пэдах — та же, что у основного
+/// таймера.
+const PAD_TIMER_ACTIVE: egui::Color32 = TIMER_ACTIVE;
+const PAD_TIMER_INACTIVE: egui::Color32 = TIMER_INACTIVE;
+
+/// Ненаступившие компоненты круга (DVR): номер/время до начала круга,
+/// событие до его метки. Не путать с потухшим (мигание) — отдельный
+/// оттенок.
+const LAP_FUTURE: egui::Color32 = egui::Color32::from_rgb(0x60, 0x60, 0x60);
+
 /// Машина состояний экрана: данные фаз инкапсулированы в вариантах.
 /// Гоночные фазы эфира живут в ядре (service::race::RaceStage) — здесь
 /// только разделение «эфир vs DVR».
@@ -118,7 +135,7 @@ struct Live {
     race: Race,
     /// pad_id → дистилят кругов (последний Notice::Laps): строки журнала
     /// + текущий круг (бегущее время рендер считает по `since`).
-    laps: HashMap<String, Vec<(u64, LapLine, Vec<LapEvent>)>>,
+    laps: HashMap<String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>>,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: RaceStage,
     rules: RaceRules,
@@ -178,6 +195,16 @@ struct FrameContents {
     timer: TimerContents,
     /// Таймлайн (мс-домен; в дроби переводит рендер). None в эфире.
     timeline: Option<TimelineContents>,
+    /// Курсор кругов: позиция воспроизведения, мс журнала. None —
+    /// эфир: всё в прошлом, раскраска не работает (без спецветок).
+    laps_cursor: Option<u64>,
+    /// Старт гонки, мс журнала: начало первого круга (для «ещё не
+    /// начался»). 0 в эфире (не используется без курсора).
+    laps_race_start: u64,
+    /// Отсчёт в пэдах: Some(dim) — фаза Countdown, dim — тот же сигнал
+    /// мигания, что у основного таймера (вторая половина секунды).
+    /// None — не отсчёт, пэды рисуют круги/пустоту.
+    countdown: Option<bool>,
 }
 
 /// Контент одного пада: всё для его рамки и картинки.
@@ -190,9 +217,10 @@ struct PadContents {
     image: viewfinder::ViewfinderContents,
     /// Alt: эффективное разрешение ("1080p") или "error".
     res_badge: Option<String>,
-    /// Дистилят кругов: (строка, события круга); текущий круг идёт
-    /// последним (бегущее время считается рендером по `since`).
-    laps: Vec<(LapLine, Vec<LapEvent>)>,
+    /// Дистилят кругов: (метка конца круга, строка, события с метками);
+    /// текущий круг идёт последним (бегущее время считается рендером
+    /// по `since`). Метки — для раскраски «ещё не случилось» серым.
+    laps: Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>,
 }
 
 /// Состояние одной кнопки для кадра. Иконки и цвета — часть вёрстки
@@ -531,7 +559,7 @@ impl Flight {
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
-        laps: &HashMap<String, Vec<(u64, LapLine, Vec<LapEvent>)>>,
+        laps: &HashMap<String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>>,
         alt: bool,
     ) -> Vec<PadContents> {
         setup
@@ -584,15 +612,7 @@ impl Flight {
                     viewport: pad.fpv.viewport.to_rect(),
                     image,
                     res_badge,
-                    laps: laps
-                        .get(pad_id)
-                        .map(|lines| {
-                            lines
-                                .iter()
-                                .map(|(_, line, events)| (line.clone(), events.clone()))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
+                    laps: laps.get(pad_id).cloned().unwrap_or_default(),
                 }
             })
             .collect()
@@ -639,6 +659,14 @@ impl Flight {
             None
         };
         // Счётчик гонки: мигание последней секунды отсчёта, нули пристыжены.
+        // Микро-таймеры пэдов: тот же сигнал мигания, что у основного
+        // таймера.
+        let countdown = match state {
+            RaceStage::Countdown { start_at } => {
+                Some(start_at.saturating_duration_since(now).as_millis() as u64 % 1000 >= 500)
+            }
+            _ => None,
+        };
         let (text, dim) = {
             let blink_off = match state {
                 RaceStage::Countdown { start_at } => {
@@ -682,6 +710,9 @@ impl Flight {
             },
             timer: TimerContents { text, dim },
             timeline: None,
+            laps_cursor: None,
+            laps_race_start: 0,
+            countdown,
         }
     }
 
@@ -761,6 +792,9 @@ impl Flight {
                 dim: true,
             },
             timeline: None,
+            laps_cursor: None,
+            laps_race_start: 0,
+            countdown: None,
         }
     }
 
@@ -827,12 +861,7 @@ impl Flight {
                     image,
                     res_badge,
                     // Скраббинг: чистый дистилят (без текущего круга).
-                    laps: d
-                        .journal
-                        .lap_infos(pad_id)
-                        .into_iter()
-                        .map(|(_, line, events)| (line, events))
-                        .collect(),
+                    laps: d.journal.lap_infos(pad_id),
                 }
             })
             .collect()
@@ -863,6 +892,10 @@ impl Flight {
         let pos = d.transport.position();
         let speed = d.transport.velocity();
         let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
+        // Курсор кругов — позиция транспорта; начало первого круга —
+        // старт гонки.
+        let laps_pos = pos;
+        let laps_race_start = clip.as_ref().and_then(|c| c.race_started_ms).unwrap_or(0);
         for (id, player) in d.players.iter() {
             let file = Self::clip_rec_ms(&clip, id).map_or(pos, |rec| pos.saturating_sub(rec));
             player.sync(file.min(player.duration()), speed);
@@ -952,6 +985,9 @@ impl Flight {
                 dim: false,
             },
             timeline: Some(timeline),
+            laps_cursor: Some(laps_pos),
+            laps_race_start: laps_race_start,
+            countdown: None,
         }
     }
 
@@ -1139,19 +1175,25 @@ impl Flight {
                         placeholder(ui, first);
                         // Второй прямоугольник — круги пада: по строке на
                         // круг, сверху вниз; влезают последние.
-                        // Второй прямоугольник без кругов остаётся
-                        // пустым: символ дисконнекта — только в первом.
+                        // Второй прямоугольник без кругов: отсчёт —
+                        // микро-таймер первого круга (мигает в такт
+                        // основному таймеру); иначе пусто (символ
+                        // дисконнекта — только в первом).
                         match frame.pads.get(i) {
-                            Some(content) if !content.laps.is_empty() => {
+                            Some(_) if !frame.pads[i].laps.is_empty() => {
                                 let capacity = (second.height() / cell_y(1)).max(0.0) as usize;
-                                let rows = lap_table(&content.laps);
+                                let rows = lap_table(
+                                    &frame.pads[i].laps,
+                                    frame.laps_cursor,
+                                    frame.laps_race_start,
+                                );
                                 let from = rows.len().saturating_sub(capacity);
                                 // Клип по прямоугольнику: строка любой
                                 // ширины не пересечёт рамку (справа
                                 // отступ как у hint_badge_corner).
                                 let painter = ui.painter().with_clip_rect(second);
-                                for (row, (text, strike)) in rows[from..].iter().enumerate() {
-                                    let galley = painter.layout_job(lap_row_job(text, *strike));
+                                for (row, cells) in rows[from..].iter().enumerate() {
+                                    let galley = painter.layout_job(lap_row_job(cells));
                                     let pos = egui::pos2(
                                         second.left(),
                                         second.top() + cell_y(row as isize),
@@ -1159,7 +1201,41 @@ impl Flight {
                                     painter.galley(pos, galley, egui::Color32::WHITE);
                                 }
                             }
-                            _ => {}
+                            Some(_) => {
+                                if let Some(dim) = frame.countdown {
+                                    // «0.000» — отсчёт первого круга:
+                                    // та же пара цветов таймера, тот же
+                                    // сигнал мигания. Раскладка как у
+                                    // строки круга: пустая колонка имени
+                                    // (мин. 2) + пробел + время (мин. 6) —
+                                    // чтобы позиция совпала с первым
+                                    // кругом гонки.
+                                    let tone = if dim {
+                                        LapTone::Inactive
+                                    } else {
+                                        LapTone::Active
+                                    };
+                                    let cells = [
+                                        LapCell {
+                                            text: "  ".to_owned(),
+                                            tone,
+                                            strike: false,
+                                        },
+                                        LapCell {
+                                            text: lap_time(Duration::ZERO, 6),
+                                            tone,
+                                            strike: false,
+                                        },
+                                    ];
+                                    let galley = ui.painter().layout_job(lap_row_job(&cells));
+                                    ui.painter().galley(
+                                        egui::pos2(second.left(), second.top()),
+                                        galley,
+                                        PAD_TIMER_ACTIVE,
+                                    );
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -1454,9 +1530,9 @@ impl Flight {
                 let timer_icon = "\u{f43a}";
                 let icon_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
                 let timer_color = if frame.timer.dim {
-                    TRANSPORT_ACTIVE.gamma_multiply(0.2)
+                    TIMER_INACTIVE
                 } else {
-                    TRANSPORT_ACTIVE
+                    TIMER_ACTIVE
                 };
                 ui.painter().text(
                     timer_pos,
@@ -1905,26 +1981,50 @@ fn mmss(dur: Duration) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
+/// Тон ячейки: активный (пара таймера), потухший (мигание отсчёта),
+/// будущий (ещё не случилось — раскраска DVR по курсору).
+#[derive(Clone, Copy)]
+enum LapTone {
+    Active,
+    Inactive,
+    Future,
+}
+
+/// Ячейка строки круга: текст, тон, зачёркивание.
+struct LapCell {
+    text: String,
+    tone: LapTone,
+    strike: bool,
+}
+
 /// Таблица кругов: одна строка на круг, колонки «имя время события»
 /// через пробел (ширины — один проход по всем строкам). Имя и время
-/// выравнены вправо; минимальные ширины — 3 и 6 (без разделителей).
+/// выравнены вправо; минимальные ширины — 2 и 6 (без разделителей).
 /// Имя — из дистилятора («HS», «1)» — скобку ставит он); текущий
 /// несёт предполагаемое имя (своё «HS»/«N)», даже с крестом);
-/// проваленный отбит пробелами. Время: формат по наибольшему кругу включая
-/// текущий: SS.mmm, далее M:SS.mmm, далее MM:SS.mmm; ведущие нули —
-/// пробелами, ширина резервирована. События: fault ✕, correct □,
-/// lap ●, колонка вправо. Возвращает (строка, конец зачёркнутого
-/// префикса): время провала рисуется зачёркнутым.
-fn lap_table(lines: &[(LapLine, Vec<LapEvent>)]) -> Vec<(String, Option<usize>)> {
+/// проваленный отбит пробелами. Время: формат по наибольшему кругу
+/// включая текущий: SS.mmm, далее M:SS.mmm, далее MM:SS.mmm; ведущие
+/// нули — пробелами, ширина резервирована. События: fault ✕,
+/// correct □, lap ○, через пробел, влево.
+///
+/// Раскраска: `cursor` (мс журнала) — элемент серым, пока его метка
+/// в будущем: имя и время круга — до начала круга (старт = конец
+/// предыдущего, первый — `race_start`), событие — до его метки.
+/// None — без раскраски (эфир: всё в прошлом).
+fn lap_table(
+    lines: &[(u64, LapLine, Vec<(u64, LapEvent)>)],
+    cursor: Option<u64>,
+    race_start: u64,
+) -> Vec<Vec<LapCell>> {
     // Время строки; у текущего — бегущее (он участвует и в выборе
     // формата колонки).
-    let duration = |(line, _): &(LapLine, Vec<LapEvent>)| match line {
+    let duration = |line: &LapLine| match line {
         LapLine::Success { duration, .. } | LapLine::Fail { duration } => *duration,
         LapLine::Current { since } => since.elapsed(),
     };
     let max_ms = lines
         .iter()
-        .map(duration)
+        .map(|(_, line, _)| duration(line))
         .map(|d| d.as_millis())
         .max()
         .unwrap_or(0);
@@ -1941,82 +2041,111 @@ fn lap_table(lines: &[(LapLine, Vec<LapEvent>)]) -> Vec<(String, Option<usize>)>
     // Нумерация совпадает с дистилятором: fail номер не съедает.
     let successes = lines
         .iter()
-        .filter(|(line, _)| matches!(line, LapLine::Success { .. }))
+        .filter(|(_, line, _)| matches!(line, LapLine::Success { .. }))
         .count();
     let current_name = if successes == 0 {
         "HS".to_owned()
     } else {
         format!("{successes})")
     };
-    // Имя — из дистилятора целиком (HS без скобки, «1)» с ней).
-    let name = |(line, _): &(LapLine, Vec<LapEvent>)| match line {
-        LapLine::Success { num, .. } => num.clone(),
-        LapLine::Current { .. } => current_name.clone(),
-        LapLine::Fail { .. } => String::new(), // зафейленный отбит пробелами
-    };
+    let future = |at: u64| cursor.is_some_and(|c| c < at);
+    let has_events = lines.iter().any(|(_, _, ev)| !ev.is_empty());
+    let mut rows = Vec::new();
+    let mut lap_start = race_start;
+    for (end, line, events) in lines {
+        // Имя — из дистилятора целиком (HS без скобки, «1)» с ней).
+        let name = match line {
+            LapLine::Success { num, .. } => num.clone(),
+            LapLine::Current { .. } => current_name.clone(),
+            LapLine::Fail { .. } => String::new(), // зафейленный отбит пробелами
+        };
+        let tone = |future_mark: bool| {
+            if future_mark {
+                LapTone::Future
+            } else {
+                LapTone::Active
+            }
+        };
+        let mut cells = vec![
+            LapCell {
+                text: name,
+                tone: tone(future(lap_start)),
+                strike: false,
+            },
+            // Номер и время белеют вместе: когда круг начался. События
+            // — по своим меткам.
+            LapCell {
+                text: lap_time(duration(line), time_width),
+                tone: tone(future(lap_start)),
+                strike: matches!(line, LapLine::Fail { .. }),
+            },
+        ];
+        if has_events {
+            for (at, event) in events {
+                cells.push(LapCell {
+                    text: match event {
+                        LapEvent::Fault => "\u{f0156}".to_owned(),
+                        LapEvent::Correction => "□".to_owned(),
+                        LapEvent::Lap => "\u{25cb}".to_owned(), // полый круг
+                    },
+                    tone: tone(future(*at)),
+                    strike: false,
+                });
+            }
+        }
+        rows.push(cells);
+        lap_start = *end;
+    }
     // Минимум 2 («HS») — узкие номера («1)») отбиваются пробелами.
-    let name_width = lines
+    let name_width = rows
         .iter()
-        .map(|l| name(l).chars().count())
+        .flat_map(|r| r.first())
+        .map(|c| c.text.chars().count())
         .max()
         .unwrap_or(0)
         .max(2);
-    let events = |(_, events): &(LapLine, Vec<LapEvent>)| -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                LapEvent::Fault => '\u{f0156}', // nf-md-close
-                LapEvent::Correction => '□',
-                LapEvent::Lap => '\u{25cb}', // полый круг — размером с ✕ и □
-            })
-            .collect::<Vec<char>>()
-            .iter()
-            .map(char::to_string)
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let has_events = lines.iter().any(|l| !l.1.is_empty());
-    lines
-        .iter()
-        .map(|line| {
-            let mut row = format!(
-                "{:>nw$} {:>tw$}",
-                name(line),
-                lap_time(duration(line), time_width),
-                nw = name_width,
-                tw = time_width,
-            );
-            // Зачёркивание времени провала: префикс ASCII (имя +
-            // пробел + время), границы — байтовые.
-            let strike = matches!(line.0, LapLine::Fail { .. }).then_some(row.len());
-            if has_events {
-                row.push(' ');
-                row.push_str(&events(line)); // глифы через пробел, влево
-            }
-            (row, strike)
-        })
-        .collect()
+    // Выравнивание: имя и время вправо (пробелами), события — как есть.
+    for cells in &mut rows {
+        for (i, cell) in cells.iter_mut().enumerate() {
+            let width = match i {
+                0 => name_width,
+                1 => time_width,
+                _ => continue,
+            };
+            let pad = width.saturating_sub(cell.text.chars().count());
+            cell.text = format!("{}{}", " ".repeat(pad), cell.text);
+        }
+    }
+    rows
 }
 
-/// LayoutJob строки круга: временная часть провала зачёркнута.
-fn lap_row_job(text: &str, strike_end: Option<usize>) -> egui::text::LayoutJob {
-    let format = |strike| egui::TextFormat {
-        font_id: style::FONT_REGULAR,
-        color: egui::Color32::WHITE,
-        strikethrough: if strike {
-            egui::Stroke::new(1.5, egui::Color32::WHITE)
-        } else {
-            egui::Stroke::NONE
-        },
-        ..Default::default()
+/// LayoutJob строки круга из ячеек: разделитель — пробел, серое —
+/// «ещё не случилось», зачёркнутое время провала.
+fn lap_row_job(cells: &[LapCell]) -> egui::text::LayoutJob {
+    let format = |cell: &LapCell| {
+        // Зачёркивание — в цвет текста ячейки.
+        let color = match cell.tone {
+            LapTone::Active => PAD_TIMER_ACTIVE,
+            LapTone::Inactive => PAD_TIMER_INACTIVE,
+            LapTone::Future => LAP_FUTURE,
+        };
+        egui::TextFormat {
+            font_id: style::FONT_REGULAR,
+            color,
+            strikethrough: if cell.strike {
+                egui::Stroke::new(1.5, color)
+            } else {
+                egui::Stroke::NONE
+            },
+            ..Default::default()
+        }
     };
     let mut job = egui::text::LayoutJob::default();
-    match strike_end {
-        Some(end) => {
-            job.append(&text[..end], 0.0, format(true));
-            job.append(&text[end..], 0.0, format(false));
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            job.append(" ", 0.0, format(cell));
         }
-        None => job.append(text, 0.0, format(false)),
+        job.append(&cell.text, 0.0, format(cell));
     }
     job
 }

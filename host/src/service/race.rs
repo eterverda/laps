@@ -175,7 +175,7 @@ struct RaceCore {
     lap_started_at: HashMap<String, Instant>,
     /// pad_id → события текущего круга (fault/correct с последнего Lap):
     /// живут в дистиляте `Current`, журнал их хранит сам.
-    lap_events: HashMap<String, Vec<LapEvent>>,
+    lap_events: HashMap<String, Vec<(u64, LapEvent)>>,
 }
 
 impl RaceCore {
@@ -322,17 +322,21 @@ impl RaceCore {
             self.lap_started_at.insert(pad_id.clone(), now);
             self.lap_events.remove(&pad_id);
         } else {
+            let at = self.ms(now);
             self.lap_events
                 .entry(pad_id.clone())
                 .or_default()
-                .push(name);
+                .push((at, name));
         }
         Some((pad_id, name))
     }
 
     /// Дистиляты всех пэдов: полное обновление GUI (на старте гонки,
     /// когда текущий круг появляется у каждого пада без единого события).
-    pub fn all_laps(&self, now: Instant) -> Vec<(String, Vec<(u64, LapLine, Vec<LapEvent>)>)> {
+    pub fn all_laps(
+        &self,
+        now: Instant,
+    ) -> Vec<(String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>)> {
         self.journal
             .header()
             .pads
@@ -343,7 +347,7 @@ impl RaceCore {
 
     /// Дистилят кругов пэда: строки журнала плюс текущий круг, пока
     /// гонка идёт (время GUI считает сам по `since`).
-    pub fn laps(&self, pad_id: &str, now: Instant) -> Vec<(u64, LapLine, Vec<LapEvent>)> {
+    pub fn laps(&self, pad_id: &str, now: Instant) -> Vec<(u64, LapLine, Vec<(u64, LapEvent)>)> {
         let mut lines = self.journal.lap_infos(pad_id);
         if let RaceStage::Running { start_at } = self.phase {
             let since = self.lap_started_at.get(pad_id).copied().unwrap_or(start_at);
@@ -700,7 +704,11 @@ mod tests {
         );
         let lines = core.laps("pad-1", clock.now);
         let current = lines.last().expect("current");
-        assert_eq!(current.2, vec![LapEvent::Fault], "fault у текущего круга");
+        assert_eq!(
+            current.2,
+            vec![(25_000, LapEvent::Fault)],
+            "fault у текущего круга"
+        );
         // Следующий lap открывает новый круг: события обнулились.
         assert_eq!(
             core.key_pressed(&key_press(&[0x04]), clock.now),
@@ -1089,7 +1097,7 @@ pub enum Notice {
     /// круг, пока гонка идёт (GUI считает бегущее время по `since`).
     Laps {
         pad_id: String,
-        lines: Vec<(u64, LapLine, Vec<LapEvent>)>,
+        lines: Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>,
     },
 }
 

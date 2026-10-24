@@ -189,7 +189,7 @@ impl Journal {
     /// текущий круг сюда не входит — его докидывает RaceCore.
     /// Успешный круг: последним действием перед Lap не был Fault;
     /// первый успешный — «HS», дальше 1, 2, … (fail номер не съедает).
-    pub fn lap_infos(&self, pad_id: &str) -> Vec<(u64, LapLine, Vec<LapEvent>)> {
+    pub fn lap_infos(&self, pad_id: &str) -> Vec<(u64, LapLine, Vec<(u64, LapEvent)>)> {
         let mut lines = Vec::new();
         let mut in_race = false;
         let mut lap_start = 0;
@@ -204,7 +204,7 @@ impl Journal {
                 }
                 JournalRecord::RaceFinished { .. } => in_race = false,
                 JournalRecord::RaceEvent { pad_id: id, name } if in_race && id == pad_id => {
-                    lap_events.push(*name);
+                    lap_events.push((ms, *name));
                     if *name == LapEvent::Lap {
                         let failed = last_action == Some(LapEvent::Fault);
                         let duration = Duration::from_millis(ms - lap_start);
@@ -605,8 +605,11 @@ mod tests {
                 duration: Duration::from_millis(20_000)
             }
         );
-        // События круга прикреплены: у fail-круга fault + lap.
-        assert_eq!(lines[1].2, vec![LapEvent::Fault, LapEvent::Lap]);
+        // События круга прикреплены (с метками): у fail-круга fault + lap.
+        assert_eq!(
+            lines[1].2,
+            vec![(30_000, LapEvent::Fault), (40_000, LapEvent::Lap)]
+        );
         // Другой пэд не видит чужих событий.
         assert!(journal.lap_infos("pad-2").is_empty());
         // Дистилят ниже уровня гонки: только окно RaceStarted..Finished.

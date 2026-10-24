@@ -22,7 +22,7 @@ use crate::gui::scrub::{
     SeekButton, Timeline, TimelineEvent, latest_journal,
 };
 use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
-use crate::model::flight::{Journal, RaceClip};
+use crate::model::flight::{Journal, LapEvent, LapLine, RaceClip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::Response;
@@ -116,6 +116,9 @@ impl Default for Idle {
 struct Live {
     /// Гоночный поток: намерения туда, уведомления оттуда.
     race: Race,
+    /// pad_id → дистилят кругов (последний Notice::Laps): строки журнала
+    /// + текущий круг (бегущее время рендер считает по `since`).
+    laps: HashMap<String, Vec<(u64, LapLine, Vec<LapEvent>)>>,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: RaceStage,
     rules: RaceRules,
@@ -187,6 +190,9 @@ struct PadContents {
     image: viewfinder::ViewfinderContents,
     /// Alt: эффективное разрешение ("1080p") или "error".
     res_badge: Option<String>,
+    /// Дистилят кругов: (строка, события круга); текущий круг идёт
+    /// последним (бегущее время считается рендером по `since`).
+    laps: Vec<(LapLine, Vec<LapEvent>)>,
 }
 
 /// Состояние одной кнопки для кадра. Иконки и цвета — часть вёрстки
@@ -363,6 +369,7 @@ impl Flight {
         }
         self.phase = Mode::Live(Live {
             race,
+            laps: HashMap::new(),
             state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
@@ -441,6 +448,9 @@ impl Flight {
                     Notice::State(state) => l.state = state,
                     Notice::EnterReview { journal } => enter_review = Some(journal),
                     Notice::BackToIdle => back_to_idle = true,
+                    Notice::Laps { pad_id, lines } => {
+                        l.laps.insert(pad_id, lines);
+                    }
                 }
             }
             let streaming = l
@@ -515,11 +525,13 @@ impl Flight {
     /// Контент падов из захватов: картинки (с update_frame) и alt-бейджи
     /// разрешений (только для камер активных падов). Рендерятся все пады
     /// (неназначенные — пустые рамки).
+    #[allow(clippy::too_many_arguments)]
     fn prepare_pads(
         webcams: &mut HashMap<String, Camera>,
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
+        laps: &HashMap<String, Vec<(u64, LapLine, Vec<LapEvent>)>>,
         alt: bool,
     ) -> Vec<PadContents> {
         setup
@@ -572,6 +584,15 @@ impl Flight {
                     viewport: pad.fpv.viewport.to_rect(),
                     image,
                     res_badge,
+                    laps: laps
+                        .get(pad_id)
+                        .map(|lines| {
+                            lines
+                                .iter()
+                                .map(|(_, line, events)| (line.clone(), events.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 }
             })
             .collect()
@@ -589,7 +610,14 @@ impl Flight {
         let rec_on = state.rec_on();
         let race_on = state.countdown_active() || matches!(state, RaceStage::Running { .. });
         let now = Instant::now();
-        let pads = Self::prepare_pads(&mut l.webcams, setup, assignments, shown_cameras, alt);
+        let pads = Self::prepare_pads(
+            &mut l.webcams,
+            setup,
+            assignments,
+            shown_cameras,
+            &l.laps,
+            alt,
+        );
         let fps_lines = if alt {
             Self::fps_lines(&l.webcams, shown_cameras, rec_on)
         } else {
@@ -690,7 +718,15 @@ impl Flight {
         {
             ctx.request_repaint_after(UI_TICK);
         }
-        let pads = Self::prepare_pads(&mut i.webcams, setup, assignments, shown_cameras, alt);
+        let no_laps = HashMap::new();
+        let pads = Self::prepare_pads(
+            &mut i.webcams,
+            setup,
+            assignments,
+            shown_cameras,
+            &no_laps,
+            alt,
+        );
         let fps_lines = if alt {
             Self::fps_lines(&i.webcams, shown_cameras, false)
         } else {
@@ -790,6 +826,13 @@ impl Flight {
                     viewport: pad.fpv.viewport.to_rect(),
                     image,
                     res_badge,
+                    // Скраббинг: чистый дистилят (без текущего круга).
+                    laps: d
+                        .journal
+                        .lap_infos(pad_id)
+                        .into_iter()
+                        .map(|(_, line, events)| (line, events))
+                        .collect(),
                 }
             })
             .collect()
@@ -1079,7 +1122,7 @@ impl Flight {
                             egui::Color32::from_rgb(0x30, 0x30, 0x30),
                         );
                     };
-                    for &(zone_start, zone_width) in &column_geometry {
+                    for (i, &(zone_start, zone_width)) in column_geometry.iter().enumerate() {
                         // Ширина — как у вьюфайндера: центр той же зоны.
                         let x = cell_x(zone_start + (zone_width - viewfinder_cols) / 2);
                         let w = cell_x(viewfinder_cols);
@@ -1094,7 +1137,30 @@ impl Flight {
                         guidelines::dashed_rect(ui, first);
                         guidelines::dashed_rect(ui, second);
                         placeholder(ui, first);
-                        placeholder(ui, second);
+                        // Второй прямоугольник — круги пада: по строке на
+                        // круг, сверху вниз; влезают последние.
+                        // Второй прямоугольник без кругов остаётся
+                        // пустым: символ дисконнекта — только в первом.
+                        match frame.pads.get(i) {
+                            Some(content) if !content.laps.is_empty() => {
+                                let capacity = (second.height() / cell_y(1)).max(0.0) as usize;
+                                let rows = lap_table(&content.laps);
+                                let from = rows.len().saturating_sub(capacity);
+                                // Клип по прямоугольнику: строка любой
+                                // ширины не пересечёт рамку (справа
+                                // отступ как у hint_badge_corner).
+                                let painter = ui.painter().with_clip_rect(second);
+                                for (row, (text, strike)) in rows[from..].iter().enumerate() {
+                                    let galley = painter.layout_job(lap_row_job(text, *strike));
+                                    let pos = egui::pos2(
+                                        second.left(),
+                                        second.top() + cell_y(row as isize),
+                                    );
+                                    painter.galley(pos, galley, egui::Color32::WHITE);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
 
@@ -1837,6 +1903,158 @@ pub fn viewfinder_cols(count: usize) -> isize {
 fn mmss(dur: Duration) -> String {
     let secs = dur.as_secs();
     format!("{:02}:{:02}", secs / 60, secs % 60)
+}
+
+/// Таблица кругов: одна строка на круг, колонки «имя время события»
+/// через пробел (ширины — один проход по всем строкам). Имя и время
+/// выравнены вправо; минимальные ширины — 3 и 6 (без разделителей).
+/// Имя — из дистилятора («HS», «1)» — скобку ставит он); текущий
+/// несёт предполагаемое имя (своё «HS»/«N)», даже с крестом);
+/// проваленный отбит пробелами. Время: формат по наибольшему кругу включая
+/// текущий: SS.mmm, далее M:SS.mmm, далее MM:SS.mmm; ведущие нули —
+/// пробелами, ширина резервирована. События: fault ✕, correct □,
+/// lap ●, колонка вправо. Возвращает (строка, конец зачёркнутого
+/// префикса): время провала рисуется зачёркнутым.
+fn lap_table(lines: &[(LapLine, Vec<LapEvent>)]) -> Vec<(String, Option<usize>)> {
+    // Время строки; у текущего — бегущее (он участвует и в выборе
+    // формата колонки).
+    let duration = |(line, _): &(LapLine, Vec<LapEvent>)| match line {
+        LapLine::Success { duration, .. } | LapLine::Fail { duration } => *duration,
+        LapLine::Current { since } => since.elapsed(),
+    };
+    let max_ms = lines
+        .iter()
+        .map(duration)
+        .map(|d| d.as_millis())
+        .max()
+        .unwrap_or(0);
+    // Минимум 6 («SS.mmm») — время всегда в полной ширине колонки.
+    let time_width = if max_ms >= 600_000 {
+        9 // MM:SS.mmm
+    } else if max_ms >= 60_000 {
+        8 // M:SS.mmm
+    } else {
+        6 // SS.mmm
+    };
+    // Текущий круг — предполагаемое имя: что получит, если завершится
+    // успехом (HS, если успешных ещё не было; иначе следующий номер).
+    // Нумерация совпадает с дистилятором: fail номер не съедает.
+    let successes = lines
+        .iter()
+        .filter(|(line, _)| matches!(line, LapLine::Success { .. }))
+        .count();
+    let current_name = if successes == 0 {
+        "HS".to_owned()
+    } else {
+        format!("{successes})")
+    };
+    // Имя — из дистилятора целиком (HS без скобки, «1)» с ней).
+    let name = |(line, _): &(LapLine, Vec<LapEvent>)| match line {
+        LapLine::Success { num, .. } => num.clone(),
+        LapLine::Current { .. } => current_name.clone(),
+        LapLine::Fail { .. } => String::new(), // зафейленный отбит пробелами
+    };
+    // Минимум 2 («HS») — узкие номера («1)») отбиваются пробелами.
+    let name_width = lines
+        .iter()
+        .map(|l| name(l).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(2);
+    let events = |(_, events): &(LapLine, Vec<LapEvent>)| -> String {
+        events
+            .iter()
+            .map(|e| match e {
+                LapEvent::Fault => '✕',
+                LapEvent::Correction => '□',
+                LapEvent::Lap => '\u{25cb}', // полый круг — размером с ✕ и □
+            })
+            .collect::<Vec<char>>()
+            .iter()
+            .map(char::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let has_events = lines.iter().any(|l| !l.1.is_empty());
+    lines
+        .iter()
+        .map(|line| {
+            let mut row = format!(
+                "{:>nw$} {:>tw$}",
+                name(line),
+                lap_time(duration(line), time_width),
+                nw = name_width,
+                tw = time_width,
+            );
+            // Зачёркивание времени провала: префикс ASCII (имя +
+            // пробел + время), границы — байтовые.
+            let strike = matches!(line.0, LapLine::Fail { .. }).then_some(row.len());
+            if has_events {
+                row.push(' ');
+                row.push_str(&events(line)); // глифы через пробел, влево
+            }
+            (row, strike)
+        })
+        .collect()
+}
+
+/// LayoutJob строки круга: временная часть провала зачёркнута.
+fn lap_row_job(text: &str, strike_end: Option<usize>) -> egui::text::LayoutJob {
+    let format = |strike| egui::TextFormat {
+        font_id: style::FONT_REGULAR,
+        color: egui::Color32::WHITE,
+        strikethrough: if strike {
+            egui::Stroke::new(1.5, egui::Color32::WHITE)
+        } else {
+            egui::Stroke::NONE
+        },
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    match strike_end {
+        Some(end) => {
+            job.append(&text[..end], 0.0, format(true));
+            job.append(&text[end..], 0.0, format(false));
+        }
+        None => job.append(text, 0.0, format(false)),
+    }
+    job
+}
+
+/// Время круга. Порядок: рендер «как есть» (круг короче минуты — без
+/// «:» даже в минутном формате), затем ведущие нули целой части —
+/// пробелами (последний ноль нуля-секунд сохраняем), затем отбивка
+/// пробелами до ширины (минимум 6 — «SS.mmm»).
+fn lap_time(dur: Duration, width: usize) -> String {
+    let millis = dur.as_millis() as u64;
+    let (m, sec, ms) = (millis / 60_000, millis / 1000 % 60, millis % 1000);
+    let s = if m > 0 {
+        if width >= 9 {
+            format!("{m:02}:{sec:02}.{ms:03}")
+        } else {
+            format!("{m}:{sec:02}.{ms:03}")
+        }
+    } else {
+        format!("{sec:02}.{ms:03}")
+    };
+    let dot = s.find('.').unwrap();
+    let mut chars: Vec<char> = s.chars().collect();
+    for c in chars[..dot].iter_mut() {
+        if *c == '0' {
+            *c = ' ';
+        } else {
+            break;
+        }
+    }
+    // ноль-секунд: «  .123» не бывает — возвращаем ноль перед точкой
+    if chars[..dot].iter().all(|c| *c == ' ') {
+        chars[dot - 1] = '0';
+    }
+    format!(
+        "{:>w$}",
+        chars.into_iter().collect::<String>(),
+        w = width.max(6)
+    )
 }
 
 struct Res;

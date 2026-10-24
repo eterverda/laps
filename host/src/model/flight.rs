@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
+use std::mem;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -181,6 +183,55 @@ impl Journal {
             }
         }
     }
+
+    /// Дистилят кругов пэда: (метка конца строки, строка, события
+    /// круга). Только окно гонки (RaceStarted → RaceFinished);
+    /// текущий круг сюда не входит — его докидывает RaceCore.
+    /// Успешный круг: последним действием перед Lap не был Fault;
+    /// первый успешный — «HS», дальше 1, 2, … (fail номер не съедает).
+    pub fn lap_infos(&self, pad_id: &str) -> Vec<(u64, LapLine, Vec<LapEvent>)> {
+        let mut lines = Vec::new();
+        let mut in_race = false;
+        let mut lap_start = 0;
+        let mut last_action: Option<LapEvent> = None;
+        let mut successful = 0u32;
+        let mut lap_events = Vec::new();
+        for (ms, event) in self.iter_ms() {
+            match event {
+                JournalRecord::RaceStarted {} => {
+                    in_race = true;
+                    lap_start = ms;
+                }
+                JournalRecord::RaceFinished { .. } => in_race = false,
+                JournalRecord::RaceEvent { pad_id: id, name } if in_race && id == pad_id => {
+                    lap_events.push(*name);
+                    if *name == LapEvent::Lap {
+                        let failed = last_action == Some(LapEvent::Fault);
+                        let duration = Duration::from_millis(ms - lap_start);
+                        let line = if failed {
+                            LapLine::Fail { duration }
+                        } else {
+                            // Имя круга — целиком от дистилятора:
+                            // HS без скобки, нумерованные — с («1)»).
+                            let num = match successful {
+                                0 => "HS".to_owned(),
+                                n => format!("{n})"),
+                            };
+                            successful += 1;
+                            LapLine::Success { num, duration }
+                        };
+                        lines.push((ms, line, mem::take(&mut lap_events)));
+                        lap_start = ms;
+                        last_action = None;
+                    } else {
+                        last_action = Some(*name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        lines
+    }
 }
 
 /// Стем файлов записи (видео + журнал) по date_time старта.
@@ -224,6 +275,10 @@ pub enum JournalRecord {
     /// Структурный вариант без полей: в yaml пишется `{}` (unit-вариант
     /// сериализовался бы null).
     RaceStarted {},
+    RaceEvent {
+        pad_id: String,
+        name: LapEvent,
+    },
     RaceFinished {
         prematurely: bool,
     },
@@ -287,10 +342,28 @@ impl RaceClip {
                 JournalRecord::RaceCountdown {} => clip.race_countdown_ms = Some(ms),
                 JournalRecord::RaceStarted {} => clip.race_started_ms = Some(ms),
                 JournalRecord::RaceFinished { .. } => clip.race_finished_ms = Some(ms),
+                JournalRecord::RaceEvent { .. } => {}
             }
         }
         clip
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LapLine {
+    Success { num: String, duration: Duration },
+    Fail { duration: Duration },
+    Current { since: Instant },
+}
+
+/// Сигнал судьи. В yaml — lower-case (`lap`/`fault`/`correct`).
+#[derive(Debug, Eq, PartialEq, Deserialize, Serialize, Clone, Copy)]
+pub enum LapEvent {
+    #[serde(rename = "fault")]
+    Fault,
+    #[serde(rename = "correct")]
+    Correction,
+    Lap,
 }
 
 #[cfg(test)]
@@ -454,6 +527,96 @@ mod tests {
         assert_eq!(content, yaml, "file mirrors the edited stream");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Дистилят кругов: HS у первого успешного, fail не съедает
+    /// номер, duration — весь круг (до нажатия Lap, fail в том числе).
+    #[test]
+    fn lap_infos_distills_success_fail_and_correct() {
+        let mut journal = sample_journal();
+        journal.push(10_000, JournalRecord::RaceStarted {});
+        // Круг 1: lap без fault — HS.
+        journal.push(
+            25_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Lap,
+            },
+        );
+        // Круг 2: fault, затем lap без correct — fail, номер не жжёт.
+        journal.push(
+            30_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Fault,
+            },
+        );
+        journal.push(
+            40_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Lap,
+            },
+        );
+        // Круг 3: fault → correct → lap — успех «1».
+        journal.push(
+            45_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Fault,
+            },
+        );
+        journal.push(
+            46_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Correction,
+            },
+        );
+        journal.push(
+            60_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Lap,
+            },
+        );
+        journal.push(70_000, JournalRecord::RaceFinished { prematurely: false });
+
+        let lines = journal.lap_infos("pad-1");
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0].0, 25_000);
+        assert_eq!(
+            lines[0].1,
+            LapLine::Success {
+                num: "HS".to_owned(),
+                duration: Duration::from_millis(15_000)
+            }
+        );
+        assert_eq!(
+            lines[1].1,
+            LapLine::Fail {
+                duration: Duration::from_millis(15_000) // весь круг 25→40
+            }
+        );
+        assert_eq!(
+            lines[2].1,
+            LapLine::Success {
+                num: "1)".to_owned(),
+                duration: Duration::from_millis(20_000)
+            }
+        );
+        // События круга прикреплены: у fail-круга fault + lap.
+        assert_eq!(lines[1].2, vec![LapEvent::Fault, LapEvent::Lap]);
+        // Другой пэд не видит чужих событий.
+        assert!(journal.lap_infos("pad-2").is_empty());
+        // Дистилят ниже уровня гонки: только окно RaceStarted..Finished.
+    }
+
+    #[test]
+    fn lap_event_serializes_lowercase() {
+        let yaml = to_yaml_string(&LapEvent::Correction).unwrap();
+        assert!(yaml.contains("correct"), "{yaml}");
+        assert!(!yaml.contains("Correction"), "{yaml}");
     }
 
     #[test]

@@ -24,11 +24,6 @@ pub struct Sound {
 }
 
 impl Sound {
-    /// Гудок старта/финиша и бип отсчёта — уровень приложения,
-    /// константы звуков, а не сервиса.
-    pub const BUZZER: Sound = Sound::from_bytes(crate::assets::BUZZER_WAV);
-    pub const STAGE: Sound = Sound::from_bytes(crate::assets::STAGE_WAV);
-
     pub const fn from_bytes(bytes: &'static [u8]) -> Self {
         assert!(
             bytes.len() > 44

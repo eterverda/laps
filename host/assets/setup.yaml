@@ -18,6 +18,10 @@ pads:
     keybinds:
       - keys: 1
         action: lap
+      - keys: Q
+        action: fault
+      - keys: A
+        action: correct
   pad-2:
     label: CH2
     color: blue

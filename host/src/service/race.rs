@@ -9,8 +9,8 @@ use crate::config::setup::PadConfig;
 use crate::driver::audio::{Audio, Sound};
 use crate::driver::camera::Recorder;
 use crate::driver::dvr::{RecordParams, RecordState};
-use crate::driver::keyboard::{KeyPressed, combo};
-use crate::model::flight::{Journal, JournalRecord};
+use crate::driver::keyboard::KeyPressed;
+use crate::model::flight::{Journal, JournalRecord, LapEvent, LapLine};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
 use crossbeam_channel as crossbeam;
@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 /// Интервал поллинга record_state (first_frame_at) и крышка сна
 /// recv_timeout: события первых кадров заметны не позже этого.
 const POLL: Duration = Duration::from_millis(30);
+
+/// Звуки гонки: механизм — `Sound` драйвера, выбор сэмплов — домен
+/// (гудок старта/финиша, бип отсчёта, фиксация круга).
+const BUZZER: Sound = Sound::from_bytes(crate::assets::BUZZER_WAV);
+const STAGE: Sound = Sound::from_bytes(crate::assets::STAGE_WAV);
+const GATE: Sound = Sound::from_bytes(crate::assets::GATE_WAV);
 
 // --- Ядро гонки --------------------------------------------------------------
 
@@ -51,7 +57,8 @@ pub enum Effect {
     Countdown {
         delay: Duration,
     },
-    Buzzer,
+    /// Короткий звук (гудок финиша, фиксация круга и дальше).
+    Sound(Sound),
     CancelAudio,
 }
 
@@ -162,6 +169,13 @@ struct RaceCore {
     /// (журнал отдаём в DVR) от отмены записи до старта (ядро дропается,
     /// GUI возвращается в Idle).
     raced: bool,
+    /// pad_id → начало текущего круга: момент последнего зафиксированного
+    /// Lap (первый круг — старт гонки, `start_at`). Метка дистилята
+    /// `Current.since`, из журнала не выводится (там ms-домен).
+    lap_started_at: HashMap<String, Instant>,
+    /// pad_id → события текущего круга (fault/correct с последнего Lap):
+    /// живут в дистиляте `Current`, журнал их хранит сам.
+    lap_events: HashMap<String, Vec<LapEvent>>,
 }
 
 impl RaceCore {
@@ -195,6 +209,8 @@ impl RaceCore {
             rec_deferred: Vec::new(),
             rec_seen: HashMap::new(),
             raced: false,
+            lap_started_at: HashMap::new(),
+            lap_events: HashMap::new(),
         };
         core.rec_deferred
             .push((core.ms(now), JournalRecord::RecordStarted {}));
@@ -260,7 +276,7 @@ impl RaceCore {
                         JournalRecord::RaceFinished { prematurely: false },
                     );
                     self.phase = RaceStage::After { race: elapsed };
-                    vec![Effect::Buzzer]
+                    vec![Effect::Sound(BUZZER)]
                 } else {
                     Vec::new()
                 }
@@ -277,6 +293,64 @@ impl RaceCore {
             Intent::RacePressed => self.race_pressed(now),
             Intent::Exit => self.exit(now),
         }
+    }
+
+    /// Нажатие клавиатуры: матч по keybinds пэдов (subset + id, см.
+    /// `KeyBind::matches`); фиксирует RaceEvent в журнал, только в
+    /// Running. Возвращает зафиксированное (пад, сигнал) — обёртка
+    /// шлёт GUI `Notice::Laps` и звук на lap.
+    pub fn key_pressed(&mut self, event: &KeyPressed, now: Instant) -> Option<(String, LapEvent)> {
+        if !matches!(self.phase, RaceStage::Running { .. }) {
+            return None; // вне гонки судейские сигналы игнорируем
+        }
+        let matched = self.journal.header().pads.iter().find_map(|(pad_id, pad)| {
+            pad.keybinds
+                .iter()
+                .find(|bind| bind.matches(event))
+                .and_then(|bind| lap_event(&bind.action))
+                .map(|name| (pad_id.clone(), name))
+        });
+        let (pad_id, name) = matched?;
+        self.journal.push(
+            self.ms(now),
+            JournalRecord::RaceEvent {
+                pad_id: pad_id.clone(),
+                name,
+            },
+        );
+        if name == LapEvent::Lap {
+            self.lap_started_at.insert(pad_id.clone(), now);
+            self.lap_events.remove(&pad_id);
+        } else {
+            self.lap_events
+                .entry(pad_id.clone())
+                .or_default()
+                .push(name);
+        }
+        Some((pad_id, name))
+    }
+
+    /// Дистиляты всех пэдов: полное обновление GUI (на старте гонки,
+    /// когда текущий круг появляется у каждого пада без единого события).
+    pub fn all_laps(&self, now: Instant) -> Vec<(String, Vec<(u64, LapLine, Vec<LapEvent>)>)> {
+        self.journal
+            .header()
+            .pads
+            .keys()
+            .map(|pad_id| (pad_id.clone(), self.laps(pad_id, now)))
+            .collect()
+    }
+
+    /// Дистилят кругов пэда: строки журнала плюс текущий круг, пока
+    /// гонка идёт (время GUI считает сам по `since`).
+    pub fn laps(&self, pad_id: &str, now: Instant) -> Vec<(u64, LapLine, Vec<LapEvent>)> {
+        let mut lines = self.journal.lap_infos(pad_id);
+        if let RaceStage::Running { start_at } = self.phase {
+            let since = self.lap_started_at.get(pad_id).copied().unwrap_or(start_at);
+            let events = self.lap_events.get(pad_id).cloned().unwrap_or_default();
+            lines.push((self.ms(now), LapLine::Current { since }, events));
+        }
+        lines
     }
 
     /// Намерение REC (ядро живо).
@@ -298,7 +372,10 @@ impl RaceCore {
                 );
                 self.finish_recording(now);
                 self.phase = RaceStage::Finished;
-                vec![Effect::Buzzer, Effect::StopRecording { commit: true }]
+                vec![
+                    Effect::Sound(BUZZER),
+                    Effect::StopRecording { commit: true },
+                ]
             }
             RaceStage::After { .. } => {
                 self.finish_recording(now);
@@ -336,7 +413,7 @@ impl RaceCore {
                     JournalRecord::RaceFinished { prematurely: true },
                 );
                 self.phase = RaceStage::After { race };
-                vec![Effect::Buzzer]
+                vec![Effect::Sound(BUZZER)]
             }
             RaceStage::After { .. } | RaceStage::Finished => Vec::new(),
         }
@@ -353,7 +430,10 @@ impl RaceCore {
                     JournalRecord::RaceFinished { prematurely: true },
                 );
                 self.finish_recording(now);
-                vec![Effect::Buzzer, Effect::StopRecording { commit: true }]
+                vec![
+                    Effect::Sound(BUZZER),
+                    Effect::StopRecording { commit: true },
+                ]
             }
             RaceStage::After { .. } => {
                 self.finish_recording(now);
@@ -477,6 +557,8 @@ impl RaceCore {
 mod tests {
     use super::*;
     use crate::config::camera::PixelConfig;
+    use crate::config::keyboard::KeyBind;
+    use crate::driver::keyboard::key_set;
     use crate::model::rules::StartSignalDelay;
     use std::env::temp_dir;
 
@@ -520,6 +602,130 @@ mod tests {
         .0
     }
 
+    /// Пад с одним биндингом «A → lap» на эксклюзивной клавиатуре key-1.
+    fn test_pads() -> BTreeMap<String, PadConfig> {
+        let mut pads = BTreeMap::new();
+        pads.insert(
+            "pad-1".to_owned(),
+            PadConfig {
+                label: "A1".to_owned(),
+                color: crate::config::setup::ColorConfig::Red,
+                fpv: crate::config::setup::FpvConfig {
+                    camera_id: "camera-1".to_owned(),
+                    viewport: crate::config::camera::ViewportConfig::default(),
+                },
+                keybinds: vec![
+                    KeyBind {
+                        #[cfg(target_os = "linux")]
+                        exclusive_keyboard_id: Some("key-1".to_owned()),
+                        keys: key_set(&[0x04]),
+                        action: "lap".to_owned(),
+                    },
+                    KeyBind {
+                        #[cfg(target_os = "linux")]
+                        exclusive_keyboard_id: Some("key-1".to_owned()),
+                        keys: key_set(&[0xE0, 0x05]),
+                        action: "fault".to_owned(),
+                    },
+                ],
+            },
+        );
+        pads
+    }
+
+    fn key_press(keys: &[u32]) -> KeyPressed {
+        KeyPressed {
+            #[cfg(target_os = "linux")]
+            exclusive_keyboard_id: Some("key-1".to_owned()),
+            keys: key_set(keys),
+            at: Instant::now(),
+        }
+    }
+
+    /// Судейские сигналы: только в Running, матч по биндингу пада,
+    /// дистилят с текущим кругом.
+    #[test]
+    fn key_pressed_records_race_event_and_builds_laps() {
+        let mut clock = FakeClock::new();
+        let (mut core, _effects) = RaceCore::new(
+            clock.now,
+            RaceRules {
+                duration: Some(DURATION),
+                start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+            },
+            temp_dir(),
+            Duration::ZERO,
+            test_pads(),
+            HashMap::new(),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
+        );
+        // До гонки сигналы игнорируются.
+        assert!(core.key_pressed(&key_press(&[0x04]), clock.now).is_none());
+        core.race_pressed(clock.now);
+        let t_start = clock.advance(10_000); // отсчёт вышел — Running
+        core.tick(t_start);
+        // Старт гонки: текущий круг — у каждого пада, без единого
+        // судейского события.
+        let all = core.all_laps(clock.now);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert_eq!(all[0].1.len(), 1, "{all:?}");
+        assert!(matches!(all[0].1[0].1, LapLine::Current { .. }));
+        // Lap на 15-й секунде гонки.
+        let t_lap = clock.advance(15_000);
+        assert_eq!(
+            core.key_pressed(&key_press(&[0x04]), t_lap),
+            Some(("pad-1".to_owned(), LapEvent::Lap))
+        );
+        let marks = journal_marks(&core);
+        assert!(
+            marks.iter().any(|(_, m)| *m == "race-event"),
+            "RaceEvent в журнале: {marks:?}"
+        );
+        let lines = core.laps("pad-1", clock.now);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        // Круг от гудка: lap на t0+25 с (10 с до старта + 15 с), гудок
+        // на t0+3 с (PRE_BEEP_SECS отсчёта) → 22 с.
+        assert_eq!(
+            lines[0].1,
+            LapLine::Success {
+                num: "HS".to_owned(),
+                duration: Duration::from_millis(22_000)
+            }
+        );
+        assert!(matches!(lines[1].1, LapLine::Current { .. }));
+        // Fault текущего круга: в журнале и в событиях Current.
+        assert_eq!(
+            core.key_pressed(&key_press(&[0xE0, 0x05]), clock.now),
+            Some(("pad-1".to_owned(), LapEvent::Fault))
+        );
+        let lines = core.laps("pad-1", clock.now);
+        let current = lines.last().expect("current");
+        assert_eq!(current.2, vec![LapEvent::Fault], "fault у текущего круга");
+        // Следующий lap открывает новый круг: события обнулились.
+        assert_eq!(
+            core.key_pressed(&key_press(&[0x04]), clock.now),
+            Some(("pad-1".to_owned(), LapEvent::Lap))
+        );
+        let lines = core.laps("pad-1", clock.now);
+        assert!(lines.last().unwrap().2.is_empty(), "новый круг чист");
+        // Несматчившее нажатие (другой клавишей) — ничего не меняет.
+        assert!(core.key_pressed(&key_press(&[0x05]), clock.now).is_none());
+        // Финиш: текущий круг исчезает — дистилят только журнальный.
+        let t_end = clock.advance(DURATION.as_millis() as u64);
+        core.tick(t_end);
+        let lines = core.laps("pad-1", clock.now);
+        // HS (lap) + Fail (fault → lap без correct); открытый после них
+        // круг — Current, на финше гаснет.
+        assert_eq!(lines.len(), 2, "итог гонки: {lines:?}");
+        assert!(matches!(lines[1].1, LapLine::Fail { .. }), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|(_, line, _)| !matches!(line, LapLine::Current { .. })),
+            "после финиша Current нет: {lines:?}"
+        );
+    }
+
     /// События журнала как (ms, короткая метка) для asserts.
     fn journal_marks(core: &RaceCore) -> Vec<(u64, &'static str)> {
         core.journal
@@ -538,6 +744,7 @@ mod tests {
                             "finish-auto"
                         }
                     }
+                    JournalRecord::RaceEvent { .. } => "race-event",
                 };
                 (ms, mark)
             })
@@ -587,7 +794,10 @@ mod tests {
 
         // Лимит: авто-финиш ровно через DURATION от старта.
         let t_finish = clock.advance(DURATION.as_millis() as u64);
-        assert!(matches!(core.tick(t_finish).as_slice(), [Effect::Buzzer]));
+        assert!(matches!(
+            core.tick(t_finish).as_slice(),
+            [Effect::Sound(sound)] if *sound == BUZZER
+        ));
         assert_eq!(
             journal_marks(&core)[4],
             (
@@ -666,7 +876,8 @@ mod tests {
         let t_rec = clock.advance(20_000);
         assert!(matches!(
             core.intent(Intent::RecPressed, t_rec).as_slice(),
-            [Effect::Buzzer, Effect::StopRecording { commit: true }]
+            [Effect::Sound(sound), Effect::StopRecording { commit: true }]
+                if *sound == BUZZER
         ));
         let marks = journal_marks(&core);
         assert_eq!(
@@ -688,7 +899,7 @@ mod tests {
         let t = clock.advance(12_345);
         assert!(matches!(
             core.intent(Intent::RacePressed, t).as_slice(),
-            [Effect::Buzzer]
+            [Effect::Sound(sound)] if *sound == BUZZER
         ));
         let marks = journal_marks(&core);
         assert_eq!(marks.last(), Some(&(15_345, "finish-user")), "{marks:?}");
@@ -710,7 +921,8 @@ mod tests {
         let t = clock.advance(5_000);
         assert!(matches!(
             core.intent(Intent::Exit, t).as_slice(),
-            [Effect::Buzzer, Effect::StopRecording { commit: true }]
+            [Effect::Sound(sound), Effect::StopRecording { commit: true }]
+                if *sound == BUZZER
         ));
         assert_eq!(
             journal_marks(&core).last(),
@@ -779,7 +991,8 @@ mod tests {
         let t_rec = clock.advance(20_000);
         assert!(matches!(
             core.intent(Intent::RecPressed, t_rec).as_slice(),
-            [Effect::Buzzer, Effect::StopRecording { commit: true }]
+            [Effect::Sound(sound), Effect::StopRecording { commit: true }]
+                if *sound == BUZZER
         ));
         let marks = journal_marks(&core);
         assert_eq!(
@@ -827,7 +1040,7 @@ mod tests {
         // Пользователь завершает кнопкой.
         assert!(matches!(
             core.intent(Intent::RacePressed, t_later).as_slice(),
-            [Effect::Buzzer]
+            [Effect::Sound(sound)] if *sound == BUZZER
         ));
     }
 
@@ -852,6 +1065,16 @@ mod tests {
     }
 }
 
+/// Keybind action → сигнал судьи; неизвестное действие не сигнал.
+fn lap_event(action: &str) -> Option<LapEvent> {
+    match action {
+        "lap" => Some(LapEvent::Lap),
+        "fault" => Some(LapEvent::Fault),
+        "correct" => Some(LapEvent::Correction),
+        _ => None,
+    }
+}
+
 /// Сообщения ядра → GUI.
 pub enum Notice {
     /// Состояние эфира изменилось (GUI держит последний).
@@ -862,6 +1085,12 @@ pub enum Notice {
     /// REC-off до старта гонки: сессия отменена, журнала на диске нет.
     /// GUI возвращается в Idle (поток завершился).
     BackToIdle,
+    /// Дистилят кругов пэда после RaceEvent: строки журнала + текущий
+    /// круг, пока гонка идёт (GUI считает бегущее время по `since`).
+    Laps {
+        pad_id: String,
+        lines: Vec<(u64, LapLine, Vec<LapEvent>)>,
+    },
 }
 
 /// Хэндл гоночного потока для GUI: шлём намерения, забираем уведомления.
@@ -903,22 +1132,11 @@ impl Race {
     ) -> Race {
         let (intent_tx, intent_rx) = crossbeam::bounded(16);
         let (notice_tx, notice_rx) = crossbeam::bounded(64);
-        // Биндинги с id пада для матчинга в дрейне: pads дальше
-        // уйдут в ядро.
-        let keybinds: Vec<(String, crate::config::keyboard::KeyBind)> = pads
-            .iter()
-            .flat_map(|(pad_id, pad)| {
-                pad.keybinds
-                    .clone()
-                    .into_iter()
-                    .map(move |bind| (pad_id.clone(), bind))
-            })
-            .collect();
         let (core, effects) = RaceCore::new(
             Instant::now(),
             rules,
             captures_dir.clone(),
-            Sound::BUZZER.duration(),
+            BUZZER.duration(),
             pads,
             assignments,
             cameras,
@@ -975,22 +1193,26 @@ impl Race {
                         Err(_) => break, // GUI ушёл без выхода
                     },
                     recv(&keyboard_rx) -> event => match event {
-                        // Регистрация нажатий — в RaceCore (пока лог).
                         Ok(event) => {
                             log::info!("keyboard: {event}");
-                            // Матчинг по биндингам падов: аккорд и его
-                            // action в лог. Код намеренно не обобщён с
-                            // Idle-дрейном: реакции разойдутся.
-                            for (pad_id, bind) in &keybinds {
-                                if bind.matches(&event) {
-                                    log::info!(
-                                        "keybind: {pad_id} {} -> {}",
-                                        combo(&bind.keys),
-                                        bind.action
-                                    );
+                            // Ядро фиксирует RaceEvent; дистилят — GUI,
+                            // звук фиксации круга — через эффекты.
+                            let now = Instant::now();
+                            match core.key_pressed(&event, now) {
+                                Some((pad_id, name)) => {
+                                    let _ = notice_tx.try_send(Notice::Laps {
+                                        pad_id: pad_id.clone(),
+                                        lines: core.laps(&pad_id, now),
+                                    });
+                                    wake();
+                                    if name == LapEvent::Lap {
+                                        vec![Effect::Sound(GATE)]
+                                    } else {
+                                        Vec::new()
+                                    }
                                 }
+                                None => Vec::new(),
                             }
-                            Vec::new()
                         }
                         // Отвал клавиатур отключает ветку: never не
                         // готов никогда, цикл живёт.
@@ -1017,9 +1239,18 @@ impl Race {
                 // гнать уведомления.
                 let air = core.phase();
                 if air != last_air {
+                    let was_running = matches!(last_air, RaceStage::Running { .. });
                     last_air = air;
                     let _ = notice_tx.try_send(Notice::State(air));
                     wake();
+                    // Границы гонки: на старте текущий круг появляется у
+                    // каждого пада (без единого события); на финше
+                    // пропадает — свежий дистилят его перезаписывает.
+                    if matches!(air, RaceStage::Running { .. }) || was_running {
+                        for (pad_id, lines) in core.all_laps(Instant::now()) {
+                            let _ = notice_tx.try_send(Notice::Laps { pad_id, lines });
+                        }
+                    }
                 }
                 if air.finished() {
                     if core.has_raced() {
@@ -1057,13 +1288,13 @@ impl Race {
 fn countdown_steps(delay: Duration) -> Vec<(Duration, Sound)> {
     let interval = delay.saturating_sub(Duration::from_secs(PRE_BEEP_SECS));
     if interval.is_zero() {
-        vec![(Duration::ZERO, Sound::BUZZER)]
+        vec![(Duration::ZERO, BUZZER)]
     } else {
         let mut steps: Vec<(Duration, Sound)> = (0..PRE_BEEP_SECS)
             .map(Duration::from_secs)
-            .map(|t| (t, Sound::STAGE))
+            .map(|t| (t, STAGE))
             .collect();
-        steps.push((delay, Sound::BUZZER));
+        steps.push((delay, BUZZER));
         steps
     }
 }
@@ -1089,7 +1320,7 @@ fn apply(effects: &[Effect], recorders: &HashMap<String, Recorder>, audio: &Audi
                 }
             }
             Effect::Countdown { delay } => audio.sequence(countdown_steps(*delay)),
-            Effect::Buzzer => audio.play(Sound::BUZZER),
+            Effect::Sound(sound) => audio.play(*sound),
             Effect::CancelAudio => audio.cancel(),
         }
     }

@@ -7,3 +7,5 @@ pub const SETUP_YAML: &str = include_str!("../assets/setup.yaml");
 pub const STAGE_WAV: &[u8] = include_bytes!("../assets/sfx/stage.wav");
 /// Гудок старт/стоп.
 pub const BUZZER_WAV: &[u8] = include_bytes!("../assets/sfx/buzzer.wav");
+/// Фиксация круга (из laps-trainer, gate).
+pub const GATE_WAV: &[u8] = include_bytes!("../assets/sfx/gate.wav");

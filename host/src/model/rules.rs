@@ -46,7 +46,7 @@ impl Default for RaceRules {
     fn default() -> Self {
         Self {
             start_signal_delay: Default::default(),
-            duration: Some(Duration::from_secs(15)),
+            duration: Some(Duration::from_secs(90)),
         }
     }
 }

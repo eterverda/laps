@@ -1965,7 +1965,7 @@ fn lap_table(lines: &[(LapLine, Vec<LapEvent>)]) -> Vec<(String, Option<usize>)>
         events
             .iter()
             .map(|e| match e {
-                LapEvent::Fault => '✕',
+                LapEvent::Fault => '\u{f0156}', // nf-md-close
                 LapEvent::Correction => '□',
                 LapEvent::Lap => '\u{25cb}', // полый круг — размером с ✕ и □
             })

@@ -307,7 +307,7 @@ impl RaceCore {
             pad.keybinds
                 .iter()
                 .find(|bind| bind.matches(event))
-                .and_then(|bind| lap_event(&bind.action))
+                .and_then(|bind| LapEvent::from_action(&bind.action))
                 .map(|name| (pad_id.clone(), name))
         });
         let (pad_id, name) = matched?;
@@ -718,13 +718,12 @@ mod tests {
         assert!(lines.last().unwrap().2.is_empty(), "новый круг чист");
         // Несматчившее нажатие (другой клавишей) — ничего не меняет.
         assert!(core.key_pressed(&key_press(&[0x05]), clock.now).is_none());
-        // Финиш: текущий круг исчезает — дистилят только журнальный.
+        // Финиш: Current сменяется застывшим незакрытым кругом.
         let t_end = clock.advance(DURATION.as_millis() as u64);
         core.tick(t_end);
         let lines = core.laps("pad-1", clock.now);
-        // HS (lap) + Fail (fault → lap без correct); открытый после них
-        // круг — Current, на финше гаснет.
-        assert_eq!(lines.len(), 2, "итог гонки: {lines:?}");
+        // HS (lap) + Fail (fault → lap без correct) + незакрытый хвост.
+        assert_eq!(lines.len(), 3, "итог гонки: {lines:?}");
         assert!(matches!(lines[1].1, LapLine::Fail { .. }), "{lines:?}");
         assert!(
             lines
@@ -732,6 +731,11 @@ mod tests {
                 .all(|(_, line, _)| !matches!(line, LapLine::Current { .. })),
             "после финиша Current нет: {lines:?}"
         );
+        assert!(
+            matches!(lines[2].1, LapLine::Unfinished { .. }),
+            "незакрытый круг после финиша: {lines:?}"
+        );
+        assert!(lines[2].2.is_empty(), "хвост без событий: {lines:?}");
     }
 
     /// События журнала как (ms, короткая метка) для asserts.
@@ -1073,16 +1077,6 @@ mod tests {
     }
 }
 
-/// Keybind action → сигнал судьи; неизвестное действие не сигнал.
-fn lap_event(action: &str) -> Option<LapEvent> {
-    match action {
-        "lap" => Some(LapEvent::Lap),
-        "fault" => Some(LapEvent::Fault),
-        "correct" => Some(LapEvent::Correction),
-        _ => None,
-    }
-}
-
 /// Сообщения ядра → GUI.
 pub enum Notice {
     /// Состояние эфира изменилось (GUI держит последний).
@@ -1252,8 +1246,9 @@ impl Race {
                     let _ = notice_tx.try_send(Notice::State(air));
                     wake();
                     // Границы гонки: на старте текущий круг появляется у
-                    // каждого пада (без единого события); на финше
-                    // пропадает — свежий дистилят его перезаписывает.
+                    // каждого пада (без единого события); на финше он
+                    // сменяется застывшим незакрытым — свежий дистилят
+                    // его перезаписывает.
                     if matches!(air, RaceStage::Running { .. }) || was_running {
                         for (pad_id, lines) in core.all_laps(Instant::now()) {
                             let _ = notice_tx.try_send(Notice::Laps { pad_id, lines });

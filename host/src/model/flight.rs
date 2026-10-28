@@ -185,8 +185,9 @@ impl Journal {
     }
 
     /// Дистилят кругов пэда: (метка конца строки, строка, события
-    /// круга). Только окно гонки (RaceStarted → RaceFinished);
-    /// текущий круг сюда не входит — его докидывает RaceCore.
+    /// круга). Только окно гонки (RaceStarted → RaceFinished); текущий
+    /// круг в эфире сюда не входит — его докидывает RaceCore, а после
+    /// RaceFinished выдаётся здесь же незакрытый круг (`Unfinished`).
     /// Успешный круг: последним действием перед Lap не был Fault;
     /// первый успешный — «HS», дальше 1, 2, … (fail номер не съедает).
     pub fn lap_infos(&self, pad_id: &str) -> Vec<(u64, LapLine, Vec<(u64, LapEvent)>)> {
@@ -196,13 +197,17 @@ impl Journal {
         let mut last_action: Option<LapEvent> = None;
         let mut successful = 0u32;
         let mut lap_events = Vec::new();
+        let mut race_finished = None;
         for (ms, event) in self.iter_ms() {
             match event {
                 JournalRecord::RaceStarted {} => {
                     in_race = true;
                     lap_start = ms;
                 }
-                JournalRecord::RaceFinished { .. } => in_race = false,
+                JournalRecord::RaceFinished { .. } => {
+                    in_race = false;
+                    race_finished = Some(ms);
+                }
                 JournalRecord::RaceEvent { pad_id: id, name } if in_race && id == pad_id => {
                     lap_events.push((ms, *name));
                     if *name == LapEvent::Lap {
@@ -223,12 +228,29 @@ impl Journal {
                         lines.push((ms, line, mem::take(&mut lap_events)));
                         lap_start = ms;
                         last_action = None;
-                    } else {
+                    } else if *name != LapEvent::Warn {
+                        // Warn расчётно нейтрален: в события круга
+                        // попал выше, на fail/success не влияет (fault
+                        // перед ним не снимает).
                         last_action = Some(*name);
                     }
                 }
                 _ => {}
             }
+        }
+        // Незакрытый круг гонки (пост-полётный «текущий»): после
+        // RaceFinished остаток событий не пристроен ни одному кругу.
+        // Строка выдаётся всегда — с застывшим временем (от начала
+        // круга до финиша), как Current в эфире показывается у каждого
+        // пада без единого события.
+        if let Some(finish) = race_finished {
+            lines.push((
+                finish,
+                LapLine::Unfinished {
+                    duration: Duration::from_millis(finish - lap_start),
+                },
+                mem::take(&mut lap_events),
+            ));
         }
         lines
     }
@@ -351,19 +373,69 @@ impl RaceClip {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LapLine {
-    Success { num: String, duration: Duration },
-    Fail { duration: Duration },
-    Current { since: Instant },
+    Success {
+        num: String,
+        duration: Duration,
+    },
+    Fail {
+        duration: Duration,
+    },
+    Current {
+        since: Instant,
+    },
+    /// Пост-полётный незакрытый круг (живой «текущий» после
+    /// RaceFinished): время застывшее — от начала круга до финиша.
+    /// Рендерится как Current (серый), но без имени — колонка
+    /// резервируется пустой.
+    Unfinished {
+        duration: Duration,
+    },
 }
 
-/// Сигнал судьи. В yaml — lower-case (`lap`/`fault`/`correct`).
+impl LapLine {
+    /// Длительность круга: зафиксированная у завершённых и у
+    /// незакрытого пост-полётного, бегущая у текущего (эфир).
+    pub fn duration(&self) -> Duration {
+        match self {
+            LapLine::Success { duration, .. }
+            | LapLine::Fail { duration }
+            | LapLine::Unfinished { duration } => *duration,
+            LapLine::Current { since } => since.elapsed(),
+        }
+    }
+}
+
+/// Сигнал судьи. В yaml — lower-case (`lap`/`fault`/`correct`/`warn`).
+/// Warn расчётно нейтрален: отображается с меткой, на fail/success
+/// круга не влияет.
 #[derive(Debug, Eq, PartialEq, Deserialize, Serialize, Clone, Copy)]
 pub enum LapEvent {
     #[serde(rename = "fault")]
     Fault,
     #[serde(rename = "correct")]
     Correction,
+    /// alias — старые журналы (до rename сериализовали `Lap`).
+    #[serde(rename = "lap", alias = "Lap")]
     Lap,
+    #[serde(rename = "warn")]
+    Warn,
+}
+
+impl LapEvent {
+    /// Имя action/yaml варианта — единый источник: сериализация
+    /// (serde-rename'ы выше).
+    pub fn action(&self) -> String {
+        serde_yaml::to_string(self)
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Action биндинга → сигнал. Неизвестное действие — None.
+    pub fn from_action(action: &str) -> Option<Self> {
+        [Self::Lap, Self::Fault, Self::Correction, Self::Warn]
+            .into_iter()
+            .find(|e| e.action() == action)
+    }
 }
 
 #[cfg(test)]
@@ -583,7 +655,7 @@ mod tests {
         journal.push(70_000, JournalRecord::RaceFinished { prematurely: false });
 
         let lines = journal.lap_infos("pad-1");
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
         assert_eq!(lines[0].0, 25_000);
         assert_eq!(
             lines[0].1,
@@ -610,9 +682,146 @@ mod tests {
             lines[1].2,
             vec![(30_000, LapEvent::Fault), (40_000, LapEvent::Lap)]
         );
-        // Другой пэд не видит чужих событий.
-        assert!(journal.lap_infos("pad-2").is_empty());
+        // Незакрытый хвост после финиша: застывшее время, событий нет.
+        assert_eq!(lines[3].0, 70_000);
+        assert_eq!(
+            lines[3].1,
+            LapLine::Unfinished {
+                duration: Duration::from_millis(10_000) // 60→70
+            }
+        );
+        assert!(lines[3].2.is_empty());
+        // Пэд без единого события видит только незакрытый круг гонки.
+        let pad2 = journal.lap_infos("pad-2");
+        assert_eq!(pad2.len(), 1, "{pad2:?}");
+        assert_eq!(
+            pad2[0].1,
+            LapLine::Unfinished {
+                duration: Duration::from_millis(60_000) // 10→70
+            }
+        );
         // Дистилят ниже уровня гонки: только окно RaceStarted..Finished.
+    }
+
+    /// Warn: прикрепляется к событию круга с меткой, но на расчёт не
+    /// влияет — fault перед ним не снимает, номер не жжёт.
+    #[test]
+    fn lap_infos_warn_is_display_only() {
+        let mut journal = sample_journal();
+        journal.push(10_000, JournalRecord::RaceStarted {});
+        // warn до и после fault: круг всё равно fail.
+        journal.push(
+            20_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Warn,
+            },
+        );
+        journal.push(
+            30_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Fault,
+            },
+        );
+        journal.push(
+            35_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Warn,
+            },
+        );
+        journal.push(
+            40_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Lap,
+            },
+        );
+        journal.push(50_000, JournalRecord::RaceFinished { prematurely: false });
+
+        let lines = journal.lap_infos("pad-1");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(matches!(lines[0].1, LapLine::Fail { .. }), "{lines:?}");
+        // Оба warn — в событиях круга, с метками.
+        assert_eq!(
+            lines[0].2,
+            vec![
+                (20_000, LapEvent::Warn),
+                (30_000, LapEvent::Fault),
+                (35_000, LapEvent::Warn),
+                (40_000, LapEvent::Lap),
+            ]
+        );
+        // Незакрытый хвост (40→50) без событий — всё равно строка.
+        assert_eq!(lines[1].0, 50_000);
+        assert_eq!(
+            lines[1].1,
+            LapLine::Unfinished {
+                duration: Duration::from_millis(10_000)
+            }
+        );
+        assert!(lines[1].2.is_empty());
+    }
+
+    /// Незакрытый круг после RaceFinished: строка с застывшим
+    /// временем (от начала круга до финиша) и событиями круга.
+    /// Без событий после последнего завершённого круга строки нет.
+    #[test]
+    fn lap_infos_appends_unfinished_lap_after_finish() {
+        let mut journal = sample_journal();
+        journal.push(10_000, JournalRecord::RaceStarted {});
+        journal.push(
+            25_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Lap,
+            },
+        );
+        // Незакрытый круг: fault + warn, затем финиш.
+        journal.push(
+            30_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Fault,
+            },
+        );
+        journal.push(
+            32_000,
+            JournalRecord::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Warn,
+            },
+        );
+        journal.push(40_000, JournalRecord::RaceFinished { prematurely: false });
+
+        let lines = journal.lap_infos("pad-1");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1].0, 40_000);
+        assert_eq!(
+            lines[1].1,
+            LapLine::Unfinished {
+                duration: Duration::from_millis(15_000) // 25→40
+            }
+        );
+        assert_eq!(
+            lines[1].2,
+            vec![(30_000, LapEvent::Fault), (32_000, LapEvent::Warn)]
+        );
+    }
+
+    /// from_action читает имена вариантов — та же таблица, что yaml.
+    #[test]
+    fn lap_event_from_action_matches_yaml_names() {
+        for (action, event) in [
+            ("lap", LapEvent::Lap),
+            ("fault", LapEvent::Fault),
+            ("correct", LapEvent::Correction),
+            ("warn", LapEvent::Warn),
+        ] {
+            assert_eq!(LapEvent::from_action(action), Some(event));
+        }
+        assert_eq!(LapEvent::from_action("banana"), None);
     }
 
     #[test]
@@ -620,6 +829,9 @@ mod tests {
         let yaml = to_yaml_string(&LapEvent::Correction).unwrap();
         assert!(yaml.contains("correct"), "{yaml}");
         assert!(!yaml.contains("Correction"), "{yaml}");
+        let yaml = to_yaml_string(&LapEvent::Warn).unwrap();
+        assert!(yaml.contains("warn"), "{yaml}");
+        assert!(!yaml.contains("Warn"), "{yaml}");
     }
 
     #[test]

@@ -1092,9 +1092,9 @@ impl Flight {
         // Клик по ячейке кругов: (время выделения,
         // выделение). Клик — на конец круга: по событию и
         // по имени/времени. Выделение — кружок, засчитавший
-        // этот круг: свой при клике по событию, последний
-        // кружок строки при клике по имени/времени (у
-        // текущего круга его нет — выделение снимается).
+        // круг: свой при клике по событию, событие, совпавшее
+        // по метке с концом круга, при клике по имени/времени
+        // (у незакрытого такого нет — выделение снимается).
         let mut lap_click: Option<(u64, Option<EventSelection>)> = None;
         for (i, &(first, second)) in zones.iter().enumerate() {
             placeholder(ui, first);
@@ -1132,13 +1132,19 @@ impl Flight {
                     // Блоки событий выровнены вправо: имя и
                     // время между строками на одной линии,
                     // по мере событий не прыгают.
-                    let max_events = rows.iter().map(|r| r.len() - 2).max().unwrap_or(0).max(1);
+                    let max_events = rows
+                        .iter()
+                        .map(|r| lap_event_cells(r).len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(1);
                     for (row, cells) in rows[from..].iter().enumerate() {
                         let full_row = from + row;
                         let pos = egui::pos2(
                             second.left()
                                 + cell_x(
-                                    LAP_EVENT_COLS * (max_events - (cells.len() - 2)) as isize,
+                                    LAP_EVENT_COLS
+                                        * (max_events - lap_event_cells(cells).len()) as isize,
                                 ),
                             second.top() + cell_y(row as isize),
                         );
@@ -1209,25 +1215,24 @@ impl Flight {
                                 }
                                 if response.clicked() {
                                     let pad_id = frame.pads[i].pad_id.clone();
-                                    let selection = if ci + 2 < cells.len() {
+                                    let selection = if ci < lap_event_cells(cells).len() {
                                         Some(EventSelection {
                                             pad_id,
                                             ms: cell.seek,
                                         })
                                     } else {
                                         // Кружок, засчитавший
-                                        // этот круг:
-                                        // последнее событие
-                                        // строки (две
-                                        // последние ячейки —
-                                        // имя и время; у
-                                        // текущего круга
-                                        // событий нет).
-                                        cells
-                                            .len()
-                                            .checked_sub(3)
-                                            .map(|n| &cells[n])
-                                            .filter(|c| !c.text.is_empty())
+                                        // круг: событие, чья
+                                        // метка совпадает с
+                                        // концом круга (время
+                                        // ячейки — end). У
+                                        // незакрытого такого
+                                        // нет — выделение
+                                        // снимается.
+                                        let end = lap_end_ms(cells);
+                                        lap_event_cells(cells)
+                                            .iter()
+                                            .find(|c| c.seek == end)
                                             .map(|c| EventSelection { pad_id, ms: c.seek })
                                     };
                                     lap_click = Some((cell.seek, selection));
@@ -1254,38 +1259,10 @@ impl Flight {
                             LapTone::Future
                         };
                         let cells = [
-                            LapCell {
-                                text: String::new(),
-                                tone,
-                                strike: false,
-                                highlight: false,
-                                active: false,
-                                seek: 0,
-                            },
-                            LapCell {
-                                text: String::new(),
-                                tone,
-                                strike: false,
-                                highlight: false,
-                                active: false,
-                                seek: 0,
-                            },
-                            LapCell {
-                                text: "HS".to_owned(),
-                                tone,
-                                strike: false,
-                                highlight: false,
-                                active: false,
-                                seek: 0,
-                            },
-                            LapCell {
-                                text: lap_time(Duration::ZERO, 6),
-                                tone,
-                                strike: false,
-                                highlight: false,
-                                active: false,
-                                seek: 0,
-                            },
+                            LapCell::plain(String::new(), tone, 0),
+                            LapCell::plain(String::new(), tone, 0),
+                            LapCell::plain("HS", tone, 0),
+                            LapCell::plain(lap_time(Duration::ZERO, 6), tone, 0),
                         ];
                         let galley = ui.painter().layout_job(lap_row_job(&cells));
                         ui.painter().galley(
@@ -2231,6 +2208,30 @@ struct LapCell {
     seek: u64,
 }
 
+impl LapCell {
+    /// Ячейка без зачёркивания и подсветок — таких большинство.
+    fn plain(text: impl Into<String>, tone: LapTone, seek: u64) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+            strike: false,
+            highlight: false,
+            active: false,
+            seek,
+        }
+    }
+}
+
+/// Ячейки событий строки: последние две ячейки — имя и время.
+fn lap_event_cells(cells: &[LapCell]) -> &[LapCell] {
+    cells.split_at(cells.len().saturating_sub(2)).0
+}
+
+/// Метка конца круга: seek времени (последней ячейки строки).
+fn lap_end_ms(cells: &[LapCell]) -> u64 {
+    cells.last().map(|c| c.seek).unwrap_or(0)
+}
+
 /// Таблица кругов: одна строка на круг, колонки «события имя время»
 /// через пробел. События — первая колонка: по глифу на событие, в
 /// порядке возникновения слева направо. Рендер резервирует колонку
@@ -2240,10 +2241,11 @@ struct LapCell {
 /// прыгают. Имя и время выравнены вправо; минимальные ширины — 2 и 6
 /// (без разделителей). Имя — из дистилятора («HS», «1)» — скобку
 /// ставит он); текущий несёт предполагаемое имя (своё «HS»/«N)», даже
-/// с крестом); проваленный отбит пробелами. Время: формат по
+/// с крестом); проваленный и незакрытый пост-полётный отбиты
+/// пробелами (имя пустое, колонка резервируется). Время: формат по
 /// наибольшему кругу включая текущий: SS.mmm, далее M:SS.mmm, далее
 /// MM:SS.mmm; ведущие нули — пробелами, ширина резервирована.
-/// События: fault ✕, correct □, lap ○.
+/// События: fault ✕, correct □, lap ○, warn △.
 ///
 /// Раскраска: `cursor` (мс журнала) — элемент серым, пока его метка
 /// в будущем: имя и время круга — до конца круга (белеют одновременно
@@ -2257,13 +2259,9 @@ fn lap_table(
 ) -> Vec<Vec<LapCell>> {
     // Время строки; у текущего — бегущее (он участвует и в выборе
     // формата колонки).
-    let duration = |line: &LapLine| match line {
-        LapLine::Success { duration, .. } | LapLine::Fail { duration } => *duration,
-        LapLine::Current { since } => since.elapsed(),
-    };
     let max_ms = lines
         .iter()
-        .map(|(_, line, _)| duration(line))
+        .map(|(_, line, _)| line.duration())
         .map(|d| d.as_millis())
         .max()
         .unwrap_or(0);
@@ -2294,6 +2292,9 @@ fn lap_table(
         let name = match line {
             LapLine::Success { num, .. } => num.clone(),
             LapLine::Current { .. } => current_name.clone(),
+            // Незакрытый (пост-полёт): без имени — колонка
+            // резервируется пустой (как у провала).
+            LapLine::Unfinished { .. } => String::new(),
             LapLine::Fail { .. } => String::new(), // зафейленный отбит пробелами
         };
         let tone = |future_mark: bool| {
@@ -2316,6 +2317,7 @@ fn lap_table(
                     LapEvent::Fault => "\u{f0156}".to_owned(),
                     LapEvent::Correction => "□".to_owned(),
                     LapEvent::Lap => "\u{25cb}".to_owned(), // полый круг
+                    LapEvent::Warn => "\u{f0537}".to_owned(), // nf-md-triangle-outline
                 },
                 tone: tone(future(*at)),
                 strike: false,
@@ -2324,23 +2326,16 @@ fn lap_table(
                 seek: *at,
             })
             .collect();
-        let finished = !matches!(line, LapLine::Current { .. });
+        let finished = !matches!(line, LapLine::Current { .. } | LapLine::Unfinished { .. });
         let done_at = if finished { *end } else { u64::MAX };
+        cells.push(LapCell::plain(name, tone(future(done_at)), *end));
         cells.push(LapCell {
-            text: name,
-            tone: tone(future(done_at)),
-            strike: false,
-            highlight: false,
-            active: false,
-            seek: *end,
-        });
-        cells.push(LapCell {
-            text: lap_time(duration(line), time_width),
-            tone: tone(future(done_at)),
             strike: matches!(line, LapLine::Fail { .. }),
-            highlight: false,
-            active: false,
-            seek: *end,
+            ..LapCell::plain(
+                lap_time(line.duration(), time_width),
+                tone(future(done_at)),
+                *end,
+            )
         });
         rows.push(cells);
     }

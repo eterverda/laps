@@ -22,6 +22,8 @@ pads:
         action: fault
       - keys: A
         action: correct
+      - keys: Z
+        action: warn
   pad-2:
     label: CH2
     color: blue

@@ -79,15 +79,22 @@ const TIMER_INACTIVE: egui::Color32 =
 const PAD_TIMER_ACTIVE: egui::Color32 = TIMER_ACTIVE;
 const PAD_TIMER_INACTIVE: egui::Color32 = TIMER_INACTIVE;
 
-/// Ненаступившие компоненты круга (DVR): номер/время до начала круга,
-/// событие до его метки. Не путать с потухшим (мигание) — отдельный
-/// оттенок.
-const LAP_FUTURE: egui::Color32 = egui::Color32::from_rgb(0x60, 0x60, 0x60);
+/// Ненаступившие компоненты круга (DVR): номер/время до конца круга
+/// (белеют одновременно с его кружком), событие до его метки. Не
+/// путать с потухшим (мигание) — отдельный оттенок. Производен:
+/// TRANSPORT_ACTIVE.gamma_multiply(0.6), тот же приём, что у
+/// TIMER_INACTIVE (× 0.2).
+const LAP_FUTURE: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x88, 0x7C);
 
 /// Акцент кругов: обводка активности у курсора и выделение кликом.
 const LAP_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x5A, 0xC1, 0xFE);
 const LAP_HIGHLIGHT: egui::Color32 = LAP_ACCENT;
 const LAP_SELECTION: egui::Color32 = LAP_ACCENT;
+
+/// Событие в колонке кругов занимает 2 колонки сетки: глиф (1) и
+/// разделитель после него (1). Fira Code моноширинный — advance любого
+/// глифа и пробела = клетке (16 pt при 26 pt кегле).
+const LAP_EVENT_COLS: isize = 2;
 
 /// Машина состояний экрана: данные фаз инкапсулированы в вариантах.
 /// Гоночные фазы эфира живут в ядре (service::race::RaceStage) — здесь
@@ -1030,6 +1037,270 @@ impl Flight {
         }
     }
 
+    /// Блок кругов под вьюфайндерами: рамки-зоны (пунктир), символ
+    /// дисконнекта, таблицы кругов пэдов (события/имя/время) и
+    /// микро-таймер отсчёта. Клики по ячейкам (только DVR,
+    /// `frame.laps_clickable`) возвращаются интентом: (время
+    /// перемотки, выделение) — мутацию фазы делает вызывающий.
+    fn show_laps(
+        ui: &mut egui::Ui,
+        frame: &FrameContents,
+        column_geometry: &[(isize, isize)],
+        viewfinder_cols: isize,
+    ) -> Option<(u64, Option<EventSelection>)> {
+        // Квадраты под вьюфайндерами (шириной во вьюфайндер):
+        // первый — клетка ниже картинки (рамка рисуется
+        // Outside — не в счёт), высота 4 клетки; второй —
+        // клетка ниже первого, низ — на нижней границе.
+        let screen = ui.max_rect().into_ruler();
+        let bottom = screen.collapse_bottom().translate(0.0, -cell_y(4));
+        let vf_bottom = cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows(frame.pads.len()) + 2);
+        let first_top = vf_bottom + cell_y(1);
+        let placeholder = |ui: &mut egui::Ui, rect: egui::Rect| {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{ead0}",
+                style::FONT_REGULAR_X2,
+                egui::Color32::from_rgb(0x30, 0x30, 0x30),
+            );
+        };
+        // Рамки — отдельным проходом ДО контента: всё,
+        // что рисуется внутри (плейсхолдер, круги,
+        // микро-таймеры, подсветки), поверх пунктира.
+        let zones: Vec<(egui::Rect, egui::Rect)> = column_geometry
+            .iter()
+            .map(|&(zone_start, zone_width)| {
+                // Ширина — как у вьюфайндера: центр той же зоны.
+                let x = cell_x(zone_start + (zone_width - viewfinder_cols) / 2);
+                let w = cell_x(viewfinder_cols);
+                let first: egui::Rect = egui::pos2(x, first_top)
+                    .into_ruler()
+                    .extrude(w, cell_y(4))
+                    .into();
+                let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
+                    .into_ruler()
+                    .extrude(w, bottom.bottom_left().y - cell_y(1) - first.bottom())
+                    .into();
+                (first, second)
+            })
+            .collect();
+        for (first, second) in &zones {
+            guidelines::dashed_rect(ui, *first);
+            guidelines::dashed_rect(ui, *second);
+        }
+        // Клик по ячейке кругов: (время выделения,
+        // выделение). Клик — на конец круга: по событию и
+        // по имени/времени. Выделение — кружок, засчитавший
+        // этот круг: свой при клике по событию, последний
+        // кружок строки при клике по имени/времени (у
+        // текущего круга его нет — выделение снимается).
+        let mut lap_click: Option<(u64, Option<EventSelection>)> = None;
+        for (i, &(first, second)) in zones.iter().enumerate() {
+            placeholder(ui, first);
+            // Второй прямоугольник — круги пада: по строке на
+            // круг, сверху вниз; влезают последние.
+            // Второй прямоугольник без кругов: отсчёт —
+            // микро-таймер первого круга (мигает в такт
+            // основному таймеру); иначе пусто (символ
+            // дисконнекта — только в первом).
+            match frame.pads.get(i) {
+                Some(_) if !frame.pads[i].laps.is_empty() => {
+                    let capacity = (second.height() / cell_y(1)).max(0.0) as usize;
+                    let pad_id = &frame.pads[i].pad_id;
+                    let active_ms = frame
+                        .laps_active
+                        .as_ref()
+                        .filter(|sel| sel.pad_id == *pad_id)
+                        .map(|sel| sel.ms);
+                    let rows = lap_table(
+                        &frame.pads[i].laps,
+                        frame.laps_cursor,
+                        frame.laps_race_start,
+                        active_ms,
+                    );
+                    let from = rows.len().saturating_sub(capacity);
+                    // Без клипа: по вертикали строки влезают по
+                    // построению (capacity), обводки подсветки
+                    // ничем не обрезаются, а широкая строка пусть
+                    // пересекает пунктир — лучше, чем съеденное
+                    // обрезанием время.
+                    let painter = ui.painter();
+                    // Колонка событий резервируется по самой
+                    // широкой строке пада, минимум — под
+                    // кружок (LAP_EVENT_COLS колонок сетки).
+                    // Блоки событий выровнены вправо: имя и
+                    // время между строками на одной линии,
+                    // по мере событий не прыгают.
+                    let max_events = rows.iter().map(|r| r.len() - 2).max().unwrap_or(0).max(1);
+                    for (row, cells) in rows[from..].iter().enumerate() {
+                        let full_row = from + row;
+                        let pos = egui::pos2(
+                            second.left()
+                                + cell_x(
+                                    LAP_EVENT_COLS * (max_events - (cells.len() - 2)) as isize,
+                                ),
+                            second.top() + cell_y(row as isize),
+                        );
+                        // Геометрия ячеек: позиции для
+                        // заливок, обводок и кликов.
+                        let mut x = pos.x;
+                        let mut rects = Vec::new();
+                        for cell in cells {
+                            let size = measure_text(ui.ctx(), style::FONT_REGULAR, &cell.text);
+                            let rect = egui::Rect::from_min_size(egui::pos2(x, pos.y), size)
+                                .expand2(egui::vec2(6.0, -2.0));
+                            rects.push(rect);
+                            x += size.x + cell_x(1);
+                        }
+                        // Заливка выделенной (кликнутой) —
+                        // под текстом: красный фон.
+                        for (rect, cell) in rects.iter().zip(cells) {
+                            if cell.active {
+                                painter.rect_filled(*rect, 4.0, LAP_SELECTION);
+                            }
+                        }
+                        let galley = painter.layout_job(lap_row_job(cells));
+                        painter.galley(pos, galley, PAD_TIMER_ACTIVE);
+                        for (ci, (rect, cell)) in rects.iter().zip(cells).enumerate() {
+                            // Обводки раздельные. По
+                            // одной: вспышка у курсора —
+                            // по полному rect, выделенная —
+                            // на 2 px меньше. Обе сразу:
+                            // выделенная ещё на 1 px
+                            // меньше, вспышка на 1 px
+                            // больше — рамки разъезжаются.
+                            let both = cell.highlight && cell.active;
+                            if cell.highlight {
+                                let flash = if both { rect.expand(2.0) } else { *rect };
+                                painter.rect_stroke(
+                                    flash,
+                                    4.0,
+                                    egui::Stroke::new(2.0, LAP_HIGHLIGHT),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            if cell.active {
+                                let selection = rect.shrink2(if both {
+                                    egui::vec2(4.0, 4.0)
+                                } else {
+                                    egui::vec2(2.0, 2.0)
+                                });
+                                painter.rect_stroke(
+                                    selection,
+                                    4.0,
+                                    egui::Stroke::new(2.0, LAP_SELECTION),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                            // Клик: перемотка на время
+                            // ячейки (play/RPT не трогаем —
+                            // seek их сохраняет). Выделяется
+                            // кружок: свой у события,
+                            // предыдущий у имени/времени.
+                            if frame.laps_clickable && !cell.text.is_empty() {
+                                let response = ui.interact(
+                                    *rect,
+                                    egui::Id::unique(("lap", i, full_row, ci)),
+                                    egui::Sense::click(),
+                                );
+                                if response.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if response.clicked() {
+                                    let pad_id = frame.pads[i].pad_id.clone();
+                                    let selection = if ci + 2 < cells.len() {
+                                        Some(EventSelection {
+                                            pad_id,
+                                            ms: cell.seek,
+                                        })
+                                    } else {
+                                        // Кружок, засчитавший
+                                        // этот круг:
+                                        // последнее событие
+                                        // строки (две
+                                        // последние ячейки —
+                                        // имя и время; у
+                                        // текущего круга
+                                        // событий нет).
+                                        cells
+                                            .len()
+                                            .checked_sub(3)
+                                            .map(|n| &cells[n])
+                                            .filter(|c| !c.text.is_empty())
+                                            .map(|c| EventSelection { pad_id, ms: c.seek })
+                                    };
+                                    lap_click = Some((cell.seek, selection));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    if let Some(dim) = frame.countdown {
+                        // «0.000» — отсчёт первого круга:
+                        // та же пара цветов таймера, тот же
+                        // сигнал мигания. Раскладка как у
+                        // строки круга: пустые колонки
+                        // событий (мин. 2) и имени (мин. 2) +
+                        // время (мин. 6) — позиция совпадает
+                        // с первым кругом гонки. Тон —
+                        // будущее: круг не завершён;
+                        // потухшая фаза — гаснущий сигнал
+                        // отсчёта.
+                        let tone = if dim {
+                            LapTone::Inactive
+                        } else {
+                            LapTone::Future
+                        };
+                        let cells = [
+                            LapCell {
+                                text: String::new(),
+                                tone,
+                                strike: false,
+                                highlight: false,
+                                active: false,
+                                seek: 0,
+                            },
+                            LapCell {
+                                text: String::new(),
+                                tone,
+                                strike: false,
+                                highlight: false,
+                                active: false,
+                                seek: 0,
+                            },
+                            LapCell {
+                                text: "HS".to_owned(),
+                                tone,
+                                strike: false,
+                                highlight: false,
+                                active: false,
+                                seek: 0,
+                            },
+                            LapCell {
+                                text: lap_time(Duration::ZERO, 6),
+                                tone,
+                                strike: false,
+                                highlight: false,
+                                active: false,
+                                seek: 0,
+                            },
+                        ];
+                        let galley = ui.painter().layout_job(lap_row_job(&cells));
+                        ui.painter().galley(
+                            egui::pos2(second.left(), second.top()),
+                            galley,
+                            PAD_TIMER_ACTIVE,
+                        );
+                    }
+                }
+                None => {}
+            }
+        }
+        lap_click
+    }
+
     pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
         // Main-клавиатура (Idle/Live): события egui уходят в общий
         // канал клавиатур — тот, куда смотрит текущий хаб (локальный
@@ -1182,226 +1453,12 @@ impl Flight {
                             4.0,
                         ));
                     }
-                    // Квадраты под вьюфайндерами (шириной во вьюфайндер):
-                    // первый — клетка ниже картинки (рамка рисуется
-                    // Outside — не в счёт), высота 4 клетки; второй —
-                    // клетка ниже первого, низ — на нижней границе.
-                    let vf_bottom = cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows + 2);
-                    let first_top = vf_bottom + cell_y(1);
-                    let placeholder = |ui: &mut egui::Ui, rect: egui::Rect| {
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "\u{ead0}",
-                            style::FONT_REGULAR_X2,
-                            egui::Color32::from_rgb(0x30, 0x30, 0x30),
-                        );
-                    };
-                    // Рамки — отдельным проходом ДО контента: всё,
-                    // что рисуется внутри (плейсхолдер, круги,
-                    // микро-таймеры, подсветки), поверх пунктира.
-                    let zones: Vec<(egui::Rect, egui::Rect)> = column_geometry
-                        .iter()
-                        .map(|&(zone_start, zone_width)| {
-                            // Ширина — как у вьюфайндера: центр той же зоны.
-                            let x = cell_x(zone_start + (zone_width - viewfinder_cols) / 2);
-                            let w = cell_x(viewfinder_cols);
-                            let first: egui::Rect = egui::pos2(x, first_top)
-                                .into_ruler()
-                                .extrude(w, cell_y(4))
-                                .into();
-                            let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
-                                .into_ruler()
-                                .extrude(w, bottom.bottom_left().y - cell_y(1) - first.bottom())
-                                .into();
-                            (first, second)
-                        })
-                        .collect();
-                    for (first, second) in &zones {
-                        guidelines::dashed_rect(ui, *first);
-                        guidelines::dashed_rect(ui, *second);
-                    }
-                    // Клик по ячейке кругов: (время выделения,
-                    // выделение). Выделение — кружок: свой (клик по
-                    // событию) или предыдущий (клик по имени/времени:
-                    // начало круга = завершение предыдущего).
-                    let mut lap_click: Option<(u64, Option<EventSelection>)> = None;
-                    for (i, &(first, second)) in zones.iter().enumerate() {
-                        placeholder(ui, first);
-                        // Второй прямоугольник — круги пада: по строке на
-                        // круг, сверху вниз; влезают последние.
-                        // Второй прямоугольник без кругов: отсчёт —
-                        // микро-таймер первого круга (мигает в такт
-                        // основному таймеру); иначе пусто (символ
-                        // дисконнекта — только в первом).
-                        match frame.pads.get(i) {
-                            Some(_) if !frame.pads[i].laps.is_empty() => {
-                                let capacity = (second.height() / cell_y(1)).max(0.0) as usize;
-                                let pad_id = &frame.pads[i].pad_id;
-                                let active_ms = frame
-                                    .laps_active
-                                    .as_ref()
-                                    .filter(|sel| sel.pad_id == *pad_id)
-                                    .map(|sel| sel.ms);
-                                let rows = lap_table(
-                                    &frame.pads[i].laps,
-                                    frame.laps_cursor,
-                                    frame.laps_race_start,
-                                    active_ms,
-                                );
-                                let from = rows.len().saturating_sub(capacity);
-                                // Клип по прямоугольнику с запасом под
-                                // обводку подсветки (±6 px плюс 2 px
-                                // штриха наружу): вспышка у кромки не
-                                // обрезается и перекрывает пунктир.
-                                let painter = ui
-                                    .painter()
-                                    .with_clip_rect(second.expand2(egui::vec2(8.0, 2.0)));
-                                for (row, cells) in rows[from..].iter().enumerate() {
-                                    let full_row = from + row;
-                                    let pos = egui::pos2(
-                                        second.left(),
-                                        second.top() + cell_y(row as isize),
-                                    );
-                                    // Геометрия ячеек: позиции для
-                                    // заливок, обводок и кликов.
-                                    let mut x = pos.x;
-                                    let mut rects = Vec::new();
-                                    for cell in cells {
-                                        let size =
-                                            measure_text(ui.ctx(), style::FONT_REGULAR, &cell.text);
-                                        let rect =
-                                            egui::Rect::from_min_size(egui::pos2(x, pos.y), size)
-                                                .expand2(egui::vec2(6.0, -2.0));
-                                        rects.push(rect);
-                                        x += size.x + cell_x(1);
-                                    }
-                                    // Заливка выделенной (кликнутой) —
-                                    // под текстом: красный фон.
-                                    for (rect, cell) in rects.iter().zip(cells) {
-                                        if cell.active {
-                                            painter.rect_filled(*rect, 4.0, LAP_SELECTION);
-                                        }
-                                    }
-                                    let galley = painter.layout_job(lap_row_job(cells));
-                                    painter.galley(pos, galley, PAD_TIMER_ACTIVE);
-                                    for (ci, (rect, cell)) in rects.iter().zip(cells).enumerate() {
-                                        // Обводки раздельные. По
-                                        // одной: вспышка у курсора —
-                                        // по полному rect, выделенная —
-                                        // на 2 px меньше. Обе сразу:
-                                        // выделенная ещё на 1 px
-                                        // меньше, вспышка на 1 px
-                                        // больше — рамки разъезжаются.
-                                        let both = cell.highlight && cell.active;
-                                        if cell.highlight {
-                                            let flash = if both { rect.expand(2.0) } else { *rect };
-                                            painter.rect_stroke(
-                                                flash,
-                                                4.0,
-                                                egui::Stroke::new(2.0, LAP_HIGHLIGHT),
-                                                egui::StrokeKind::Outside,
-                                            );
-                                        }
-                                        if cell.active {
-                                            let selection = rect.shrink2(if both {
-                                                egui::vec2(4.0, 4.0)
-                                            } else {
-                                                egui::vec2(2.0, 2.0)
-                                            });
-                                            painter.rect_stroke(
-                                                selection,
-                                                4.0,
-                                                egui::Stroke::new(2.0, LAP_SELECTION),
-                                                egui::StrokeKind::Outside,
-                                            );
-                                        }
-                                        // Клик: перемотка на время
-                                        // ячейки (play/RPT не трогаем —
-                                        // seek их сохраняет). Выделяется
-                                        // кружок: свой у события,
-                                        // предыдущий у имени/времени.
-                                        if frame.laps_clickable {
-                                            let response = ui.interact(
-                                                *rect,
-                                                egui::Id::unique(("lap", i, full_row, ci)),
-                                                egui::Sense::click(),
-                                            );
-                                            if response.hovered() {
-                                                ui.ctx().set_cursor_icon(
-                                                    egui::CursorIcon::PointingHand,
-                                                );
-                                            }
-                                            if response.clicked() {
-                                                let pad_id = frame.pads[i].pad_id.clone();
-                                                let selection = if ci >= 2 {
-                                                    Some(EventSelection {
-                                                        pad_id,
-                                                        ms: cell.seek,
-                                                    })
-                                                } else if full_row > 0 {
-                                                    // Кружок завершения
-                                                    // предыдущего круга:
-                                                    // последняя ячейка
-                                                    // предыдущей строки.
-                                                    rows[full_row - 1].last().map(|c| {
-                                                        EventSelection { pad_id, ms: c.seek }
-                                                    })
-                                                } else {
-                                                    None
-                                                };
-                                                lap_click = Some((cell.seek, selection));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Some(_) => {
-                                if let Some(dim) = frame.countdown {
-                                    // «0.000» — отсчёт первого круга:
-                                    // та же пара цветов таймера, тот же
-                                    // сигнал мигания. Раскладка как у
-                                    // строки круга: пустая колонка имени
-                                    // (мин. 2) + пробел + время (мин. 6) —
-                                    // чтобы позиция совпала с первым
-                                    // кругом гонки.
-                                    let tone = if dim {
-                                        LapTone::Inactive
-                                    } else {
-                                        LapTone::Active
-                                    };
-                                    let cells = [
-                                        LapCell {
-                                            text: "HS".to_owned(),
-                                            tone,
-                                            strike: false,
-                                            highlight: false,
-                                            active: false,
-                                            seek: 0,
-                                        },
-                                        LapCell {
-                                            text: lap_time(Duration::ZERO, 6),
-                                            tone,
-                                            strike: false,
-                                            highlight: false,
-                                            active: false,
-                                            seek: 0,
-                                        },
-                                    ];
-                                    let galley = ui.painter().layout_job(lap_row_job(&cells));
-                                    ui.painter().galley(
-                                        egui::pos2(second.left(), second.top()),
-                                        galley,
-                                        PAD_TIMER_ACTIVE,
-                                    );
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                    // Клик по ячейке кругов: перемотка на её время,
-                    // выделение — кружок (у первого круга снимается).
-                    if let Some((ms, selection)) = lap_click {
+                    // Блок кругов пэдов: рамки-зоны, таблицы,
+                    // микро-таймер отсчёта. Клик возвращается
+                    // интентом — мутацию фазы делает вызывающий.
+                    if let Some((ms, selection)) =
+                        Self::show_laps(ui, &frame, &column_geometry, viewfinder_cols)
+                    {
                         if let Mode::Review(d) = &mut self.phase {
                             d.transport.seek(ms);
                             d.selection = selection;
@@ -2174,24 +2231,28 @@ struct LapCell {
     seek: u64,
 }
 
-/// Таблица кругов: одна строка на круг, колонки «имя время события»
-/// через пробел (ширины — один проход по всем строкам). Имя и время
-/// выравнены вправо; минимальные ширины — 2 и 6 (без разделителей).
-/// Имя — из дистилятора («HS», «1)» — скобку ставит он); текущий
-/// несёт предполагаемое имя (своё «HS»/«N)», даже с крестом);
-/// проваленный отбит пробелами. Время: формат по наибольшему кругу
-/// включая текущий: SS.mmm, далее M:SS.mmm, далее MM:SS.mmm; ведущие
-/// нули — пробелами, ширина резервирована. События: fault ✕,
-/// correct □, lap ○, через пробел, влево.
+/// Таблица кругов: одна строка на круг, колонки «события имя время»
+/// через пробел. События — первая колонка: по глифу на событие, в
+/// порядке возникновения слева направо. Рендер резервирует колонку
+/// событий по самому широкому блоку пада (минимум — под кружок:
+/// глиф + разделитель, 2 колонки сетки) и выравнивает блоки вправо —
+/// имя и время между строками на одной линии, по мере событий не
+/// прыгают. Имя и время выравнены вправо; минимальные ширины — 2 и 6
+/// (без разделителей). Имя — из дистилятора («HS», «1)» — скобку
+/// ставит он); текущий несёт предполагаемое имя (своё «HS»/«N)», даже
+/// с крестом); проваленный отбит пробелами. Время: формат по
+/// наибольшему кругу включая текущий: SS.mmm, далее M:SS.mmm, далее
+/// MM:SS.mmm; ведущие нули — пробелами, ширина резервирована.
+/// События: fault ✕, correct □, lap ○.
 ///
 /// Раскраска: `cursor` (мс журнала) — элемент серым, пока его метка
-/// в будущем: имя и время круга — до начала круга (старт = конец
-/// предыдущего, первый — `race_start`), событие — до его метки.
-/// None — без раскраски (эфир: всё в прошлом).
+/// в будущем: имя и время круга — до конца круга (белеют одновременно
+/// с его кружком; текущий круг не завершён никогда), событие — до
+/// его метки. None — без раскраски (эфир: всё в прошлом).
 fn lap_table(
     lines: &[(u64, LapLine, Vec<(u64, LapEvent)>)],
     cursor: Option<u64>,
-    race_start: u64,
+    _race_start: u64,
     active_ms: Option<u64>,
 ) -> Vec<Vec<LapCell>> {
     // Время строки; у текущего — бегущее (он участвует и в выборе
@@ -2227,9 +2288,7 @@ fn lap_table(
         format!("{successes})")
     };
     let future = |at: u64| cursor.is_some_and(|c| c < at);
-    let has_events = lines.iter().any(|(_, _, ev)| !ev.is_empty());
     let mut rows = Vec::new();
-    let mut lap_start = race_start;
     for (end, line, events) in lines {
         // Имя — из дистилятора целиком (HS без скобки, «1)» с ней).
         let name = match line {
@@ -2245,60 +2304,62 @@ fn lap_table(
             }
         };
         let highlighted = |at: u64| cursor.is_some_and(|c| (at..at + 100).contains(&c));
-        // Клик по имени/времени перематывает на начало круга, по
-        // событию — на момент события. Выделяются только события.
-        let mut cells = vec![
-            LapCell {
-                text: name,
-                tone: tone(future(lap_start)),
+        // Колонка событий — первая: по глифу на событие, в порядке
+        // возникновения. Имя и время завершают строку: белеют по
+        // метке конца круга (одновременно с его кружком; у текущего
+        // круга конца нет — серые всегда). Клик по имени/времени, как
+        // и по кружку, — на конец круга. Выделяются только события.
+        let mut cells: Vec<LapCell> = events
+            .iter()
+            .map(|(at, event)| LapCell {
+                text: match event {
+                    LapEvent::Fault => "\u{f0156}".to_owned(),
+                    LapEvent::Correction => "□".to_owned(),
+                    LapEvent::Lap => "\u{25cb}".to_owned(), // полый круг
+                },
+                tone: tone(future(*at)),
                 strike: false,
-                highlight: false,
-                active: false,
-                seek: lap_start,
-            },
-            // Номер и время белеют вместе: когда круг начался. События
-            // — по своим меткам. Подсветка — только события.
-            LapCell {
-                text: lap_time(duration(line), time_width),
-                tone: tone(future(lap_start)),
-                strike: matches!(line, LapLine::Fail { .. }),
-                highlight: false,
-                active: false,
-                seek: lap_start,
-            },
-        ];
-        if has_events {
-            for (at, event) in events {
-                cells.push(LapCell {
-                    text: match event {
-                        LapEvent::Fault => "\u{f0156}".to_owned(),
-                        LapEvent::Correction => "□".to_owned(),
-                        LapEvent::Lap => "\u{25cb}".to_owned(), // полый круг
-                    },
-                    tone: tone(future(*at)),
-                    strike: false,
-                    highlight: highlighted(*at),
-                    active: active_ms == Some(*at),
-                    seek: *at,
-                });
-            }
-        }
+                highlight: highlighted(*at),
+                active: active_ms == Some(*at),
+                seek: *at,
+            })
+            .collect();
+        let finished = !matches!(line, LapLine::Current { .. });
+        let done_at = if finished { *end } else { u64::MAX };
+        cells.push(LapCell {
+            text: name,
+            tone: tone(future(done_at)),
+            strike: false,
+            highlight: false,
+            active: false,
+            seek: *end,
+        });
+        cells.push(LapCell {
+            text: lap_time(duration(line), time_width),
+            tone: tone(future(done_at)),
+            strike: matches!(line, LapLine::Fail { .. }),
+            highlight: false,
+            active: false,
+            seek: *end,
+        });
         rows.push(cells);
-        lap_start = *end;
     }
     // Минимум 2 («HS») — узкие номера («1)») отбиваются пробелами.
+    // Имя — предпоследняя ячейка (после колонки событий); колонку
+    // событий рендер выравнивает вправо сам — по ширине блоков.
     let name_width = rows
         .iter()
-        .flat_map(|r| r.first())
+        .flat_map(|r| r.iter().rev().nth(1))
         .map(|c| c.text.chars().count())
         .max()
         .unwrap_or(0)
         .max(2);
-    // Выравнивание: имя и время вправо (пробелами), события — как есть.
+    // Выравнивание: имя и время вправо (пробелами).
     for cells in &mut rows {
+        let len = cells.len();
         for (i, cell) in cells.iter_mut().enumerate() {
-            let width = match i {
-                0 => name_width,
+            let width = match len - i {
+                2 => name_width,
                 1 => time_width,
                 _ => continue,
             };

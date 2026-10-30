@@ -26,6 +26,7 @@ use crate::model::flight::{Journal, LapEvent, LapLine, RaceClip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::Response;
+use crate::service::key_matcher::KeyMatcher;
 use crate::service::race::{Notice, Race, RaceStage};
 use crate::service::transport::{Circle, Transport};
 use crossbeam_channel as crossbeam;
@@ -91,6 +92,9 @@ const LAP_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x5A, 0xC1, 0xFE);
 const LAP_HIGHLIGHT: egui::Color32 = LAP_ACCENT;
 const LAP_SELECTION: egui::Color32 = LAP_ACCENT;
 
+/// Пока активен какой-то один пад, остальные рисуются серыми.
+const PAD_INACTIVE: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
+
 /// Событие в колонке кругов занимает 2 колонки сетки: глиф (1) и
 /// разделитель после него (1). Fira Code моноширинный — advance любого
 /// глифа и пробела = клетке (16 pt при 26 pt кегле).
@@ -151,6 +155,9 @@ struct Live {
     /// pad_id → дистилят кругов (последний Notice::Laps): строки журнала
     /// + текущий круг (бегущее время рендер считает по `since`).
     laps: HashMap<String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>>,
+    /// Активный пад (глобальные клавиши 1–8, матчер в ядре): рамка
+    /// его вьюфайндера серая. None — никто не активен.
+    active_pad: Option<String>,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: RaceStage,
     rules: RaceRules,
@@ -244,6 +251,9 @@ struct PadContents {
     /// Идентификатор пада (ключ `Setup.pads`): выделение кругов
     /// адресуется (пад, мс).
     pad_id: String,
+    /// Пад активен (глобальные клавиши): рамка вьюфайндера серая
+    /// вместо цвета пада.
+    active: bool,
     label: String,
     pilot: String,
     color: egui::Color32,
@@ -420,6 +430,7 @@ impl Flight {
             self.setup.pads.clone(),
             self.assignments.clone(),
             self.shown_cameras.clone(),
+            KeyMatcher::new(&self.setup),
             recorders,
             idle.keyboard_rx,
             wake,
@@ -434,6 +445,7 @@ impl Flight {
             race,
             rec_at: Instant::now(),
             laps: HashMap::new(),
+            active_pad: None,
             state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
@@ -515,6 +527,7 @@ impl Flight {
                     Notice::Laps { pad_id, lines } => {
                         l.laps.insert(pad_id, lines);
                     }
+                    Notice::ActivePad(pad) => l.active_pad = pad,
                 }
             }
             let streaming = l
@@ -596,6 +609,7 @@ impl Flight {
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
         laps: &HashMap<String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>>,
+        active_pad: Option<&str>,
         alt: bool,
     ) -> Vec<PadContents> {
         setup
@@ -640,6 +654,7 @@ impl Flight {
                 };
                 PadContents {
                     pad_id: pad_id.clone(),
+                    active: active_pad.is_some_and(|a| a == pad_id),
                     label: pad.label.clone(),
                     pilot: assignments
                         .get(pad_id)
@@ -673,6 +688,7 @@ impl Flight {
             assignments,
             shown_cameras,
             &l.laps,
+            l.active_pad.as_deref(),
             alt,
         );
         let fps_lines = if alt {
@@ -797,6 +813,7 @@ impl Flight {
             assignments,
             shown_cameras,
             &no_laps,
+            None,
             alt,
         );
         let fps_lines = if alt {
@@ -895,6 +912,7 @@ impl Flight {
                 };
                 PadContents {
                     pad_id: pad_id.clone(),
+                    active: false,
                     label: pad.label.clone(),
                     pilot: assignments
                         .get(pad_id)
@@ -1039,9 +1057,9 @@ impl Flight {
 
     /// Блок кругов под вьюфайндерами: рамки-зоны (пунктир), символ
     /// дисконнекта, таблицы кругов пэдов (события/имя/время) и
-    /// микро-таймер отсчёта. Клики по ячейкам (только DVR,
-    /// `frame.laps_clickable`) возвращаются интентом: (время
-    /// перемотки, выделение) — мутацию фазы делает вызывающий.
+    /// микро-таймер отсчёта. Клик возвращается интентом: (время
+    /// перемотки, выделение) — мутацию фазы делает вызывающий
+    /// (`Review::set_selection` + `Review::seek`).
     fn show_laps(
         ui: &mut egui::Ui,
         frame: &FrameContents,
@@ -1095,6 +1113,7 @@ impl Flight {
         // круг: свой при клике по событию, событие, совпавшее
         // по метке с концом круга, при клике по имени/времени
         // (у незакрытого такого нет — выделение снимается).
+        // Клик по ячейке кругов: (время перемотки, выделение).
         let mut lap_click: Option<(u64, Option<EventSelection>)> = None;
         for (i, &(first, second)) in zones.iter().enumerate() {
             placeholder(ui, first);
@@ -1437,13 +1456,16 @@ impl Flight {
                         Self::show_laps(ui, &frame, &column_geometry, viewfinder_cols)
                     {
                         if let Mode::Review(d) = &mut self.phase {
-                            d.transport.seek(ms);
-                            d.selection = selection;
+                            if d.set_selection(selection) {
+                                d.seek(ms);
+                            }
                         }
                     }
                 }
 
                 if columns > 0 {
+                    // Пока активен один пад, остальные — серые.
+                    let any_active = frame.pads.iter().any(|p| p.active);
                     for (i, content) in frame.pads.iter().enumerate() {
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - viewfinder_cols) / 2;
@@ -1451,10 +1473,18 @@ impl Flight {
                         let viewfinder =
                             ruler.extrude(cell_x(viewfinder_cols), cell_y(viewfinder_rows + 2));
                         let frame_rect: egui::Rect = viewfinder.into();
+                        // Серым — неактивные, пока активен кто-то один;
+                        // активный и общий случай (без активного) —
+                        // цвет пада.
+                        let frame_color = if any_active && !content.active {
+                            PAD_INACTIVE
+                        } else {
+                            content.color
+                        };
                         viewfinder::ViewfinderFrame::new(
                             &content.label,
                             &content.pilot,
-                            content.color,
+                            frame_color,
                         )
                         .show(ui, frame_rect, |ui, rect| {
                             viewfinder::Viewfinder::new(content.viewport).show(
@@ -2051,6 +2081,22 @@ impl Flight {
 }
 
 impl Review {
+    /// Выделение ячейки кругов: тоггл. true — клик выделил (тогда
+    /// курсору можно ехать), false — развыбор.
+    fn set_selection(&mut self, selection: Option<EventSelection>) -> bool {
+        if selection.is_some() && self.selection == selection {
+            self.selection = None;
+            return false;
+        }
+        self.selection = selection;
+        true
+    }
+
+    /// Перемотка по клику ячейки кругов.
+    fn seek(&mut self, ms: u64) {
+        self.transport.seek(ms);
+    }
+
     /// Полный набор данных DVR из журнала (None — пустой DVR: никаких
     /// чужих записей, только файлы журнала). Плееры открываются
     /// асинхронно — транзит, пока все не открылись (Ready/Failed).

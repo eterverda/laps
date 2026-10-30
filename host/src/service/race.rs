@@ -13,6 +13,7 @@ use crate::driver::keyboard::KeyPressed;
 use crate::model::flight::{Journal, JournalRecord, LapEvent, LapLine};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
+use crate::service::key_matcher::{KeyMatch, KeyMatcher};
 use crossbeam_channel as crossbeam;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
@@ -176,6 +177,10 @@ struct RaceCore {
     /// pad_id → события текущего круга (fault/correct с последнего Lap):
     /// живут в дистиляте `Current`, журнал их хранит сам.
     lap_events: HashMap<String, Vec<(u64, LapEvent)>>,
+    /// Матчер клавиатурных биндингов: бинды падов из сетапа + глобальная
+    /// таблица (цифры — активный пад, Space — lap активного). Активный
+    /// пад живёт здесь, в GUI транслируется через Notice.
+    key_matcher: KeyMatcher,
 }
 
 impl RaceCore {
@@ -192,6 +197,7 @@ impl RaceCore {
         pads: BTreeMap<String, PadConfig>,
         assignments: HashMap<String, Pilot>,
         cameras: HashMap<String, CameraConfig>,
+        key_matcher: KeyMatcher,
     ) -> (Self, Vec<Effect>) {
         let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
             log::warn!("flight: local time unavailable, journal falls back to UTC");
@@ -211,6 +217,7 @@ impl RaceCore {
             raced: false,
             lap_started_at: HashMap::new(),
             lap_events: HashMap::new(),
+            key_matcher,
         };
         core.rec_deferred
             .push((core.ms(now), JournalRecord::RecordStarted {}));
@@ -295,40 +302,40 @@ impl RaceCore {
         }
     }
 
-    /// Нажатие клавиатуры: матч по keybinds пэдов (subset + id, см.
-    /// `KeyBind::matches`); фиксирует RaceEvent в журнал, только в
-    /// Running. Возвращает зафиксированное (пад, сигнал) — обёртка
-    /// шлёт GUI `Notice::Laps` и звук на lap.
-    pub fn key_pressed(&mut self, event: &KeyPressed, now: Instant) -> Option<(String, LapEvent)> {
+    /// Нажатие клавиатуры: решает матчер (бинды падов + глобальные
+    /// таблицы). Сигнал фиксируется в журнале, только в Running;
+    /// переключение активного пада — только состояние (GUI спрашивает
+    /// его через `active_pad`).
+    pub fn key_pressed(&mut self, event: &KeyPressed, now: Instant) -> Option<KeyMatch> {
         if !matches!(self.phase, RaceStage::Running { .. }) {
             return None; // вне гонки судейские сигналы игнорируем
         }
-        let matched = self.journal.header().pads.iter().find_map(|(pad_id, pad)| {
-            pad.keybinds
-                .iter()
-                .find(|bind| bind.matches(event))
-                .and_then(|bind| LapEvent::from_action(&bind.action))
-                .map(|name| (pad_id.clone(), name))
-        });
-        let (pad_id, name) = matched?;
-        self.journal.push(
-            self.ms(now),
-            JournalRecord::RaceEvent {
-                pad_id: pad_id.clone(),
-                name,
-            },
-        );
-        if name == LapEvent::Lap {
-            self.lap_started_at.insert(pad_id.clone(), now);
-            self.lap_events.remove(&pad_id);
-        } else {
-            let at = self.ms(now);
-            self.lap_events
-                .entry(pad_id.clone())
-                .or_default()
-                .push((at, name));
+        let matched = self.key_matcher.match_key(event)?;
+        if let KeyMatch::Signal { pad, event } = &matched {
+            let ms = self.ms(now);
+            self.journal.push(
+                ms,
+                JournalRecord::RaceEvent {
+                    pad_id: pad.clone(),
+                    name: *event,
+                },
+            );
+            if *event == LapEvent::Lap {
+                self.lap_started_at.insert(pad.clone(), now);
+                self.lap_events.remove(pad);
+            } else {
+                self.lap_events
+                    .entry(pad.clone())
+                    .or_default()
+                    .push((ms, *event));
+            }
         }
-        Some((pad_id, name))
+        Some(matched)
+    }
+
+    /// Активный пад (id) или None — для GUI после ToggleActivePad.
+    pub fn active_pad(&self) -> Option<&str> {
+        self.key_matcher.active_pad()
     }
 
     /// Дистиляты всех пэдов: полное обновление GUI (на старте гонки,
@@ -562,6 +569,7 @@ mod tests {
     use super::*;
     use crate::config::camera::PixelConfig;
     use crate::config::keyboard::KeyBind;
+    use crate::config::setup::Setup;
     use crate::driver::keyboard::key_set;
     use crate::model::rules::StartSignalDelay;
     use std::env::temp_dir;
@@ -602,8 +610,20 @@ mod tests {
             BTreeMap::new(),
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(BTreeMap::new()),
         )
         .0
+    }
+
+    /// Матчер над заданными падами (setup на входе — только источник
+    /// падов и их биндов).
+    fn test_matcher(pads: BTreeMap<String, PadConfig>) -> KeyMatcher {
+        KeyMatcher::new(&Setup {
+            cameras: BTreeMap::new(),
+            pads,
+            #[cfg(target_os = "linux")]
+            exclusive_keyboards: BTreeMap::new(),
+        })
     }
 
     /// Пад с одним биндингом «A → lap» на эксклюзивной клавиатуре key-1.
@@ -646,6 +666,74 @@ mod tests {
         }
     }
 
+    /// Нажатие на main-клавиатуре (без exclusive id): глобальные
+    /// биндинги матчера видят только её.
+    fn main_press(keys: &[u32]) -> KeyPressed {
+        KeyPressed {
+            #[cfg(target_os = "linux")]
+            exclusive_keyboard_id: None,
+            keys: key_set(keys),
+            at: Instant::now(),
+        }
+    }
+
+    /// Глобальные клавиши в гонке: цифра активирует/гасит пад,
+    /// Space — lap активного пада; состояние активного пада —
+    /// `active_pad()`.
+    #[test]
+    fn global_keys_toggle_active_pad_and_signal() {
+        let mut clock = FakeClock::new();
+        let (mut core, _effects) = RaceCore::new(
+            clock.now,
+            RaceRules {
+                duration: Some(DURATION),
+                start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+            },
+            temp_dir(),
+            Duration::ZERO,
+            test_pads(),
+            HashMap::new(),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(test_pads()),
+        );
+        core.race_pressed(clock.now);
+        core.tick(clock.advance(10_000)); // Running
+        // Глобальные — только main-клавиатура (Linux: у устройств
+        // свой id, глобалки без id их не видят; на других ОС фильтра
+        // нет — assert платформенный).
+        #[cfg(target_os = "linux")]
+        assert!(core.key_pressed(&key_press(&[0x1E]), clock.now).is_none());
+        // 1 (0x1E) на main: pad-1 активен.
+        assert_eq!(
+            core.key_pressed(&main_press(&[0x1E]), clock.now),
+            Some(KeyMatch::ToggleActivePad(1))
+        );
+        assert_eq!(core.active_pad(), Some("pad-1"));
+        // Space — lap активного пада, в журнале.
+        let t_lap = clock.advance(15_000);
+        assert_eq!(
+            core.key_pressed(&main_press(&[0x2C]), t_lap),
+            Some(KeyMatch::Signal {
+                pad: "pad-1".to_owned(),
+                event: LapEvent::Lap,
+            })
+        );
+        // Повтор цифры — деактивация; Space теперь ничего.
+        assert_eq!(
+            core.key_pressed(&main_press(&[0x1E]), clock.now),
+            Some(KeyMatch::ToggleActivePad(1))
+        );
+        assert_eq!(core.active_pad(), None);
+        assert!(core.key_pressed(&main_press(&[0x2C]), clock.now).is_none());
+        assert!(
+            journal_marks(&core)
+                .iter()
+                .any(|(ms, mark)| *ms == 25_000 && *mark == "race-event"),
+            "lap активного пада в журнале: {:?}",
+            journal_marks(&core)
+        );
+    }
+
     /// Судейские сигналы: только в Running, матч по биндингу пада,
     /// дистилят с текущим кругом.
     #[test]
@@ -662,6 +750,7 @@ mod tests {
             test_pads(),
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(test_pads()),
         );
         // До гонки сигналы игнорируются.
         assert!(core.key_pressed(&key_press(&[0x04]), clock.now).is_none());
@@ -678,7 +767,10 @@ mod tests {
         let t_lap = clock.advance(15_000);
         assert_eq!(
             core.key_pressed(&key_press(&[0x04]), t_lap),
-            Some(("pad-1".to_owned(), LapEvent::Lap))
+            Some(KeyMatch::Signal {
+                pad: "pad-1".to_owned(),
+                event: LapEvent::Lap,
+            })
         );
         let marks = journal_marks(&core);
         assert!(
@@ -700,7 +792,10 @@ mod tests {
         // Fault текущего круга: в журнале и в событиях Current.
         assert_eq!(
             core.key_pressed(&key_press(&[0xE0, 0x05]), clock.now),
-            Some(("pad-1".to_owned(), LapEvent::Fault))
+            Some(KeyMatch::Signal {
+                pad: "pad-1".to_owned(),
+                event: LapEvent::Fault,
+            })
         );
         let lines = core.laps("pad-1", clock.now);
         let current = lines.last().expect("current");
@@ -712,7 +807,10 @@ mod tests {
         // Следующий lap открывает новый круг: события обнулились.
         assert_eq!(
             core.key_pressed(&key_press(&[0x04]), clock.now),
-            Some(("pad-1".to_owned(), LapEvent::Lap))
+            Some(KeyMatch::Signal {
+                pad: "pad-1".to_owned(),
+                event: LapEvent::Lap,
+            })
         );
         let lines = core.laps("pad-1", clock.now);
         assert!(lines.last().unwrap().2.is_empty(), "новый круг чист");
@@ -993,6 +1091,7 @@ mod tests {
             BTreeMap::new(),
             HashMap::new(),
             cameras,
+            test_matcher(BTreeMap::new()),
         )
         .0;
         core.intent(Intent::RacePressed, clock.now);
@@ -1036,6 +1135,7 @@ mod tests {
             BTreeMap::new(),
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(BTreeMap::new()),
         )
         .0;
         core.intent(Intent::RacePressed, clock.now);
@@ -1093,6 +1193,9 @@ pub enum Notice {
         pad_id: String,
         lines: Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>,
     },
+    /// Активный пад переключён (глобальные клавиши 1–8): новое
+    /// состояние, None — деактивирован.
+    ActivePad(Option<String>),
 }
 
 /// Хэндл гоночного потока для GUI: шлём намерения, забираем уведомления.
@@ -1127,6 +1230,7 @@ impl Race {
         pads: BTreeMap<String, PadConfig>,
         assignments: HashMap<String, Pilot>,
         cameras: HashMap<String, CameraConfig>,
+        key_matcher: KeyMatcher,
         recorders: HashMap<String, Recorder>,
         keyboard_rx: crossbeam::Receiver<KeyPressed>,
         wake: Arc<dyn Fn() + Send + Sync>,
@@ -1142,6 +1246,7 @@ impl Race {
             pads,
             assignments,
             cameras,
+            key_matcher,
         );
         thread::spawn(move || {
             let mut core = core;
@@ -1201,17 +1306,24 @@ impl Race {
                             // звук фиксации круга — через эффекты.
                             let now = Instant::now();
                             match core.key_pressed(&event, now) {
-                                Some((pad_id, name)) => {
+                                Some(KeyMatch::Signal { pad, event }) => {
                                     let _ = notice_tx.try_send(Notice::Laps {
-                                        pad_id: pad_id.clone(),
-                                        lines: core.laps(&pad_id, now),
+                                        pad_id: pad.clone(),
+                                        lines: core.laps(&pad, now),
                                     });
                                     wake();
-                                    if name == LapEvent::Lap {
+                                    if event == LapEvent::Lap {
                                         vec![Effect::Sound(GATE)]
                                     } else {
                                         Vec::new()
                                     }
+                                }
+                                Some(KeyMatch::ToggleActivePad(_)) => {
+                                    let _ = notice_tx.try_send(Notice::ActivePad(
+                                        core.active_pad().map(str::to_owned),
+                                    ));
+                                    wake();
+                                    Vec::new()
                                 }
                                 None => Vec::new(),
                             }

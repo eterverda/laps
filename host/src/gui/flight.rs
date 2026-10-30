@@ -68,12 +68,12 @@ const DIAL_LAG_MS: u64 = 150;
 /// нужно.
 const UI_TICK: Duration = Duration::from_millis(43);
 
-/// Пара основного таймера: горящий и потухший. Потухший — 0.2
-/// яркости (тот же сигнал мигания, что у таймера: вторая половина
-/// секунды отсчёта).
+/// Пара основного таймера: горящий и потухший. Потухший — активный
+/// × 0.2 при ПОЛНОЙ альфе: с прозрачностью поверх тёмного фона
+/// гаснет насовсем (тот же сигнал мигания: вторая половина секунды
+/// отсчёта).
 const TIMER_ACTIVE: egui::Color32 = TRANSPORT_ACTIVE;
-const TIMER_INACTIVE: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(0x2E, 0x2D, 0x29, 0x33);
+const TIMER_INACTIVE: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x2D, 0x29);
 
 /// Пара микро-таймеров отсчёта в пэдах — та же, что у основного
 /// таймера.
@@ -1501,29 +1501,41 @@ impl Flight {
                     }
                 }
 
-                // Нижний ряд: EXIT · REW · PLAY · FF · RPT · REC · RACE ·
-                // TIMER. Ряд — линейкой от края: каждая кнопка extrude
-                // ТОЛЬКО по горизонтали, отдать rect, свернуть вправо,
-                // переместиться на зазор. Ширины и зазоры (колонки):
-                // EXIT 6 · 3 · REW 8 · 1 · PLAY 8 · 1 · FF 8 · 2 · RPT 6 ·
-                // 3 · REC 8 · 1 · RACE 8.
+                // Нижний ряд: EXIT слева; по центру экрана — TIMER,
+                // его серединная вертикаль совпадает с серединой сетки
+                // (край таймера округляется в меньшую сторону — центр
+                // не правее середины). REC ·1· RACE ·5· — влево от
+                // таймера, транспорт REW ·1· PLAY ·1· FF ·2· RPT —
+                // вправо (зазор от таймера тот же, 5 клеток). Все
+                // кнопки (кроме EXIT) привязаны к таймеру.
                 let y = ui.max_rect().bottom();
 
                 let exit_label = "\u{e6c0}\u{f0206}";
                 let btn_h = cell_y(2);
-                let mut ruler = egui::pos2(0.0, y).into_ruler().extrude(0.0, -btn_h);
-                let mut btn = |w: isize, gap: isize| -> egui::Rect {
-                    let next = ruler.extrude(cell_x(w), 0.0);
-                    ruler = next.collapse_right().translate(cell_x(gap), 0.0);
-                    next.into()
+                let row_rect = |left: f32, cols: isize| -> egui::Rect {
+                    egui::Rect::from_min_max(
+                        egui::pos2(left, y - btn_h),
+                        egui::pos2(left + cell_x(cols), y),
+                    )
                 };
-                let exit_rect = btn(6, 3);
-                let rew_rect = btn(8, 1);
-                let play_rect = btn(8, 1);
-                let ff_rect = btn(8, 2);
-                let rpt_rect = btn(6, 3);
-                let rec_rect = btn(8, 1);
-                let race_rect = btn(8, 0);
+                let exit_rect = row_rect(0.0, 6);
+                let timer_icon = "\u{f43a}";
+                let icon_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
+                let timer_w = icon_w
+                    + cell_x(1)
+                    + measure_text(ui.ctx(), style::FONT_REGULAR_X2, &frame.timer.text).x;
+                // Центр таймера — центр сетки; край таймера — вниз,
+                // к колонке.
+                let timer_left =
+                    ((cell_x(GRID_WIDTH) / 2.0 - timer_w / 2.0) / cell_x(1)).floor() * cell_x(1);
+                let race_left = timer_left - cell_x(13); // 8 ширина + 5 зазор
+                let rec_rect = row_rect(race_left - cell_x(9), 8);
+                let race_rect = row_rect(race_left, 8);
+                let rew_left = timer_left + timer_w + cell_x(5);
+                let rew_rect = row_rect(rew_left, 8);
+                let play_rect = row_rect(rew_left + cell_x(9), 8);
+                let ff_rect = row_rect(rew_left + cell_x(18), 8);
+                let rpt_rect = row_rect(rew_left + cell_x(28), 6);
 
                 // Alt-баббл над кнопкой: многострочность — '\n' внутри
                 // строки.
@@ -1759,7 +1771,7 @@ impl Flight {
 
                 // TIMER: в live-фазах — счётчик гонки (цвет с учётом
                 // мигания/нулей), в DVR — позиция.
-                let timer_pos = egui::pos2(egui::Rect::from(ruler).right() + cell_x(2), y);
+                let timer_pos = egui::pos2(timer_left, y);
                 let timer_icon = "\u{f43a}";
                 let icon_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
                 let timer_color = if frame.timer.dim {

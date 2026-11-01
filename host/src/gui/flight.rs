@@ -26,7 +26,7 @@ use crate::model::flight::{Journal, LapEvent, LapLine, RaceClip};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::Response;
-use crate::service::key_matcher::KeyMatcher;
+use crate::service::key_matcher::{KeyMatch, KeyMatcher};
 use crate::service::race::{Notice, Race, RaceStage};
 use crate::service::transport::{Circle, Transport};
 use crossbeam_channel as crossbeam;
@@ -113,10 +113,8 @@ enum Mode {
 /// и keepawake).
 struct Idle {
     webcams: HashMap<String, Camera>,
-    /// Матчер клавиатурных биндингов фазы: тогл активного пада и
-    /// глобальные биндинги работают уже в Idle; события пока только
-    /// логируются. При входе в Live его активный пад сеется в поточный
-    /// матчер гонки.
+    /// Матчер клавиатурных биндингов фазы (чистый: активный пад —
+    /// из выделения экрана); события пока только логируются.
     key_matcher: KeyMatcher,
     /// Main-клавиатура (фокусная, из egui) и канал клавиатур сетапа.
     /// Живут с фазой: при Idle → Live уезжают в Race; новые строятся
@@ -159,10 +157,6 @@ struct Live {
     /// pad_id → дистилят кругов (последний Notice::Laps): строки журнала
     /// + текущий круг (бегущее время рендер считает по `since`).
     laps: HashMap<String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>>,
-    /// Активный пад — зеркало поточного матчера гонки для рендера:
-    /// обновляется Notice::ActivePad (каждый тогл). При выходе из Live
-    /// сеет матчер следующей фазы.
-    active_pad: Option<String>,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: RaceStage,
     rules: RaceRules,
@@ -191,9 +185,13 @@ enum Selection {
     Event(String, u64),
 }
 
-impl Default for Selection {
-    fn default() -> Self {
-        Self::None
+impl Selection {
+    /// Пад выделения (Pad или Event) или None.
+    fn pad(&self) -> Option<&str> {
+        match self {
+            Selection::Pad(p) | Selection::Event(p, _) => Some(p),
+            Selection::None => None,
+        }
     }
 }
 
@@ -220,9 +218,6 @@ struct Review {
     /// камера с файлом; переключаемая в рантайме.
     master: String,
     scrub: Scrub,
-    /// Выделение кругов (клик): пад и, возможно, событие на нём.
-    /// Пад сеется в матчер фазы — он же цель клавиатурных сигналов.
-    selection: Selection,
 }
 
 /// Состояние скраббинга DVR: таймлайн, кнопки перемотки, шкалы
@@ -362,6 +357,10 @@ pub struct Flight {
     /// сразу, флаг — для навигации в меню из update (нужен Navigator).
     exit_requested: bool,
     header: header::Header,
+    /// Выделение экрана: пад и, возможно, событие на нём. Сессионное —
+    /// переживает переходы фаз; в эфире — вид активного пада ядра
+    /// (нотисами), в GUI-фазах — власть (клики, клавиши 1–8/0).
+    selection: Selection,
     phase: Mode,
 }
 
@@ -402,6 +401,7 @@ impl Flight {
             res: None,
             exit_requested: false,
             header: header::Header::new(),
+            selection: Selection::None,
             phase: Mode::Idle(Idle {
                 webcams,
                 key_matcher,
@@ -440,8 +440,8 @@ impl Flight {
             .iter()
             .map(|(id, camera)| (id.clone(), camera.recorder()))
             .collect();
-        // Активный пад Idle: сеет поточный матчер и зеркало рендера.
-        let active_pad = idle.key_matcher.active_pad().map(str::to_owned);
+        // Выделение экрана сеет ядро гонки (зеркало — нотисами).
+        let active_pad = self.selection.pad().map(str::to_owned);
         // Пробуждение GUI по уведомлениям потока: без него state
         // обновлялся бы только по кадрам камер (мертвый эфир висел бы
         // в Before до первого repaint).
@@ -453,17 +453,12 @@ impl Flight {
             self.setup.pads.clone(),
             self.assignments.clone(),
             self.shown_cameras.clone(),
-            // Поточный матчер сеян активным падом Idle — выбор пада
-            // переживает переход Idle → Live.
-            {
-                let mut key_matcher = KeyMatcher::new(&self.setup);
-                key_matcher.set_active_pad(active_pad.as_deref());
-                key_matcher
-            },
+            KeyMatcher::new(&self.setup),
             recorders,
             idle.keyboard_rx,
             wake,
             self.audio.clone(),
+            active_pad.clone(),
         );
         // Рождение кнопкой RACE: отсчёт стартует сразу (намерение ждёт
         // поток в очереди на рождение).
@@ -474,7 +469,6 @@ impl Flight {
             race,
             rec_at: Instant::now(),
             laps: HashMap::new(),
-            active_pad,
             state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
@@ -499,13 +493,9 @@ impl Flight {
         #[cfg(target_os = "linux")]
         let exclusive_keyboards = attach_exclusive_keyboards(&self.setup, &keyboard_tx);
         let main = Keyboard::new(&keyboard_tx);
-        // Активный пад из гонки (зеркало последнего тогла) сеет матчер
-        // новой Idle-фазы.
-        let mut key_matcher = KeyMatcher::new(&self.setup);
-        key_matcher.set_active_pad(live.active_pad.as_deref());
         self.phase = Mode::Idle(Idle {
             webcams: live.webcams,
-            key_matcher,
+            key_matcher: KeyMatcher::new(&self.setup),
             main_keyboard: main,
             keyboard_rx,
             #[cfg(target_os = "linux")]
@@ -532,7 +522,7 @@ impl Flight {
                 })
             });
         let shown_cameras = filter_cameras(&setup, &assignments);
-        let phase = Mode::Review(Review::open(ctx, journal, &setup, None));
+        let phase = Mode::Review(Review::open(ctx, journal, &setup));
         Self {
             setup,
             assignments,
@@ -542,6 +532,7 @@ impl Flight {
             res: None,
             exit_requested: false,
             header: header::Header::new(),
+            selection: Selection::None,
             phase,
         }
     }
@@ -561,7 +552,12 @@ impl Flight {
                     Notice::Laps { pad_id, lines } => {
                         l.laps.insert(pad_id, lines);
                     }
-                    Notice::ActivePad(pad) => l.active_pad = pad,
+                    Notice::ActivePad(pad) => {
+                        self.selection = match &pad {
+                            Some(p) => Selection::Pad(p.clone()),
+                            None => Selection::None,
+                        };
+                    }
                 }
             }
             let streaming = l
@@ -591,11 +587,12 @@ impl Flight {
                 &self.setup,
                 &self.assignments,
                 &self.shown_cameras,
+                &mut self.selection,
                 ctx,
                 alt,
             ),
             Mode::Live(l) => {
-                let active_pad = l.active_pad.clone();
+                let active_pad = self.selection.pad().map(str::to_owned);
                 Self::prepare_live(
                     l,
                     &self.setup,
@@ -605,7 +602,14 @@ impl Flight {
                     alt,
                 )
             }
-            Mode::Review(d) => Self::prepare_dvr(d, &self.setup, &self.assignments, ctx, alt),
+            Mode::Review(d) => Self::prepare_dvr(
+                d,
+                &self.setup,
+                &self.assignments,
+                &mut self.selection,
+                ctx,
+                alt,
+            ),
         }
     }
 
@@ -823,6 +827,7 @@ impl Flight {
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
+        selection: &mut Selection,
         ctx: &egui::Context,
         alt: bool,
     ) -> FrameContents {
@@ -830,7 +835,7 @@ impl Flight {
         // и глобальные биндинги работают уже здесь; события пока только
         // логируются (исполнение — в гонке). В Live канал уехал в Race,
         // там его дренит поток.
-        drain_keyboard(&i.keyboard_rx, &mut i.key_matcher);
+        drain_keyboard(&i.keyboard_rx, &i.key_matcher, selection);
         // Клавиатурный дрен выше живёт на этом счётчике, пока эфир
         // мёртв (живой — кадры гонят перерисовки сами).
         if !i
@@ -847,7 +852,7 @@ impl Flight {
             assignments,
             shown_cameras,
             &no_laps,
-            i.key_matcher.active_pad(),
+            selection.pad(),
             alt,
         );
         let fps_lines = if alt {
@@ -969,24 +974,14 @@ impl Flight {
         d: &mut Review,
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
+        selection: &mut Selection,
         ctx: &egui::Context,
         alt: bool,
     ) -> FrameContents {
         // Клавиатуры (Review): ввод — main-клавиатура (пумп в update),
-        // матчит матчер фазы; события пока только логируются (правки
-        // журнала — следующим шагом).
-        drain_keyboard(&d.keyboard_rx, &mut d.key_matcher);
-        // Выделение — зеркало активного пада матчера: смена пада
-        // сбрасывает событие (событие живёт только на своём паде).
-        // Выделение — зеркало активного пада матчера: смена пада
-        // сбрасывает событие (событие живёт только на своём паде).
-        let active = d.key_matcher.active_pad().map(str::to_owned);
-        let sel = mem::take(&mut d.selection);
-        d.selection = match (active, sel) {
-            (Some(pad), Selection::Event(p, ms)) if p == pad => Selection::Event(p, ms),
-            (Some(pad), _) => Selection::Pad(pad),
-            (None, _) => Selection::None,
-        };
+        // матчит матчер фазы (пад — из выделения); события пока только
+        // логируются (правки журнала — следующим шагом).
+        drain_keyboard(&d.keyboard_rx, &d.key_matcher, selection);
         // Вспышка тапа живёт ровно кадр: ставится в seek_tick на рендере,
         // гасится здесь перед сборкой следующего кадра.
         d.scrub.rew.flash = false;
@@ -1041,8 +1036,8 @@ impl Flight {
                 shown % 1_000
             ),
         };
-        let active_pad = d.key_matcher.active_pad().map(str::to_owned);
-        let pads = Self::prepare_dvr_pads(d, setup, assignments, active_pad.as_deref(), alt);
+        let selection_pad = selection.pad().map(str::to_owned);
+        let pads = Self::prepare_dvr_pads(d, setup, assignments, selection_pad.as_deref(), alt);
         let transport = TransportContents {
             rew: ButtonContents {
                 enabled: interactive,
@@ -1101,7 +1096,7 @@ impl Flight {
             laps_cursor: Some(laps_pos),
             laps_race_start,
             countdown: None,
-            laps_active: d.selection.clone(),
+            laps_active: selection.clone(),
             laps_clickable: true,
         }
     }
@@ -1173,13 +1168,10 @@ impl Flight {
                 ),
                 second.right_bottom(),
             );
-            if frame.laps_clickable {
-                let response =
-                    ui.interact(content, egui::Id::unique(("pad", i)), egui::Sense::click());
-                if response.clicked() {
-                    if let Some(pad) = frame.pads.get(i) {
-                        lap_click = Selection::Pad(pad.pad_id.clone());
-                    }
+            let response = ui.interact(content, egui::Id::unique(("pad", i)), egui::Sense::click());
+            if response.clicked() {
+                if let Some(pad) = frame.pads.get(i) {
+                    lap_click = Selection::Pad(pad.pad_id.clone());
                 }
             }
             // Рамка активного пада: вокруг контента колонки; толще
@@ -1493,16 +1485,21 @@ impl Flight {
                     // Блок кругов пэдов: рамки-зоны, таблицы,
                     // микро-таймер отсчёта. Клик возвращается
                     // интентом — мутацию фазы делает вызывающий.
+                    // Клик — выделение экрана (одно для всех фаз);
+                    // матч по фазе — только побочки: интент в ядро в
+                    // эфире, перемотка по ячейке в DVR.
                     match Self::show_laps(ui, &frame, &column_geometry, viewfinder_cols) {
                         Selection::None => {}
                         Selection::Pad(pad) => {
-                            if let Mode::Review(d) = &mut self.phase {
-                                d.click(&pad, None);
+                            self.selection = Selection::Pad(pad.clone());
+                            if let Mode::Live(l) = &mut self.phase {
+                                l.race.set_active_pad(Some(pad));
                             }
                         }
                         Selection::Event(pad, ms) => {
+                            self.selection = Selection::Event(pad.clone(), ms);
                             if let Mode::Review(d) = &mut self.phase {
-                                d.click(&pad, Some(ms));
+                                d.transport.seek(ms);
                             }
                         }
                     }
@@ -1866,14 +1863,7 @@ impl Flight {
     /// Переход эфир → DVR по закрытию гонки: строим Review, дроп Live
     /// гасит эфир (камеры, keepawake, гоночный поток).
     fn enter_review(&mut self, ctx: &egui::Context, journal: Journal) {
-        // Активный пад из гонки (зеркало последнего тогла) сеет матчер
-        // Review.
-        let active_pad = match &self.phase {
-            Mode::Live(l) => l.active_pad.clone(),
-            _ => None,
-        };
-        let dvr = Review::open(ctx, Some(journal), &self.setup, active_pad.as_deref());
-        self.phase = Mode::Review(dvr);
+        self.phase = Mode::Review(Review::open(ctx, Some(journal), &self.setup));
     }
 
     /// Часы DVR в журнальном домене: (старт, позиция, конец). Полоска
@@ -2134,29 +2124,10 @@ impl Flight {
 }
 
 impl Review {
-    /// Клик по области кругов: Pad — выделение пада, Event — события
-    /// (+ перемотка). Только выделяет; пад сеется в матчер (цель
-    /// клавиатурных сигналов).
-    fn click(&mut self, pad: &str, seek: Option<u64>) {
-        self.selection = match seek {
-            None => Selection::Pad(pad.to_owned()),
-            Some(ms) => Selection::Event(pad.to_owned(), ms),
-        };
-        self.key_matcher.set_active_pad(Some(pad));
-        if let Some(ms) = seek {
-            self.transport.seek(ms);
-        }
-    }
-
     /// Полный набор данных DVR из журнала (None — пустой DVR: никаких
     /// чужих записей, только файлы журнала). Плееры открываются
     /// асинхронно — транзит, пока все не открылись (Ready/Failed).
-    fn open(
-        ctx: &egui::Context,
-        journal: Option<Journal>,
-        setup: &Setup,
-        active_pad: Option<&str>,
-    ) -> Self {
+    fn open(ctx: &egui::Context, journal: Option<Journal>, setup: &Setup) -> Self {
         let journal = journal.unwrap_or_else(|| {
             let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
                 log::warn!("flight: local time unavailable, journal falls back to UTC");
@@ -2194,17 +2165,14 @@ impl Review {
             transport.seek(cd.min(span));
         }
         let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
-        let mut key_matcher = KeyMatcher::new(setup);
-        key_matcher.set_active_pad(active_pad);
         Self {
             journal,
-            key_matcher,
+            key_matcher: KeyMatcher::new(setup),
             main_keyboard: Keyboard::new(&keyboard_tx),
             keyboard_rx,
             players,
             transport,
             master,
-            selection: Selection::None,
             scrub: Scrub {
                 timeline: Timeline::new(),
                 rew: SeekButton::new(),
@@ -2287,13 +2255,24 @@ pub fn viewfinder_cols(count: usize) -> isize {
     viewfinder_rows(count) * 8 / 3
 }
 
-/// Дрен клавиатурного канала фазы через её матчер: нажатие логируется,
-/// разрешённое действие — тоже (исполнение — у потребителя фазы).
-fn drain_keyboard(rx: &crossbeam::Receiver<KeyPressed>, key_matcher: &mut KeyMatcher) {
+/// Дрен клавиатурного канала фазы: нажатия матчит (активный пад —
+/// из выделения, матчер чистый) и применяет к выделению: Set/Reset
+/// меняют пад, сигналы только логируются (исполнение — в гонке).
+fn drain_keyboard(
+    rx: &crossbeam::Receiver<KeyPressed>,
+    key_matcher: &KeyMatcher,
+    selection: &mut Selection,
+) {
     while let Ok(event) = rx.try_recv() {
         log::info!("keyboard: {event}");
-        if let Some(matched) = key_matcher.match_key(&event) {
-            log::info!("keybind: {matched}");
+        let Some(matched) = key_matcher.match_key(&event, selection.pad()) else {
+            continue;
+        };
+        log::info!("keybind: {matched}");
+        match matched {
+            KeyMatch::SetActivePad(p) => *selection = Selection::Pad(p),
+            KeyMatch::ResetActivePad => *selection = Selection::None,
+            KeyMatch::Signal { .. } => {}
         }
     }
 }

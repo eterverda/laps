@@ -34,12 +34,14 @@ const GATE: Sound = Sound::from_bytes(crate::assets::GATE_WAV);
 
 // --- Ядро гонки --------------------------------------------------------------
 
-/// Намерения в ядро (GUI-кнопки, выход).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Намерения в ядро (GUI-кнопки, выход, выбор активного пада).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     RecPressed,
     RacePressed,
     Exit,
+    /// Активный пад из GUI (клик по области пада в эфире).
+    SetActivePad(Option<String>),
 }
 
 /// Эффекты из ядра: решения, которые исполняет поток-обёртка (команды
@@ -178,9 +180,14 @@ struct RaceCore {
     /// живут в дистиляте `Current`, журнал их хранит сам.
     lap_events: HashMap<String, Vec<(u64, LapEvent)>>,
     /// Матчер клавиатурных биндингов: бинды падов из сетапа + глобальная
-    /// таблица (цифры — активный пад, Space — lap активного). Активный
-    /// пад живёт здесь, в GUI транслируется через Notice.
+    /// таблица (цифры — активный пад, Space — lap активного). Матчер
+    /// чистый: активный пад — состояние ядра, матчится с ним как с
+    /// параметром, в GUI транслируется через Notice.
     key_matcher: KeyMatcher,
+    /// Активный пад (id): цель глобальных сигналов (`lap-active-pad`)
+    /// и клавиш выбора (1–8, 0). Сеется GUI при входе в Live, меняется
+    /// клавиатурой тут и кликом по области пада (Intent::SetActivePad).
+    active_pad: Option<String>,
 }
 
 impl RaceCore {
@@ -198,6 +205,7 @@ impl RaceCore {
         assignments: HashMap<String, Pilot>,
         cameras: HashMap<String, CameraConfig>,
         key_matcher: KeyMatcher,
+        active_pad: Option<String>,
     ) -> (Self, Vec<Effect>) {
         let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
             log::warn!("flight: local time unavailable, journal falls back to UTC");
@@ -218,6 +226,7 @@ impl RaceCore {
             lap_started_at: HashMap::new(),
             lap_events: HashMap::new(),
             key_matcher,
+            active_pad,
         };
         core.rec_deferred
             .push((core.ms(now), JournalRecord::RecordStarted {}));
@@ -299,17 +308,26 @@ impl RaceCore {
             Intent::RecPressed => self.rec_pressed(now),
             Intent::RacePressed => self.race_pressed(now),
             Intent::Exit => self.exit(now),
+            Intent::SetActivePad(pad) => self.set_active_pad(pad),
         }
     }
 
     /// Нажатие клавиатуры: решает матчер (бинды падов + глобальные
-    /// таблицы) — в любой фазе записи; тоггл активного пада живёт
-    /// всегда (Before/Countdown — выбрать пад, After — после финиша).
-    /// Сигнал фиксируется в журнале, только в Running. GUI спрашивает
-    /// активный пад через `active_pad`.
+    /// таблицы) с активным падом ядра — в любой фазе записи; выбор пада
+    /// живёт всегда (Before/Countdown — выбрать пад, After — после
+    /// финиша). Сигнал фиксируется в журнале, только в Running. GUI
+    /// спрашивает активный пад через `active_pad`.
     pub fn key_pressed(&mut self, event: &KeyPressed, now: Instant) -> Option<KeyMatch> {
-        let matched = self.key_matcher.match_key(event)?;
+        let matched = self
+            .key_matcher
+            .match_key(event, self.active_pad.as_deref())?;
         let KeyMatch::Signal { pad, event } = &matched else {
+            // Выбор пада: тогл своего номера, «0» снимает. GUI — нотисом.
+            match &matched {
+                KeyMatch::SetActivePad(p) => self.active_pad = Some(p.clone()),
+                KeyMatch::ResetActivePad => self.active_pad = None,
+                KeyMatch::Signal { .. } => unreachable!(),
+            }
             return Some(matched);
         };
         if !matches!(self.phase, RaceStage::Running { .. }) {
@@ -336,9 +354,10 @@ impl RaceCore {
         Some(matched)
     }
 
-    /// Активный пад (id) или None — для GUI после Set/ResetActivePad.
+    /// Активный пад (id) или None — для GUI после Set/ResetActivePad
+    /// и Intent::SetActivePad.
     pub fn active_pad(&self) -> Option<&str> {
-        self.key_matcher.active_pad()
+        self.active_pad.as_deref()
     }
 
     /// Дистиляты всех пэдов: полное обновление GUI (на старте гонки,
@@ -365,6 +384,12 @@ impl RaceCore {
             lines.push((self.ms(now), LapLine::Current { since }, events));
         }
         lines
+    }
+
+    /// Активный пад из GUI (клик по области пада в эфире).
+    fn set_active_pad(&mut self, pad: Option<String>) -> Vec<Effect> {
+        self.active_pad = pad;
+        Vec::new()
     }
 
     /// Намерение REC (ядро живо).
@@ -614,6 +639,7 @@ mod tests {
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(BTreeMap::new()),
+            None,
         )
         .0
     }
@@ -698,6 +724,7 @@ mod tests {
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(test_pads()),
+            None,
         );
         core.race_pressed(clock.now);
         // Отсчёт (Countdown, до выхода в Running): сет живёт и там.
@@ -770,6 +797,7 @@ mod tests {
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(test_pads()),
+            None,
         );
         // До гонки: сет работает (Before — выбрать пад), сигналы — нет.
         assert_eq!(
@@ -1115,6 +1143,7 @@ mod tests {
             HashMap::new(),
             cameras,
             test_matcher(BTreeMap::new()),
+            None,
         )
         .0;
         core.intent(Intent::RacePressed, clock.now);
@@ -1159,6 +1188,7 @@ mod tests {
             HashMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(BTreeMap::new()),
+            None,
         )
         .0;
         core.intent(Intent::RacePressed, clock.now);
@@ -1241,6 +1271,11 @@ impl Race {
         let _ = self.intents.try_send(Intent::Exit);
     }
 
+    /// Активный пад из GUI (клик по области пада в эфире).
+    pub fn set_active_pad(&self, pad: Option<String>) {
+        let _ = self.intents.try_send(Intent::SetActivePad(pad));
+    }
+
     /// Рождает гоночный поток и возвращает хэндл. new = REC нажали:
     /// журнал и ноль меток — от этого момента. Жизнь потока — сессия
     /// REC: REC-off до старта гонки отменяет её (ядро дропается,
@@ -1258,6 +1293,7 @@ impl Race {
         keyboard_rx: crossbeam::Receiver<KeyPressed>,
         wake: Arc<dyn Fn() + Send + Sync>,
         audio: Audio,
+        active_pad: Option<String>,
     ) -> Race {
         let (intent_tx, intent_rx) = crossbeam::bounded(16);
         let (notice_tx, notice_rx) = crossbeam::bounded(64);
@@ -1270,6 +1306,7 @@ impl Race {
             assignments,
             cameras,
             key_matcher,
+            active_pad,
         );
         thread::spawn(move || {
             let mut core = core;
@@ -1319,7 +1356,17 @@ impl Race {
                 // (таймаут — тот же min(deadline, POLL)).
                 let effects = crossbeam::select! {
                     recv(&intent_rx) -> intent => match intent {
-                        Ok(intent) => core.intent(intent, Instant::now()),
+                        Ok(intent) => {
+                            let set_pad = matches!(intent, Intent::SetActivePad(_));
+                            let effects = core.intent(intent, Instant::now());
+                            if set_pad {
+                                let _ = notice_tx.try_send(Notice::ActivePad(
+                                    core.active_pad().map(str::to_owned),
+                                ));
+                                wake();
+                            }
+                            effects
+                        }
                         Err(_) => break, // GUI ушёл без выхода
                     },
                     recv(&keyboard_rx) -> event => match event {

@@ -1,12 +1,14 @@
 //! Матчер клавиатурных биндингов: на вход нажатие (`KeyPressed`), на
 //! выход — действие. Сетап не матчер: при создании ему отдаётся
 //! `Setup`, матчинг живёт здесь. Бинды падов берутся из сетапа,
-//! глобальные — из таблицы в коде (не в setup.yaml): цифры 1–8
-//! активируют/деактивируют пад, Space — lap активного пада, W/E/R —
-//! warn/fault/correct активного.
+//! глобальные — из таблицы в коде (не в setup.yaml): цифры 1–8 —
+//! тогл активного пада (повтор снимает), 0 снимает явно, Space — lap
+//! активного пада, W/E/R — warn/fault/correct активного.
 //! Матчер отслеживает активный пад: действия вида `lap-active-pad`
-//! превращаются в сигнал над конкретным падом, `toggle-active-pad-N`
-//! глобальны — к падам не привязаны, хоть пады и переключают.
+//! превращаются в сигнал над конкретным падом, тогл цифрой наружу
+//! выходит уже разрешённым: Set (чужой номер) или Reset (свой
+//! повтором). Глобальные действия к падам не привязаны, хоть пады и
+//! переключают.
 
 use crate::config::keyboard::KeyBind;
 use crate::config::setup::Setup;
@@ -23,21 +25,34 @@ const GLOBAL_KEYBINDS: &[(&str, &str)] = &[
     ("6", "toggle-active-pad-6"),
     ("7", "toggle-active-pad-7"),
     ("8", "toggle-active-pad-8"),
+    ("0", "reset-active-pad"),
     ("Spacebar", "lap-active-pad"),
     ("W", "warn-active-pad"),
     ("E", "fault-active-pad"),
     ("R", "correct-active-pad"),
 ];
 
-/// Результат матчинга нажатия.
+/// Результат матчинга нажатия. Активный пад — всегда по имени.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyMatch {
     /// Сигнал судьи над конкретным падом.
     Signal { pad: String, event: LapEvent },
-    /// Глобальное переключение активного пада (клавиши 1–8, нумерация
-    /// с 1); повтор того же номера деактивирует. Номер без пада —
-    /// нажатие гаснет (no-op).
-    ToggleActivePad(usize),
+    /// Активный пад включён (тогл невыбранного номера).
+    SetActivePad(String),
+    /// Активный пад снят (тогл своего номера повтором или «0»).
+    ResetActivePad,
+}
+
+impl std::fmt::Display for KeyMatch {
+    /// Канонические строки действий (как в таблицах биндингов):
+    /// `fault -> pad-1`, `set-active-pad -> pad-2`, `reset-active-pad`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyMatch::Signal { pad, event } => write!(f, "{} -> {pad}", event.action()),
+            KeyMatch::SetActivePad(pad) => write!(f, "set-active-pad -> {pad}"),
+            KeyMatch::ResetActivePad => write!(f, "reset-active-pad"),
+        }
+    }
 }
 
 /// Глобальную таблицу собираем через serde — тот же парсер ключей,
@@ -88,8 +103,10 @@ impl KeyMatcher {
     /// Нажатие → действие. Сматчившийся падовый биндинг имеет
     /// приоритет над глобальным (неизвестное действие нажатие съедает,
     /// глобальные не проверяем). Глобальные действия разбираются на
-    /// месте: `toggle-active-pad-N` переключает активный пад,
-    /// `<signal>-active-pad` — сигнал над активным (без него — None).
+    /// месте: тогл цифрой разрешается по состоянию в Set (чужой
+    /// номер) или Reset (свой повтором), `reset-active-pad` снимает
+    /// явно, `<signal>-active-pad` — сигнал над активным (без него —
+    /// None).
     pub fn match_key(&mut self, event: &KeyPressed) -> Option<KeyMatch> {
         if let Some((pad, bind)) = self.pad_binds.iter().find(|(_, b)| b.matches(event)) {
             let event = LapEvent::from_action(&bind.action)?;
@@ -98,24 +115,28 @@ impl KeyMatcher {
                 event,
             });
         }
-        let action = self
+        let action = &self
             .global_binds
             .iter()
             .find(|bind| bind.matches(event))?
-            .action
-            .clone();
+            .action;
         if let Some(n) = action.strip_prefix("toggle-active-pad-") {
             let n: usize = n.parse().ok()?;
-            let i = n - 1;
-            if !(1..=8).contains(&n) || i >= self.pads.len() {
+            if !(1..=8).contains(&n) || n > self.pads.len() {
                 return None; // пада с таким номером нет: нажатие гаснет
             }
-            self.active = if self.active == Some(i) {
-                None
+            let i = n - 1;
+            return Some(if self.active == Some(i) {
+                self.active = None;
+                KeyMatch::ResetActivePad
             } else {
-                Some(i)
-            };
-            return Some(KeyMatch::ToggleActivePad(n));
+                self.active = Some(i);
+                KeyMatch::SetActivePad(self.pads[i].clone())
+            });
+        }
+        if action == "reset-active-pad" {
+            self.active = None;
+            return Some(KeyMatch::ResetActivePad);
         }
         if let Some(signal) = action.strip_suffix("-active-pad") {
             let event = LapEvent::from_action(signal)?;
@@ -130,6 +151,26 @@ impl KeyMatcher {
         self.active
             .and_then(|i| self.pads.get(i))
             .map(String::as_str)
+    }
+
+    /// Начальное состояние активного пада (id) — передача выбора
+    /// через границу фаз: GUI-матчер отдаёт его матчеру гонки при
+    /// входе в Live, обратно приходит через Notice::ActivePad.
+    pub fn set_active_pad(&mut self, pad: Option<&str>) {
+        self.active = pad.and_then(|p| self.pads.iter().position(|id| id == p));
+    }
+}
+
+impl Default for KeyMatcher {
+    /// Пустой матчер: ни падов, ни биндов — для пустышек обмена фаз
+    /// (экземпляр живёт до замены вызывающим кодом).
+    fn default() -> Self {
+        Self {
+            pads: Vec::new(),
+            pad_binds: Vec::new(),
+            global_binds: global_keybinds(),
+            active: None,
+        }
     }
 }
 
@@ -183,27 +224,29 @@ pads:
     }
 
     #[test]
-    fn toggle_switches_and_repeats_deactivate() {
+    fn toggle_resolves_to_set_or_reset() {
         let mut m = KeyMatcher::new(&setup());
-        // 1 — usage 0x1E.
+        // 1 — usage 0x1E: тогл пустого состояния — Set.
         assert_eq!(
             m.match_key(&press(&[0x1E])),
-            Some(KeyMatch::ToggleActivePad(1))
+            Some(KeyMatch::SetActivePad("pad-1".to_owned()))
         );
         assert_eq!(m.active_pad(), Some("pad-1"));
-        // Тот же номер — деактивация.
-        assert_eq!(
-            m.match_key(&press(&[0x1E])),
-            Some(KeyMatch::ToggleActivePad(1))
-        );
+        // Повтор своего номера — Reset.
+        assert_eq!(m.match_key(&press(&[0x1E])), Some(KeyMatch::ResetActivePad));
         assert_eq!(m.active_pad(), None);
-        // Другой номер — переключение (2 = 0x1F).
-        m.match_key(&press(&[0x1E]));
+        // Чужой номер — Set (2 = 0x1F).
         assert_eq!(
             m.match_key(&press(&[0x1F])),
-            Some(KeyMatch::ToggleActivePad(2))
+            Some(KeyMatch::SetActivePad("pad-2".to_owned()))
         );
         assert_eq!(m.active_pad(), Some("pad-2"));
+        // 0 — usage 0x27 — явное снятие.
+        assert_eq!(m.match_key(&press(&[0x27])), Some(KeyMatch::ResetActivePad));
+        assert_eq!(m.active_pad(), None);
+        // Повторный 0 при пустом состоянии — всё равно Reset.
+        assert_eq!(m.match_key(&press(&[0x27])), Some(KeyMatch::ResetActivePad));
+        assert_eq!(m.active_pad(), None);
     }
 
     #[test]
@@ -244,6 +287,24 @@ pads:
             // 3, 5, 8 — пада с таким номером нет: нажатие гаснет.
             assert_eq!(m.match_key(&press(&[usage])), None);
         }
+        assert_eq!(m.active_pad(), None);
+    }
+
+    #[test]
+    fn set_active_pad_seeds_by_pad_id() {
+        let mut m = KeyMatcher::new(&setup());
+        m.set_active_pad(Some("pad-2"));
+        assert_eq!(m.active_pad(), Some("pad-2"));
+        // lap-active-pad без toggle — сразу на посеянный пад.
+        assert_eq!(
+            m.match_key(&press(&[0x2C])),
+            Some(KeyMatch::Signal {
+                pad: "pad-2".to_owned(),
+                event: LapEvent::Lap,
+            })
+        );
+        // Неизвестный id — сброс в None.
+        m.set_active_pad(Some("pad-X"));
         assert_eq!(m.active_pad(), None);
     }
 

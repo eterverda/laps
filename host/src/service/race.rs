@@ -303,37 +303,40 @@ impl RaceCore {
     }
 
     /// Нажатие клавиатуры: решает матчер (бинды падов + глобальные
-    /// таблицы). Сигнал фиксируется в журнале, только в Running;
-    /// переключение активного пада — только состояние (GUI спрашивает
-    /// его через `active_pad`).
+    /// таблицы) — в любой фазе записи; тоггл активного пада живёт
+    /// всегда (Before/Countdown — выбрать пад, After — после финиша).
+    /// Сигнал фиксируется в журнале, только в Running. GUI спрашивает
+    /// активный пад через `active_pad`.
     pub fn key_pressed(&mut self, event: &KeyPressed, now: Instant) -> Option<KeyMatch> {
+        let matched = self.key_matcher.match_key(event)?;
+        let KeyMatch::Signal { pad, event } = &matched else {
+            return Some(matched);
+        };
         if !matches!(self.phase, RaceStage::Running { .. }) {
             return None; // вне гонки судейские сигналы игнорируем
         }
-        let matched = self.key_matcher.match_key(event)?;
-        if let KeyMatch::Signal { pad, event } = &matched {
-            let ms = self.ms(now);
-            self.journal.push(
-                ms,
-                JournalRecord::RaceEvent {
-                    pad_id: pad.clone(),
-                    name: *event,
-                },
-            );
-            if *event == LapEvent::Lap {
-                self.lap_started_at.insert(pad.clone(), now);
-                self.lap_events.remove(pad);
-            } else {
-                self.lap_events
-                    .entry(pad.clone())
-                    .or_default()
-                    .push((ms, *event));
-            }
+        let pad = pad.clone();
+        let ms = self.ms(now);
+        self.journal.push(
+            ms,
+            JournalRecord::RaceEvent {
+                pad_id: pad.clone(),
+                name: *event,
+            },
+        );
+        if *event == LapEvent::Lap {
+            self.lap_started_at.insert(pad.clone(), now);
+            self.lap_events.remove(&pad);
+        } else {
+            self.lap_events
+                .entry(pad.clone())
+                .or_default()
+                .push((ms, *event));
         }
         Some(matched)
     }
 
-    /// Активный пад (id) или None — для GUI после ToggleActivePad.
+    /// Активный пад (id) или None — для GUI после Set/ResetActivePad.
     pub fn active_pad(&self) -> Option<&str> {
         self.key_matcher.active_pad()
     }
@@ -697,18 +700,18 @@ mod tests {
             test_matcher(test_pads()),
         );
         core.race_pressed(clock.now);
+        // Отсчёт (Countdown, до выхода в Running): сет живёт и там.
+        assert_eq!(
+            core.key_pressed(&main_press(&[0x1E]), clock.now),
+            Some(KeyMatch::SetActivePad("pad-1".to_owned()))
+        );
+        assert_eq!(core.active_pad(), Some("pad-1"));
         core.tick(clock.advance(10_000)); // Running
         // Глобальные — только main-клавиатура (Linux: у устройств
         // свой id, глобалки без id их не видят; на других ОС фильтра
         // нет — assert платформенный).
         #[cfg(target_os = "linux")]
         assert!(core.key_pressed(&key_press(&[0x1E]), clock.now).is_none());
-        // 1 (0x1E) на main: pad-1 активен.
-        assert_eq!(
-            core.key_pressed(&main_press(&[0x1E]), clock.now),
-            Some(KeyMatch::ToggleActivePad(1))
-        );
-        assert_eq!(core.active_pad(), Some("pad-1"));
         // Space — lap активного пада, в журнале.
         let t_lap = clock.advance(15_000);
         assert_eq!(
@@ -718,12 +721,28 @@ mod tests {
                 event: LapEvent::Lap,
             })
         );
-        // Повтор цифры — деактивация; Space теперь ничего.
+        // Пост-финиш (After, запись ещё идёт): тогл живёт и там.
+        core.tick(clock.advance(DURATION.as_millis() as u64));
+        assert!(matches!(core.phase(), RaceStage::After { .. }));
+        assert_eq!(core.active_pad(), Some("pad-1")); // из Running
+        // Повтор своего номера — Reset (тогл).
         assert_eq!(
             core.key_pressed(&main_press(&[0x1E]), clock.now),
-            Some(KeyMatch::ToggleActivePad(1))
+            Some(KeyMatch::ResetActivePad)
         );
         assert_eq!(core.active_pad(), None);
+        // Чужое включение и явное снятие.
+        assert_eq!(
+            core.key_pressed(&main_press(&[0x1E]), clock.now),
+            Some(KeyMatch::SetActivePad("pad-1".to_owned()))
+        );
+        assert_eq!(core.active_pad(), Some("pad-1"));
+        assert_eq!(
+            core.key_pressed(&main_press(&[0x27]), clock.now),
+            Some(KeyMatch::ResetActivePad)
+        );
+        assert_eq!(core.active_pad(), None);
+        // Space без активного пада — ничего.
         assert!(core.key_pressed(&main_press(&[0x2C]), clock.now).is_none());
         assert!(
             journal_marks(&core)
@@ -752,21 +771,25 @@ mod tests {
             HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(test_pads()),
         );
-        // До гонки сигналы игнорируются.
+        // До гонки: сет работает (Before — выбрать пад), сигналы — нет.
+        assert_eq!(
+            core.key_pressed(&main_press(&[0x1E]), clock.now),
+            Some(KeyMatch::SetActivePad("pad-1".to_owned()))
+        );
+        assert_eq!(core.active_pad(), Some("pad-1"));
         assert!(core.key_pressed(&key_press(&[0x04]), clock.now).is_none());
         core.race_pressed(clock.now);
-        let t_start = clock.advance(10_000); // отсчёт вышел — Running
-        core.tick(t_start);
+        core.tick(clock.advance(10_000)); // Running
         // Старт гонки: текущий круг — у каждого пада, без единого
         // судейского события.
         let all = core.all_laps(clock.now);
         assert_eq!(all.len(), 1, "{all:?}");
         assert_eq!(all[0].1.len(), 1, "{all:?}");
         assert!(matches!(all[0].1[0].1, LapLine::Current { .. }));
-        // Lap на 15-й секунде гонки.
+        // Активный пад из Before пережил старт; сигнал на него — в журнал.
         let t_lap = clock.advance(15_000);
         assert_eq!(
-            core.key_pressed(&key_press(&[0x04]), t_lap),
+            core.key_pressed(&main_press(&[0x2C]), t_lap),
             Some(KeyMatch::Signal {
                 pad: "pad-1".to_owned(),
                 event: LapEvent::Lap,
@@ -1318,7 +1341,7 @@ impl Race {
                                         Vec::new()
                                     }
                                 }
-                                Some(KeyMatch::ToggleActivePad(_)) => {
+                                Some(KeyMatch::SetActivePad(_) | KeyMatch::ResetActivePad) => {
                                     let _ = notice_tx.try_send(Notice::ActivePad(
                                         core.active_pad().map(str::to_owned),
                                     ));

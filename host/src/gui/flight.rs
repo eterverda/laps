@@ -87,13 +87,11 @@ const PAD_TIMER_INACTIVE: egui::Color32 = TIMER_INACTIVE;
 /// TIMER_INACTIVE (× 0.2).
 const LAP_FUTURE: egui::Color32 = egui::Color32::from_rgb(0x8B, 0x88, 0x7C);
 
-/// Акцент кругов: обводка активности у курсора и выделение кликом.
+/// Акцент кругов: обводка выделения кликом.
 const LAP_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x5A, 0xC1, 0xFE);
-const LAP_HIGHLIGHT: egui::Color32 = LAP_ACCENT;
 const LAP_SELECTION: egui::Color32 = LAP_ACCENT;
-
-/// Пока активен какой-то один пад, остальные рисуются серыми.
-const PAD_INACTIVE: egui::Color32 = egui::Color32::from_rgb(0x55, 0x55, 0x55);
+/// Вспышка свежего события у курсора: заливка цветом активной гонки.
+const LAP_FLASH: egui::Color32 = RACE_ACTIVE;
 
 /// Событие в колонке кругов занимает 2 колонки сетки: глиф (1) и
 /// разделитель после него (1). Fira Code моноширинный — advance любого
@@ -184,13 +182,19 @@ struct Live {
 /// Данные DVR: просмотр записи. «Открытие» — не состояние экрана:
 /// интерактив включён ровно тогда, когда готовы плееры
 /// (`players_ready()`), это производное от их состояния.
-/// Выделение события кругов: пэд + журнальные мс. Совпадение мс у
-/// двух событий одного пада считаем невозможным (редактирование
-/// сохранит инвариант).
+/// Выделение в DVR: пусто / пад / событие на паде. Инвариант в
+/// типе: событие без пада не выражается.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EventSelection {
-    pad_id: String,
-    ms: u64,
+enum Selection {
+    None,
+    Pad(String),
+    Event(String, u64),
+}
+
+impl Default for Selection {
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 struct Review {
@@ -216,9 +220,9 @@ struct Review {
     /// камера с файлом; переключаемая в рантайме.
     master: String,
     scrub: Scrub,
-    /// Выделенное событие кругов (клик): подсветка и повторная
-    /// перемотка по клику.
-    selection: Option<EventSelection>,
+    /// Выделение кругов (клик): пад и, возможно, событие на нём.
+    /// Пад сеется в матчер фазы — он же цель клавиатурных сигналов.
+    selection: Selection,
 }
 
 /// Состояние скраббинга DVR: таймлайн, кнопки перемотки, шкалы
@@ -255,9 +259,8 @@ struct FrameContents {
     /// мигания, что у основного таймера (вторая половина секунды).
     /// None — не отсчёт, пэды рисуют круги/пустоту.
     countdown: Option<bool>,
-    /// Выделение кругов (DVR) — клик: перемотка на время + заливка
-    /// акцентом.
-    laps_active: Option<EventSelection>,
+    /// Выделение кругов (DVR) — клик: голубая обводка события.
+    laps_active: Selection,
     /// Клики по ячейкам кругов: только DVR.
     laps_clickable: bool,
 }
@@ -267,8 +270,8 @@ struct PadContents {
     /// Идентификатор пада (ключ `Setup.pads`): выделение кругов
     /// адресуется (пад, мс).
     pad_id: String,
-    /// Пад активен (глобальные клавиши): рамка вьюфайндера серая
-    /// вместо цвета пада.
+    /// Пад активен (глобальные клавиши): голубая рамка вокруг контента
+    /// колонки (вьюфайндер и бокс кругов).
     active: bool,
     label: String,
     pilot: String,
@@ -808,7 +811,7 @@ impl Flight {
             laps_cursor: Some(l.rec_at.elapsed().as_millis() as u64),
             laps_race_start: 0,
             countdown,
-            laps_active: None,
+            laps_active: Selection::None,
             laps_clickable: false,
         }
     }
@@ -884,7 +887,7 @@ impl Flight {
             laps_cursor: None,
             laps_race_start: 0,
             countdown: None,
-            laps_active: None,
+            laps_active: Selection::None,
             laps_clickable: false,
         }
     }
@@ -973,6 +976,17 @@ impl Flight {
         // матчит матчер фазы; события пока только логируются (правки
         // журнала — следующим шагом).
         drain_keyboard(&d.keyboard_rx, &mut d.key_matcher);
+        // Выделение — зеркало активного пада матчера: смена пада
+        // сбрасывает событие (событие живёт только на своём паде).
+        // Выделение — зеркало активного пада матчера: смена пада
+        // сбрасывает событие (событие живёт только на своём паде).
+        let active = d.key_matcher.active_pad().map(str::to_owned);
+        let sel = mem::take(&mut d.selection);
+        d.selection = match (active, sel) {
+            (Some(pad), Selection::Event(p, ms)) if p == pad => Selection::Event(p, ms),
+            (Some(pad), _) => Selection::Pad(pad),
+            (None, _) => Selection::None,
+        };
         // Вспышка тапа живёт ровно кадр: ставится в seek_tick на рендере,
         // гасится здесь перед сборкой следующего кадра.
         d.scrub.rew.flash = false;
@@ -1093,16 +1107,15 @@ impl Flight {
     }
 
     /// Блок кругов под вьюфайндерами: рамки-зоны (пунктир), символ
-    /// дисконнекта, таблицы кругов пэдов (события/имя/время) и
-    /// микро-таймер отсчёта. Клик возвращается интентом: (время
-    /// перемотки, выделение) — мутацию фазы делает вызывающий
-    /// (`Review::set_selection` + `Review::seek`).
+    /// дисконнекта, таблицы кругов, микро-таймер отсчёта, рамка
+    /// активного пада. Клик — интентом Selection (None — клика не
+    /// было): мутацию делает вызывающий (`Review::click`).
     fn show_laps(
         ui: &mut egui::Ui,
         frame: &FrameContents,
         column_geometry: &[(isize, isize)],
         viewfinder_cols: isize,
-    ) -> Option<(u64, Option<EventSelection>)> {
+    ) -> Selection {
         // Квадраты под вьюфайндерами (шириной во вьюфайндер):
         // первый — клетка ниже картинки (рамка рисуется
         // Outside — не в счёт), высота 4 клетки; второй —
@@ -1144,15 +1157,41 @@ impl Flight {
             guidelines::dashed_rect(ui, *first);
             guidelines::dashed_rect(ui, *second);
         }
-        // Клик по ячейке кругов: (время выделения,
-        // выделение). Клик — на конец круга: по событию и
-        // по имени/времени. Выделение — кружок, засчитавший
-        // круг: свой при клике по событию, событие, совпавшее
-        // по метке с концом круга, при клике по имени/времени
-        // (у незакрытого такого нет — выделение снимается).
-        // Клик по ячейке кругов: (время перемотки, выделение).
-        let mut lap_click: Option<(u64, Option<EventSelection>)> = None;
-        for (i, &(first, second)) in zones.iter().enumerate() {
+        // Клик — Selection: Pad — по области пада, Event — по
+        // ячейке (+ перемотка). Развыбора по клику нет — None
+        // значит «клика не было».
+        let mut lap_click = Selection::None;
+        for (i, ((zone_start, zone_width), &(first, second))) in
+            column_geometry.iter().zip(&zones).enumerate()
+        {
+            // Область пада кликабельна: выделяет пад (курсор не
+            // меняем). Ячейки ниже — их клики приоритетнее в пересечении.
+            let content = egui::Rect::from_min_max(
+                egui::pos2(
+                    cell_x(zone_start + (zone_width - viewfinder_cols) / 2),
+                    cell_y(TOP_BAR_ROWS + 1),
+                ),
+                second.right_bottom(),
+            );
+            if frame.laps_clickable {
+                let response =
+                    ui.interact(content, egui::Id::unique(("pad", i)), egui::Sense::click());
+                if response.clicked() {
+                    if let Some(pad) = frame.pads.get(i) {
+                        lap_click = Selection::Pad(pad.pad_id.clone());
+                    }
+                }
+            }
+            // Рамка активного пада: вокруг контента колонки; толще
+            // обводки выделения, цвет тот же.
+            if frame.pads.get(i).is_some_and(|p| p.active) {
+                ui.painter().rect_stroke(
+                    content.expand2(egui::vec2(16.0, 8.0)),
+                    4.0,
+                    egui::Stroke::new(4.0, LAP_ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
             placeholder(ui, first);
             // Второй прямоугольник — круги пада: по строке на
             // круг, сверху вниз; влезают последние.
@@ -1164,11 +1203,10 @@ impl Flight {
                 Some(_) if !frame.pads[i].laps.is_empty() => {
                     let capacity = (second.height() / cell_y(1)).max(0.0) as usize;
                     let pad_id = &frame.pads[i].pad_id;
-                    let active_ms = frame
-                        .laps_active
-                        .as_ref()
-                        .filter(|sel| sel.pad_id == *pad_id)
-                        .map(|sel| sel.ms);
+                    let active_ms = match &frame.laps_active {
+                        Selection::Event(pad, ms) if pad == pad_id => Some(*ms),
+                        _ => None,
+                    };
                     let rows = lap_table(
                         &frame.pads[i].laps,
                         frame.laps_cursor,
@@ -1215,43 +1253,29 @@ impl Flight {
                             rects.push(rect);
                             x += size.x + cell_x(1);
                         }
-                        // Заливка выделенной (кликнутой) —
-                        // под текстом: красный фон.
+                        // Заливка свежего события (кислотный фон) —
+                        // shrink(2), под текстом.
                         for (rect, cell) in rects.iter().zip(cells) {
-                            if cell.active {
-                                painter.rect_filled(*rect, 4.0, LAP_SELECTION);
+                            if cell.highlight {
+                                painter.rect_filled(rect.shrink(2.0), 4.0, LAP_FLASH);
                             }
                         }
                         let galley = painter.layout_job(lap_row_job(cells));
                         painter.galley(pos, galley, PAD_TIMER_ACTIVE);
                         for (ci, (rect, cell)) in rects.iter().zip(cells).enumerate() {
-                            // Обводки раздельные. По
-                            // одной: вспышка у курсора —
-                            // по полному rect, выделенная —
-                            // на 2 px меньше. Обе сразу:
-                            // выделенная ещё на 1 px
-                            // меньше, вспышка на 1 px
-                            // больше — рамки разъезжаются.
-                            let both = cell.highlight && cell.active;
-                            if cell.highlight {
-                                let flash = if both { rect.expand(2.0) } else { *rect };
-                                painter.rect_stroke(
-                                    flash,
-                                    4.0,
-                                    egui::Stroke::new(2.0, LAP_HIGHLIGHT),
-                                    egui::StrokeKind::Outside,
-                                );
-                            }
+                            // Обводка — выделение кликом (голубое),
+                            // штрих 3 px. Размер: shrink(1); поверх
+                            // вспышки — expand(1), рамки не совпадают.
                             if cell.active {
-                                let selection = rect.shrink2(if both {
-                                    egui::vec2(4.0, 4.0)
+                                let outline = if cell.highlight {
+                                    rect.expand(1.0)
                                 } else {
-                                    egui::vec2(2.0, 2.0)
-                                });
+                                    rect.shrink(1.0)
+                                };
                                 painter.rect_stroke(
-                                    selection,
+                                    outline,
                                     4.0,
-                                    egui::Stroke::new(2.0, LAP_SELECTION),
+                                    egui::Stroke::new(3.0, LAP_SELECTION),
                                     egui::StrokeKind::Outside,
                                 );
                             }
@@ -1270,28 +1294,8 @@ impl Flight {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
                                 if response.clicked() {
-                                    let pad_id = frame.pads[i].pad_id.clone();
-                                    let selection = if ci < lap_event_cells(cells).len() {
-                                        Some(EventSelection {
-                                            pad_id,
-                                            ms: cell.seek,
-                                        })
-                                    } else {
-                                        // Кружок, засчитавший
-                                        // круг: событие, чья
-                                        // метка совпадает с
-                                        // концом круга (время
-                                        // ячейки — end). У
-                                        // незакрытого такого
-                                        // нет — выделение
-                                        // снимается.
-                                        let end = lap_end_ms(cells);
-                                        lap_event_cells(cells)
-                                            .iter()
-                                            .find(|c| c.seek == end)
-                                            .map(|c| EventSelection { pad_id, ms: c.seek })
-                                    };
-                                    lap_click = Some((cell.seek, selection));
+                                    let pad = frame.pads[i].pad_id.clone();
+                                    lap_click = Selection::Event(pad, cell.seek);
                                 }
                             }
                         }
@@ -1489,20 +1493,22 @@ impl Flight {
                     // Блок кругов пэдов: рамки-зоны, таблицы,
                     // микро-таймер отсчёта. Клик возвращается
                     // интентом — мутацию фазы делает вызывающий.
-                    if let Some((ms, selection)) =
-                        Self::show_laps(ui, &frame, &column_geometry, viewfinder_cols)
-                    {
-                        if let Mode::Review(d) = &mut self.phase {
-                            if d.set_selection(selection) {
-                                d.seek(ms);
+                    match Self::show_laps(ui, &frame, &column_geometry, viewfinder_cols) {
+                        Selection::None => {}
+                        Selection::Pad(pad) => {
+                            if let Mode::Review(d) = &mut self.phase {
+                                d.click(&pad, None);
+                            }
+                        }
+                        Selection::Event(pad, ms) => {
+                            if let Mode::Review(d) = &mut self.phase {
+                                d.click(&pad, Some(ms));
                             }
                         }
                     }
                 }
 
                 if columns > 0 {
-                    // Пока активен один пад, остальные — серые.
-                    let any_active = frame.pads.iter().any(|p| p.active);
                     for (i, content) in frame.pads.iter().enumerate() {
                         let (zone_start, zone_width) = column_geometry[i];
                         let col = zone_start + (zone_width - viewfinder_cols) / 2;
@@ -1510,18 +1516,10 @@ impl Flight {
                         let viewfinder =
                             ruler.extrude(cell_x(viewfinder_cols), cell_y(viewfinder_rows + 2));
                         let frame_rect: egui::Rect = viewfinder.into();
-                        // Серым — неактивные, пока активен кто-то один;
-                        // активный и общий случай (без активного) —
-                        // цвет пада.
-                        let frame_color = if any_active && !content.active {
-                            PAD_INACTIVE
-                        } else {
-                            content.color
-                        };
                         viewfinder::ViewfinderFrame::new(
                             &content.label,
                             &content.pilot,
-                            frame_color,
+                            content.color,
                         )
                         .show(ui, frame_rect, |ui, rect| {
                             viewfinder::Viewfinder::new(content.viewport).show(
@@ -2136,20 +2134,18 @@ impl Flight {
 }
 
 impl Review {
-    /// Выделение ячейки кругов: тоггл. true — клик выделил (тогда
-    /// курсору можно ехать), false — развыбор.
-    fn set_selection(&mut self, selection: Option<EventSelection>) -> bool {
-        if selection.is_some() && self.selection == selection {
-            self.selection = None;
-            return false;
+    /// Клик по области кругов: Pad — выделение пада, Event — события
+    /// (+ перемотка). Только выделяет; пад сеется в матчер (цель
+    /// клавиатурных сигналов).
+    fn click(&mut self, pad: &str, seek: Option<u64>) {
+        self.selection = match seek {
+            None => Selection::Pad(pad.to_owned()),
+            Some(ms) => Selection::Event(pad.to_owned(), ms),
+        };
+        self.key_matcher.set_active_pad(Some(pad));
+        if let Some(ms) = seek {
+            self.transport.seek(ms);
         }
-        self.selection = selection;
-        true
-    }
-
-    /// Перемотка по клику ячейки кругов.
-    fn seek(&mut self, ms: u64) {
-        self.transport.seek(ms);
     }
 
     /// Полный набор данных DVR из журнала (None — пустой DVR: никаких
@@ -2208,7 +2204,7 @@ impl Review {
             players,
             transport,
             master,
-            selection: None,
+            selection: Selection::None,
             scrub: Scrub {
                 timeline: Timeline::new(),
                 rew: SeekButton::new(),
@@ -2318,10 +2314,10 @@ enum LapTone {
 }
 
 /// Ячейка строки круга: текст, тон, зачёркивание. `highlight` —
-/// вспышка у курсора ([mark, mark + 100 мс], только события).
-/// `active` — выделенная кликом ячейка (DVR): красная заливка
-/// (как активная REC), чёрный глиф, красная обводка; `seek` — её
-/// время для перемотки (мс журнала).
+/// вспышка у курсора ([mark, mark + 100 мс], только события):
+/// кислотная заливка, глиф чёрный поверх неё. `active` — выделенная
+/// кликом ячейка (DVR): голубая обводка; `seek` — её время для
+/// перемотки (мс журнала).
 struct LapCell {
     text: String,
     tone: LapTone,
@@ -2348,11 +2344,6 @@ impl LapCell {
 /// Ячейки событий строки: последние две ячейки — имя и время.
 fn lap_event_cells(cells: &[LapCell]) -> &[LapCell] {
     cells.split_at(cells.len().saturating_sub(2)).0
-}
-
-/// Метка конца круга: seek времени (последней ячейки строки).
-fn lap_end_ms(cells: &[LapCell]) -> u64 {
-    cells.last().map(|c| c.seek).unwrap_or(0)
 }
 
 /// Таблица кругов: одна строка на круг, колонки «события имя время»
@@ -2492,11 +2483,10 @@ fn lap_table(
 /// «ещё не случилось», зачёркнутое время провала.
 fn lap_row_job(cells: &[LapCell]) -> egui::text::LayoutJob {
     let format = |cell: &LapCell| {
-        // Зеленовый (как активная RACE) — только обводки/заливка;
-        // глиф активной (кликнутой) ячейки — чёрный поверх заливки,
-        // остальные — в обычной паре тонов. Зачёркивание — в цвет
-        // текста ячейки.
-        let color = if cell.active {
+        // Глиф на кислотной заливке (свежее событие) — чёрный
+        // поверх неё, остальные — в обычной паре тонов.
+        // Зачёркивание — в цвет текста ячейки.
+        let color = if cell.highlight {
             egui::Color32::BLACK
         } else {
             match cell.tone {

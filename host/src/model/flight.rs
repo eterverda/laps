@@ -74,9 +74,13 @@ impl Journal {
     }
 
     /// Добавить событие (память; на диск уходит через `append`/`snapshot`
-    /// — журнал файла не касается).
+    /// — журнал файла не касается). Вставка по времени: позиция —
+    /// бинарным поиском; среди равных меток — после равных (порядок
+    /// вставки сохраняется). Вставка в конец (обычный путь
+    /// хронологической записи) — без сдвига.
     pub fn push(&mut self, ms: u64, event: JournalRecord) {
-        self.events.push((ms, event));
+        let pos = self.events.partition_point(|(at, _)| *at <= ms);
+        self.events.insert(pos, (ms, event));
     }
 
     /// Удалить события по предикату (правки DVR): правка в памяти, файл
@@ -822,6 +826,40 @@ mod tests {
             assert_eq!(LapEvent::from_action(action), Some(event));
         }
         assert_eq!(LapEvent::from_action("banana"), None);
+    }
+
+    /// Вставка по времени: позиция бинарным поиском; равные метки —
+    /// после равных (порядок вставки сохраняется).
+    #[test]
+    fn journal_push_inserts_by_time() {
+        let mut journal = sample_journal();
+        journal.push(500, JournalRecord::RaceStarted {});
+        journal.push(100, JournalRecord::RecordStarted {});
+        journal.push(300, JournalRecord::RaceCountdown {});
+        journal.push(300, JournalRecord::RaceFinished { prematurely: false });
+        let marks: Vec<(u64, &str)> = journal
+            .iter_ms()
+            .map(|(ms, e)| {
+                let mark = match e {
+                    JournalRecord::RecordStarted {} => "rec",
+                    JournalRecord::RaceCountdown {} => "cd",
+                    JournalRecord::RaceStarted {} => "go",
+                    JournalRecord::RaceFinished { .. } => "finish",
+                    _ => "?",
+                };
+                (ms, mark)
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            vec![
+                (0, "rec"),
+                (100, "rec"),
+                (300, "cd"),
+                (300, "finish"),
+                (500, "go"),
+            ]
+        );
     }
 
     #[test]

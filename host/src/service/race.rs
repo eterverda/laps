@@ -326,6 +326,8 @@ impl RaceCore {
             match &matched {
                 KeyMatch::SetActivePad(p) => self.active_pad = Some(p.clone()),
                 KeyMatch::ResetActivePad => self.active_pad = None,
+                // Удаление — только в Review (там журнал правится).
+                KeyMatch::Delete | KeyMatch::Backspace => return None,
                 KeyMatch::Signal { .. } => unreachable!(),
             }
             return Some(matched);
@@ -1388,6 +1390,7 @@ impl Race {
                                         Vec::new()
                                     }
                                 }
+                                Some(KeyMatch::Delete) | Some(KeyMatch::Backspace) => Vec::new(), // ядро глушит: не доходит
                                 Some(KeyMatch::SetActivePad(_) | KeyMatch::ResetActivePad) => {
                                     let _ = notice_tx.try_send(Notice::ActivePad(
                                         core.active_pad().map(str::to_owned),

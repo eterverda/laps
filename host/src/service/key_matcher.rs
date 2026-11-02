@@ -24,6 +24,8 @@ const GLOBAL_KEYBINDS: &[(&str, &str)] = &[
     ("8", "toggle-active-pad-8"),
     ("0", "reset-active-pad"),
     ("Spacebar", "lap-active-pad"),
+    ("Delete", "delete"),
+    ("Backspace", "backspace"),
     ("W", "warn-active-pad"),
     ("E", "fault-active-pad"),
     ("R", "correct-active-pad"),
@@ -40,6 +42,10 @@ pub enum KeyMatch {
     SetActivePad(String),
     /// Снять активный пад (тогл своего номера повтором или «0»).
     ResetActivePad,
+    /// Удаление (Delete): что удалять — решает потребитель.
+    Delete,
+    /// Удаление назад (Backspace): пока обрабатывается как Delete.
+    Backspace,
 }
 
 impl std::fmt::Display for KeyMatch {
@@ -50,6 +56,8 @@ impl std::fmt::Display for KeyMatch {
             KeyMatch::Signal { pad, event } => write!(f, "{} -> {pad}", event.action()),
             KeyMatch::SetActivePad(pad) => write!(f, "set-active-pad -> {pad}"),
             KeyMatch::ResetActivePad => write!(f, "reset-active-pad"),
+            KeyMatch::Delete => write!(f, "delete"),
+            KeyMatch::Backspace => write!(f, "backspace"),
         }
     }
 }
@@ -129,6 +137,12 @@ impl KeyMatcher {
         }
         if action == "reset-active-pad" {
             return Some(KeyMatch::ResetActivePad);
+        }
+        if action == "delete" {
+            return Some(KeyMatch::Delete);
+        }
+        if action == "backspace" {
+            return Some(KeyMatch::Backspace);
         }
         if let Some(signal) = action.strip_suffix("-active-pad") {
             let event = LapEvent::from_action(signal)?;
@@ -267,6 +281,16 @@ pads:
             // 3, 5, 8 — пада с таким номером нет: нажатие гаснет.
             assert_eq!(m.match_key(&press(&[usage]), None), None);
         }
+    }
+
+    #[test]
+    fn delete_keys_match() {
+        let m = KeyMatcher::new(&setup());
+        assert_eq!(m.match_key(&press(&[0x4C]), None), Some(KeyMatch::Delete)); // Delete
+        assert_eq!(
+            m.match_key(&press(&[0x2A]), None),
+            Some(KeyMatch::Backspace)
+        ); // Backspace
     }
 
     #[test]

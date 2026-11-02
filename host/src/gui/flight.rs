@@ -851,7 +851,7 @@ impl Flight {
         // и глобальные биндинги работают уже здесь; события пока только
         // логируются (исполнение — в гонке). В Live канал уехал в Race,
         // там его дренит поток.
-        drain_keyboard(&i.keyboard_rx, &i.key_matcher, selection);
+        let _ = drain_keyboard(&i.keyboard_rx, &i.key_matcher, selection);
         // Клавиатурный дрен выше живёт на этом счётчике, пока эфир
         // мёртв (живой — кадры гонят перерисовки сами).
         if !i
@@ -999,7 +999,24 @@ impl Flight {
         // Клавиатуры (Review): ввод — main-клавиатура (пумп в update),
         // матчит матчер фазы (пад — из выделения); события пока только
         // логируются (правки журнала — следующим шагом).
-        drain_keyboard(&d.keyboard_rx, &d.key_matcher, selection);
+        for matched in drain_keyboard(&d.keyboard_rx, &d.key_matcher, selection) {
+            match matched {
+                KeyMatch::Delete | KeyMatch::Backspace => {
+                    if let Selection::Event(pad, ms) = selection.clone() {
+                        if d.delete_selected(&pad, ms) {
+                            *selection = Selection::Pad(pad);
+                        }
+                    }
+                }
+                // Судейский сигнал — правка журнала (DVR): события пада
+                // в окне вспышки заменяются одним по курсору.
+                KeyMatch::Signal { pad, event } => {
+                    let cursor = d.transport.position();
+                    d.apply_signal(&pad, event, cursor, selection);
+                }
+                KeyMatch::SetActivePad(_) | KeyMatch::ResetActivePad => unreachable!(),
+            }
+        }
         // Вспышка тапа живёт ровно кадр: ставится в seek_tick на рендере,
         // гасится здесь перед сборкой следующего кадра.
         d.scrub.rew.flash = false;
@@ -2262,6 +2279,47 @@ impl Flight {
 }
 
 impl Review {
+    /// Удаление события (Delete/Backspace): запись убирается из
+    /// журнала, файл переписывается снапшотом целиком. true — событие
+    /// было и удалено.
+    fn delete_selected(&mut self, pad: &str, ms: u64) -> bool {
+        if self.journal.remove(pad, ms, ms + 1) == 0 {
+            return false;
+        }
+        self.snapshot_after_edit();
+        true
+    }
+
+    /// Снапшот журнала после правки (файл переписывается целиком).
+    fn snapshot_after_edit(&self) {
+        if let Err(e) = self.journal.snapshot(Path::new(CAPTURES_DIR)) {
+            log::error!("flight journal: snapshot after edit failed: {e}");
+        }
+    }
+
+    /// Применение судейского сигнала клавишами (правка журнала в DVR):
+    /// события пада в окне вспышки ([cursor−100, cursor+100)) убираются,
+    /// нажатое встаёт по курсору; событий в окне нет — просто вставка по
+    /// курсору. Выделение события снимается, выделение пада остаётся.
+    /// Выделенное событие здесь не используется — оно для удаления.
+    fn apply_signal(&mut self, pad: &str, event: LapEvent, cursor: u64, selection: &mut Selection) {
+        let (from, to) = LAP_FLASH_INTERVAL_DVR;
+        let from = (cursor as i64 + from).max(0) as u64;
+        let to = (cursor as i64 + to).max(0) as u64;
+        self.journal.remove(pad, from, to);
+        self.journal.push(
+            cursor,
+            JournalRecord::RaceEvent {
+                pad_id: pad.to_owned(),
+                name: event,
+            },
+        );
+        if let Selection::Event(p, _) = selection.clone() {
+            *selection = Selection::Pad(p);
+        }
+        self.snapshot_after_edit();
+    }
+
     /// Полный набор данных DVR из журнала (None — пустой DVR: никаких
     /// чужих записей, только файлы журнала). Плееры открываются
     /// асинхронно — транзит, пока все не открылись (Ready/Failed).
@@ -2395,12 +2453,14 @@ pub fn viewfinder_cols(count: usize) -> isize {
 
 /// Дрен клавиатурного канала фазы: нажатия матчит (активный пад —
 /// из выделения, матчер чистый) и применяет к выделению: Set/Reset
-/// меняют пад, сигналы только логируются (исполнение — в гонке).
+/// меняют пад. Остальные действия возвращает — исполнение у фазы
+/// (сигналы — в гонке, удаление — в Review).
 fn drain_keyboard(
     rx: &crossbeam::Receiver<KeyPressed>,
     key_matcher: &KeyMatcher,
     selection: &mut Selection,
-) {
+) -> Vec<KeyMatch> {
+    let mut pending = Vec::new();
     while let Ok(event) = rx.try_recv() {
         log::info!("keyboard: {event}");
         let Some(matched) = key_matcher.match_key(&event, selection.pad()) else {
@@ -2410,9 +2470,10 @@ fn drain_keyboard(
         match matched {
             KeyMatch::SetActivePad(p) => *selection = Selection::Pad(p),
             KeyMatch::ResetActivePad => *selection = Selection::None,
-            KeyMatch::Signal { .. } => {}
+            other => pending.push(other),
         }
     }
+    pending
 }
 
 /// мм:ss от длительности.

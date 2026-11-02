@@ -83,10 +83,21 @@ impl Journal {
         self.events.insert(pos, (ms, event));
     }
 
+    /// Удалить события пада в полуинтервале [from, to) (правки DVR).
+    /// Возвращает число удалённых.
+    pub fn remove(&mut self, pad_id: &str, from: u64, to: u64) -> usize {
+        let before = self.event_count();
+        self.retain(|(ms, record)| {
+            !(ms >= &from
+                && ms < &to
+                && matches!(record, JournalRecord::RaceEvent { pad_id: id, .. } if *id == pad_id))
+        });
+        before - self.event_count()
+    }
+
     /// Удалить события по предикату (правки DVR): правка в памяти, файл
     /// переписывается снапшотом целиком. Первый эвент не удаляется
     /// (держит ноль шкалы).
-    #[allow(dead_code)]
     pub fn retain<F: FnMut(&(u64, &JournalRecord)) -> bool>(&mut self, mut pred: F) {
         let mut i = 0;
         self.events.retain(|(ms, event)| {
@@ -830,6 +841,35 @@ mod tests {
 
     /// Вставка по времени: позиция бинарным поиском; равные метки —
     /// после равных (порядок вставки сохраняется).
+    #[test]
+    fn journal_remove_by_range() {
+        let mut journal = sample_journal();
+        for (ms, pad) in [
+            (100, "pad-1"),
+            (200, "pad-1"),
+            (200, "pad-2"),
+            (300, "pad-1"),
+        ] {
+            journal.push(
+                ms,
+                JournalRecord::RaceEvent {
+                    pad_id: pad.to_owned(),
+                    name: LapEvent::Fault,
+                },
+            );
+        }
+        // Половинчатый интервал: 200 входит, 300 — нет.
+        assert_eq!(journal.remove("pad-1", 100, 300), 2);
+        let rest: Vec<(u64, &str)> = journal
+            .iter_ms()
+            .filter_map(|(ms, e)| match e {
+                JournalRecord::RaceEvent { pad_id, .. } => Some((ms, pad_id.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rest, vec![(200, "pad-2"), (300, "pad-1")]);
+    }
+
     #[test]
     fn journal_push_inserts_by_time() {
         let mut journal = sample_journal();

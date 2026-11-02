@@ -1114,7 +1114,7 @@ impl Flight {
         // Квадраты под вьюфайндерами (шириной во вьюфайндер):
         // первый — клетка ниже картинки (рамка рисуется
         // Outside — не в счёт), высота 4 клетки; второй —
-        // клетка ниже первого, низ — на нижней границе.
+        // клетка ниже первого, низ — на 2 клетки выше нижней границы.
         let screen = ui.max_rect().into_ruler();
         let bottom = screen.collapse_bottom().translate(0.0, -cell_y(4));
         let vf_bottom = cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows(frame.pads.len()) + 2);
@@ -1143,7 +1143,7 @@ impl Flight {
                     .into();
                 let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
                     .into_ruler()
-                    .extrude(w, bottom.bottom_left().y - cell_y(1) - first.bottom())
+                    .extrude(w, bottom.bottom_left().y - cell_y(2) - first.bottom())
                     .into();
                 (first, second)
             })

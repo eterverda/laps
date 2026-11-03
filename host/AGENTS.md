@@ -39,7 +39,9 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - Own zooming and theming; egui auto-zoom (`zoom_with_keyboard`) disabled,
   theme pinned to dark, native window decorations untouched
 - One camera frame → one texture → N viewfinders via UV viewport cropping
-- Widgets (all in `src/gui/`): `view::Stripe`/`StripeX2` — background
+- Widgets (generic — top-level `src/gui/`, reused by the planned
+  jumbotron; flight-specific — screen submodules `src/gui/flight/laps.rs`
+  and `src/gui/flight/scrub.rs`): `view::Stripe`/`StripeX2` — background
   plates (cut-corner polygon, corner-hugging), text drawn by the caller
   in a closure; `view::NavButton` — status-bar chain button (live +
   scrub EXIT): arrow plate + top text (words, 1-cell gaps, first word
@@ -61,6 +63,20 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   string; `[weekday format:mn]` at the end is our placeholder, replaced
   with a Russian two-letter weekday, lowercase)
   our placeholder (replaced with a Russian two-letter weekday, lowercase)
+- Screen submodules of `flight` (flight-specific, unlike top-level
+  `view`/`viewfinder`): `flight::laps` — lap tables in the bottom
+  column blocks (rows, countdown micro-timer; takes ready rects, one
+  per column, returns the clicked cell); `flight::scrub` — DVR transport
+  (`Timeline` with circle-stretch and hover-scroll scrub built in,
+  `SeekButton` with the tap/hold/shuttle machine in `tick()` →
+  `SeekEvent`, `ScrollGate`, speed scales, `show_events` strip above
+  the timeline). Widgets draw and return intents; execution stays in
+  the screen
+- **Color palette** lives in `src/gui/style.rs`: button pairs
+  `<ROLE>_ACTIVE`/`<ROLE>_IDLE` (EXIT, TRANSPORT, REC, RACE), timer pair
+  `TIMER_ACTIVE`/`TIMER_INACTIVE`, pad-timer pair `PAD_TIMER_*`, lap
+  colors `LAP_*`. Names are semantic — equal colors stay separate named
+  aliases (aliasing expresses a deliberate link), they are not collapsed
 - Glyph mirroring: a word prefixed with the vendor marker
   `view::GLYPH_FLIP` (PUA U+E6C0, no glyph in the font) draws its first
   glyph mirrored horizontally — Nerd Fonts has no mirrored icon pairs
@@ -149,7 +165,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   `RaceStage`, гоночного стейта не имеет; до старта гонки отжатия
   шагают назад, после — только вперёд
 - **Клавиатуры** (`driver::keyboard`): `attach(events, id, cfg) ->
-  Result<SharedKeyboardState, AttachError>` — ридер-поток устройства
+Result<SharedKeyboardState, AttachError>` — ридер-поток устройства
   шлёт `KeyPressed` (только фронт нажатия + HID-маска модификаторов;
   релизы идут только в `ModifierTracker`, маска не застревает) прямо в
   переданный канал, умирает с устройством, на выходе гасит `connected`

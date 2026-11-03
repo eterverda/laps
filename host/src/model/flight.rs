@@ -958,3 +958,13 @@ mod tests {
         assert_eq!(clip.race_finished_ms, Some(68_000));
     }
 }
+
+/// Последний журнал полёта в каталоге: стемы сортируются лексикографически.
+pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
+        .max()
+}

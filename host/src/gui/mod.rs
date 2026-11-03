@@ -14,7 +14,6 @@ mod guidelines;
 mod header;
 mod menu;
 mod ruler;
-mod scrub;
 mod style;
 mod view;
 mod viewfinder;

@@ -1,23 +1,23 @@
-//! Транспорт DVR-режима: таймлайн, кнопки перемотки, скролл-гейты и
-//! шкалы скоростей. Экрана Scrub больше нет — всё это использует экран
-//! Flight (режим DVR).
+//! Транспорт DVR-режима экрана Flight: таймлайн, кнопки перемотки,
+//! скролл-гейты и шкалы скоростей. Виджеты рисуют и возвращают
+//! события-интенты; исполнение (транспорт, перемотка) — у экрана.
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-use crate::gui::ruler::CELL_SIZE;
-use std::fs;
 use std::time::Instant;
+
+use super::laps::{LapTone, lap_glyph, paint_event_cell};
+use crate::gui::ruler::{CELL_SIZE, cell_y};
+use crate::model::flight::LapEvent;
 
 /// База позиционного шага по тапу (клик): тап мотает на
 /// speed × SEEK_TAP файла (10x → 1 с).
 pub const SEEK_TAP: u64 = 100;
 /// Задержка до старта hold: press короче неё — чистый клик, hold в
 /// плеер не уходит вообще.
-pub const SEEK_HOLD_DELAY: Duration = Duration::from_millis(100);
+const SEEK_HOLD_DELAY: Duration = Duration::from_millis(100);
 /// Отпускание раньше этого — клик: hold (если уже ушёл) отменяется,
 /// даётся фиксированный позиционный шаг.
-pub const SEEK_CLICK_MAX: Duration = Duration::from_millis(300);
+const SEEK_CLICK_MAX: Duration = Duration::from_millis(300);
 /// Торможение по отпусканию кнопки перемотки при игре: возврат к
 /// скорости воспроизведения за это время. Из паузы стоп мгновенный
 /// (константа не участвует).
@@ -27,7 +27,7 @@ pub const SCROLL_STEP: f32 = 50.0;
 /// Минимальная ширина сосиски повтора, физические пиксели. Уже —
 /// растягиваем: внутри растянутой сосиски голова (и drag) идут по
 /// локальному скейлу круга, а не записи.
-pub const CIRCLE_MIN_WIDTH_PX: f32 = 24.0;
+const CIRCLE_MIN_WIDTH_PX: f32 = 24.0;
 /// Непрерывная тишина скролла, после которой следующий жест снова
 /// даёт шаг по шкале. 300 мс — по аналогии с double-tap time
 /// (Android ViewConfiguration / Windows).
@@ -56,13 +56,15 @@ pub enum TimelineEvent {
 }
 
 /// Акцентный цвет каретки и активного фрагмента трека — слоновая кость
-/// (как TRANSPORT_ACTIVE flight'а).
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0xE8, 0xE2, 0xCE);
+/// транспорта (своё имя: каретка таймлайна не обязана вечно следовать
+/// кнопкам транспорта).
+const ACCENT: egui::Color32 = crate::gui::style::TRANSPORT_ACTIVE;
 
 /// Таймлайн DVR: линия с кружком позиции, интерактив. Держит своё
-/// состояние ввода (нажатие, точку последнего seek'а), наружу отдаёт
-/// только события. Клик и таскание перематывают по временной шкале;
-/// seek — только при реальном сдвиге указателя. Время рисует хозяин.
+/// состояние ввода (нажатие, точку последнего seek'а, скролл-скраб),
+/// наружу отдаёт только события. Клик и таскание перематывают по
+/// временной шкале; seek — только при реальном сдвиге указателя.
+/// Время (доли) рисует хозяин: домен журнала в виджет не протекает.
 pub struct Timeline {
     /// Кнопка мыши на шкале зажата (на прошлом кадре).
     down: bool,
@@ -70,6 +72,8 @@ pub struct Timeline {
     /// при реальном сдвиге — иначе каждый кадр UI слал бы команду
     /// впустую и крутил busy-loop.
     last_seek: Option<egui::Pos2>,
+    /// Скролл-скраб над шкалой (состояние гейта — у виджета).
+    hscroll: HScroll,
 }
 
 impl Timeline {
@@ -77,6 +81,7 @@ impl Timeline {
         Self {
             down: false,
             last_seek: None,
+            hscroll: HScroll::new(),
         }
     }
 
@@ -85,9 +90,13 @@ impl Timeline {
     /// frac — доля позиции (0..1), dur_ms — для перевода доли в мс.
     /// window — доли (начало, конец) фрагмента активного вылета: рисуем
     /// белым, края полоски — серым; None — вся линия серая. circle —
-    /// доли (начало, конец) круга зацикливания: вместо кружка головки
-    /// — белая капсула (сосиска) на весь круг, точная позиция —
-    /// чёрный кружок меньшего диаметра поверх.
+    /// доли (начало, конец) реального круга зацикливания: вместо
+    /// кружка головки — белая капсула (сосиска) на весь круг, точная
+    /// позиция — чёрный кружок меньшего диаметра поверх. Круг уже
+    /// CIRCLE_MIN_WIDTH_PX растягивается здесь: внутри растянутой
+    /// капсулы голова (и drag) течёт по локальному скейлу круга.
+    /// marker — доля 0..1 момента отсчёта: белая точка 2px на линии
+    /// (RaceCountdown: стартовая позиция курсора DVR).
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -95,14 +104,7 @@ impl Timeline {
         frac: f32,
         dur_ms: u64,
         window: Option<(f32, f32)>,
-        // circle: доли (начало, конец) капсулы круга как нарисовано
-        // (после растяжения до минимума — см. CIRCLE_MIN_WIDTH_PX).
         circle: Option<(f32, f32)>,
-        // circle_real: доли (начало, конец) реального круга до растяжения
-        // — для обратного маппинга seek'а внутри растянутой капсулы.
-        circle_real: Option<(f32, f32)>,
-        // Маркер момента: доля 0..1 — белая точка 2px на линии
-        // (RaceCountdown: стартовая позиция курсора DVR).
         marker: Option<f32>,
     ) -> (egui::Response, Vec<TimelineEvent>) {
         // Акцент: каретка и активный фрагмент трека — цвет активного
@@ -111,6 +113,21 @@ impl Timeline {
         let mut events = Vec::new();
         let y = rect.center().y;
         let x = |f: f32| rect.left() + rect.width() * f;
+        // Растяжение сосиски до минимума (реальный круг уже минимума —
+        // голова по общему скейлу; иначе капсула тянется до
+        // CIRCLE_MIN_WIDTH_PX, а внутри неё голова (и drag) идут по
+        // локальному скейлу круга).
+        let min_w = (CIRCLE_MIN_WIDTH_PX / ui.ctx().pixels_per_point() / rect.width()).min(1.0);
+        let (circle, circle_real, frac) = match circle {
+            Some((lo, hi)) if hi - lo < min_w => {
+                let center = ((lo + hi) / 2.0).clamp(min_w / 2.0, 1.0 - min_w / 2.0);
+                let nlo = center - min_w / 2.0;
+                let nhi = center + min_w / 2.0;
+                let inner = ((frac - lo) / (hi - lo).max(f32::EPSILON)).clamp(0.0, 1.0);
+                (Some((nlo, nhi)), Some((lo, hi)), nlo + inner * (nhi - nlo))
+            }
+            other => (other, None, frac),
+        };
         // Трек — 40% акцентного, активный фрагмент — акцентным.
         let track = egui::Stroke::new(2.0, knob.gamma_multiply(0.4));
         let white = egui::Stroke::new(2.0, knob);
@@ -149,10 +166,10 @@ impl Timeline {
                 // курсор, центр круга встаёт на позицию.
                 let cap_r = knob_r * 1.4;
                 // Стадион: центры полуовалов — в точках круга lo/hi,
-                // овалы выпирают за них на радиус. Хозяин растягивает
-                // капсулу до CIRCLE_MIN_WIDTH_PX, так что lo==hi здесь
-                // бывает лишь если таймлайн уже минимума — вырождение
-                // в кружок. Сначала — чёрное «эхо» чуть большего
+                // овалы выпирают за них на радиус. Уже минимума круг
+                // растянут выше, так что lo==hi здесь бывает лишь если
+                // таймлайн уже минимума — вырождение в кружок.
+                // Сначала — чёрное «эхо» чуть большего
                 // диаметра: выделяет каретку на треке.
                 let echo = knob_r * 0.4;
                 let x0 = x(lo);
@@ -268,6 +285,124 @@ impl Timeline {
         self.down = down;
         (response, events)
     }
+
+    /// Горизонтальный скролл над шкалой — относительный скраб. Дельта
+    /// кадра (0 — скролла нет) → миллисекунды шага (хозяин мотает);
+    /// курсор и repaint — на себе. Вход жёстче, чтобы микро-дрожание
+    /// не будило скраб; выход — по тишине (HScroll_RELEASE).
+    pub fn hscroll(&mut self, ui: &egui::Ui, response: &egui::Response, dx: f32) -> Option<i64> {
+        let dx = if response.hovered() { dx } else { 0.0 };
+        let ms = self.hscroll.feed(dx, ui.ctx().pixels_per_point())?;
+        if self.hscroll.active() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            ui.ctx().request_repaint();
+        }
+        Some(ms)
+    }
+}
+
+/// События кнопки перемотки за кадр: команды хозяину (транспорту и
+/// перемотке). Семантика клика против hold'а: press ждёт
+/// SEEK_HOLD_DELAY (100 мс) — удержали дольше, уходит hold;
+/// отпускание раньше SEEK_CLICK_MAX (300 мс) отменяет его и даёт
+/// фиксированный шаг. Иначе короткий клик со щелчком (2–3 кадра)
+/// неотличим от тапа.
+pub enum SeekEvent {
+    /// Тап или короткий клик: позиционный шаг; величину (шкала
+    /// SEEK_SPEEDS × SEEK_TAP) и знак (направление кнопки) знает
+    /// хозяин. `from_hold` — hold успел уйти в плеер: сначала рампа
+    /// возврата (SEEK_RELEASE_RAMP), потом шаг. Вспышка подсветки
+    /// уже поставлена.
+    Step { from_hold: bool },
+    /// Hold: разгон до скорости шаттла (знак — направление кнопки;
+    /// величину — шкала SEEK_SPEEDS — знает хозяин).
+    Shuttle,
+    /// Долгое отпускание после hold'а: рампа возврата
+    /// (SEEK_RELEASE_RAMP).
+    Release,
+}
+
+/// Кнопка перемотки: клик — позиционный шаг, удержание — разгон плеера
+/// до ±скорости рампой, отпускание — возврат к прежнему режиму рампой.
+/// Весь профиль рампы живёт в плеере (resume он запоминает сам).
+///
+/// Состояние ввода кнопки; машина press/hold/release — метод tick:
+/// один кадр (response кнопки) → событие-интент хозяину.
+pub struct SeekButton {
+    down: bool,
+    /// Момент press'а: окна SEEK_HOLD_DELAY / SEEK_CLICK_MAX.
+    down_since: Instant,
+    /// Hold уже послан в плеер (после SEEK_HOLD_DELAY): отпускание до
+    /// SEEK_CLICK_MAX должно его отменить, а не просто игнорировать.
+    hold_sent: bool,
+    /// Тап/клик: вспышка подсветки. Липкая: горит, пока её не погасит
+    /// следующая перерисовка (сброс в начале апдейта; событие ставит
+    /// флаг заново в своём кадре).
+    pub flash: bool,
+}
+
+impl SeekButton {
+    pub fn new() -> Self {
+        Self {
+            down: false,
+            down_since: Instant::now(),
+            hold_sent: false,
+            flash: false,
+        }
+    }
+
+    /// Подсвечена: жмут или тапнули и ещё не было перерисовки.
+    pub fn lit(&self) -> bool {
+        self.down || self.flash
+    }
+
+    /// Один кадр кнопки. Возвращает событие кадра (максимум одно);
+    /// исполнение (шаг/шаттл/рампа на транспорте) — хозяина.
+    pub fn tick(&mut self, ui: &egui::Ui, response: &egui::Response) -> Option<SeekEvent> {
+        let pointer_down = ui.input(|i| i.pointer.primary_down());
+        let edge = if self.down && !pointer_down {
+            self.down = false;
+            Some(Edge::Release)
+        } else if !self.down && response.is_pointer_button_down_on() {
+            self.down = true;
+            self.down_since = Instant::now();
+            self.hold_sent = false;
+            None
+        } else if !self.down && response.clicked() {
+            Some(Edge::Tap)
+        } else {
+            None
+        };
+        match edge {
+            Some(Edge::Release) => {
+                if self.down_since.elapsed() < SEEK_CLICK_MAX {
+                    let from_hold = self.hold_sent;
+                    self.flash = true;
+                    return Some(SeekEvent::Step { from_hold });
+                }
+                return Some(SeekEvent::Release);
+            }
+            Some(Edge::Tap) => {
+                self.flash = true;
+                return Some(SeekEvent::Step { from_hold: false });
+            }
+            None => {}
+        }
+        if self.down && !self.hold_sent {
+            ui.ctx().request_repaint();
+        }
+        if self.down && !self.hold_sent && self.down_since.elapsed() >= SEEK_HOLD_DELAY {
+            self.hold_sent = true;
+            return Some(SeekEvent::Shuttle);
+        }
+        None
+    }
+}
+
+/// Фронт кнопки перемотки за кадр (внутренний термин tick'а).
+enum Edge {
+    Release,
+    Tap,
 }
 
 /// Гистерезис скролла «один жест — один шаг»: накопитель дельты +
@@ -313,14 +448,14 @@ impl ScrollGate {
 /// физических пикселях пальца: и пороги, и масштаб — длина записи в
 /// расчёт не входит (бар перестаёт отображать файл 1:1 — осознанно).
 /// Вход жёстче, чтобы микро-дрожание не будило скраб; выход — по тишине.
-pub struct HScroll {
+struct HScroll {
     acc: f32,
     active: bool,
     quiet_since: Instant,
 }
 
 impl HScroll {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             acc: 0.0,
             active: false,
@@ -329,14 +464,14 @@ impl HScroll {
     }
 
     /// Скраб активен (hold): курсор Grabbing, тикает repaint.
-    pub fn active(&self) -> bool {
+    fn active(&self) -> bool {
         self.active
     }
 
     /// Дельта кадра (0 — скролла нет) → миллисекунды шага, если скраб
     /// двигается. Выход по тишине проверяется на каждом вызове,
     /// включая нулевые дельты.
-    pub fn feed(&mut self, dx: f32, pixels_per_point: f32) -> Option<i64> {
+    fn feed(&mut self, dx: f32, pixels_per_point: f32) -> Option<i64> {
         if dx == 0.0 {
             if self.active && self.quiet_since.elapsed() >= HSCROLL_RELEASE {
                 self.active = false;
@@ -358,49 +493,88 @@ impl HScroll {
     }
 }
 
-/// Кнопка перемотки: клик — позиционный шаг, удержание — разгон плеера
-/// до ±скорости рампой, отпускание — возврат к прежнему режиму рампой.
-/// Весь профиль рампы живёт в плеере (resume он запоминает сам).
-///
-/// Семантика клика против hold'а: press ждёт SEEK_HOLD_DELAY (100 мс)
-/// — удержали дольше, в плеер уходит hold; отпускание раньше
-/// SEEK_CLICK_MAX (300 мс) отменяет его и даёт фиксированный шаг.
-/// Иначе короткий клик со щелчком (2–3 кадра) неотличим от тапа.
-pub struct SeekButton {
-    pub down: bool,
-    /// Момент press'а: окна SEEK_HOLD_DELAY / SEEK_CLICK_MAX.
-    pub down_since: Instant,
-    /// Hold уже послан в плеер (после SEEK_HOLD_DELAY): отпускание до
-    /// SEEK_CLICK_MAX должно его отменить, а не просто игнорировать.
-    pub hold_sent: bool,
-    /// Тап/клик: вспышка подсветки. Липкая: горит, пока её не погасит
-    /// следующая перерисовка (сброс в начале апдейта; событие ставит
-    /// флаг заново в своём кадре).
-    pub flash: bool,
-}
-
-impl SeekButton {
-    pub fn new() -> Self {
-        Self {
-            down: false,
-            down_since: Instant::now(),
-            hold_sent: false,
-            flash: false,
+/// События выделенного пада — строка над таймлайном (освобождённая от
+/// списка кругов клетка): глиф по центру над своим временем; подсветка
+/// и выделение — как в таблице кругов. Два прохода: будущее (после
+/// текущего) с конца, потом прошлое включительно с начала — ближайшие
+/// к текущему рисуются поверх. Текущее — выделенное, иначе самое
+/// свежее ≤ курсора (current приходит готовым — хозяина знает
+/// выделение). Строка на полстроки ниже границы: верхняя половина —
+/// в освобождённой клетке, нижняя заходит на таймлайн. В пересечении
+/// клик забирает событие: его интерактив регистрируется позже
+/// (egui: позднее = поверх). Возвращает мс кликнутого события; мутация
+/// выделения и seek — хозяина.
+#[allow(clippy::too_many_arguments)]
+pub fn show_events(
+    ui: &mut egui::Ui,
+    timeline_rect: egui::Rect,
+    start: u64,
+    span: u64,
+    pos: u64,
+    events: &[(u64, LapEvent)],
+    current: Option<u64>,
+    selected: Option<u64>,
+    flash: (i64, i64),
+) -> Option<u64> {
+    if events.is_empty() {
+        return None;
+    }
+    let row = egui::Rect::from_min_max(
+        egui::pos2(timeline_rect.left(), timeline_rect.top() - cell_y(1) / 2.0),
+        egui::pos2(timeline_rect.right(), timeline_rect.top() + cell_y(1) / 2.0),
+    );
+    let mut order: Vec<(u64, LapEvent)> = events
+        .iter()
+        .rev()
+        .take_while(|(at, _)| current.is_none_or(|c| *at > c))
+        .copied()
+        .collect();
+    if let Some(c) = current {
+        order.extend(events.iter().take_while(|(at, _)| *at <= c).copied());
+    }
+    let (before, after) = flash;
+    let mut clicked = None;
+    for (at, event) in &order {
+        if !(*at >= start && *at <= start + span) {
+            continue;
+        }
+        let frac = (*at - start) as f32 / span as f32;
+        let center = egui::pos2(
+            timeline_rect.left() + frac * timeline_rect.width(),
+            row.center().y,
+        );
+        // Ячейка события — ровно клетка сетки, позиционирование —
+        // по центру (суб-клетно).
+        let rect = egui::Rect::from_center_size(center, CELL_SIZE).expand2(egui::vec2(6.0, -2.0));
+        let highlighted = {
+            let d = pos as i64 - *at as i64;
+            d >= before && d < after
+        };
+        paint_event_cell(
+            &ui.painter(),
+            rect,
+            &lap_glyph(event).to_string(),
+            if pos < *at {
+                LapTone::Future
+            } else {
+                LapTone::Active
+            },
+            highlighted,
+            selected == Some(*at),
+        );
+        // Клик — выделение события (+ seek, как по ячейке таблицы) —
+        // хозяина. События строки — пада из выделения.
+        let response = ui.interact(
+            rect,
+            egui::Id::unique(("tl_event", *at)),
+            egui::Sense::click(),
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            clicked = Some(*at);
         }
     }
-
-    /// Подсвечена: жмут или тапнули и ещё не было перерисовки.
-    pub fn lit(&self) -> bool {
-        self.down || self.flash
-    }
-}
-
-/// Последний журнал полёта в каталоге: стемы сортируются лексикографически.
-pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
-        .max()
+    clicked
 }

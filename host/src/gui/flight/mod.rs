@@ -126,8 +126,10 @@ struct Live {
     /// pad_id → дистилят кругов (последний Notice::Laps): строки журнала
     /// + текущий круг (бегущее время рендер считает по `since`).
     laps: HashMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
-    /// Курсор кругов: метка «сейчас» по оси журнала (последний нотис).
-    laps_at: Option<Stamp>,
+    /// Момент рождения (REC) на часах GUI: «сейчас» = elapsed.
+    rec_at: Instant,
+    /// Ноль оси журнала сессии (от spawn): кадрит elapsed в Stamp.
+    axis_zero: Stamp,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: RaceStage,
     rules: RaceRules,
@@ -424,7 +426,7 @@ impl Flight {
         // в Before до первого repaint).
         let wake_ctx = ctx.clone();
         let wake = Arc::new(move || wake_ctx.request_repaint());
-        let race = Race::spawn(
+        let (race, axis_zero) = Race::spawn(
             self.rules,
             PathBuf::from(CAPTURES_DIR),
             self.setup.pads.clone(),
@@ -444,8 +446,12 @@ impl Flight {
         }
         self.phase = Mode::Live(Live {
             race,
+            // Часы эфира: момент рождения + ноль оси журнала сессии.
+            // По ним GUI сам кадрит «сейчас» на оси (курсор кругов,
+            // вспышки) — без нотисов на каждое событие.
+            rec_at: Instant::now(),
+            axis_zero,
             laps: HashMap::new(),
-            laps_at: None,
             state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
@@ -526,9 +532,8 @@ impl Flight {
                     Notice::State(state) => l.state = state,
                     Notice::EnterReview { journal } => enter_review = Some(journal),
                     Notice::BackToIdle => back_to_idle = true,
-                    Notice::Laps { pad_id, lines, at } => {
+                    Notice::Laps { pad_id, lines } => {
                         l.laps.insert(pad_id, lines);
-                        l.laps_at = Some(at);
                     }
                     Notice::ActivePad(pad) => {
                         self.selection = match &pad {
@@ -788,9 +793,11 @@ impl Flight {
             },
             timer: TimerContents { text, dim },
             timeline: None,
-            // Курсор кругов: метка «сейчас» из последнего дистиллята —
-            // всё, что было, активно; свежее событие вспыхивает на 100 мс.
-            laps_cursor: l.laps_at,
+            // Курсор кругов: «сейчас» на оси журнала (часы GUI) — всё,
+            // что было, активно; свежее событие вспыхивает на 100 мс.
+            laps_cursor: Some(
+                l.axis_zero.plus_ms(l.rec_at.elapsed().as_millis() as i64),
+            ),
             laps_race_start: None,
             countdown,
             laps_active: Selection::None,

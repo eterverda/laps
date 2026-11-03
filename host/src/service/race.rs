@@ -1254,11 +1254,9 @@ pub enum Notice {
     /// круг, пока гонка идёт (GUI считает бегущее время по `since`).
     /// Дистилят кругов пэда после RaceEvent: строки журнала + текущий
     /// круг, пока гонка идёт (GUI считает бегущее время по `since`).
-    /// `at` — метка «сейчас» по оси журнала (курсор кругов в эфире).
     Laps {
         pad_id: String,
         lines: Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>,
-        at: Stamp,
     },
     /// Активный пад переключён (глобальные клавиши 1–8): новое
     /// состояние, None — деактивирован.
@@ -1296,6 +1294,9 @@ impl Race {
     /// GUI — в Idle), после финиша отдаём журнал в DVR. Рождение
     /// кнопкой RACE: GUI досылает намерение RACE сразу после
     /// spawn — поток стартует с ним в очереди.
+    /// Хэндл гоночного потока для GUI: шлём намерения, забираем уведомления.
+    /// Параллельно — ноль оси журнала сессии (метка REC): GUI кадрит
+    /// «сейчас» на этой оси между нотисами (курсор кругов в эфире).
     pub fn spawn(
         rules: RaceRules,
         captures_dir: PathBuf,
@@ -1308,7 +1309,7 @@ impl Race {
         wake: Arc<dyn Fn() + Send + Sync>,
         audio: Audio,
         active_pad: Option<String>,
-    ) -> Race {
+    ) -> (Race, Stamp) {
         let (intent_tx, intent_rx) = crossbeam::bounded(16);
         let (notice_tx, notice_rx) = crossbeam::bounded(64);
         let (core, effects) = RaceCore::new(
@@ -1322,6 +1323,7 @@ impl Race {
             key_matcher,
             active_pad,
         );
+        let axis_zero = core.journal.record_started();
         thread::spawn(move || {
             let mut core = core;
             apply(&effects, &recorders, &audio);
@@ -1394,7 +1396,6 @@ impl Race {
                                     let _ = notice_tx.try_send(Notice::Laps {
                                         pad_id: pad.clone(),
                                         lines: core.laps(&pad, now),
-                                        at: core.stamp(now),
                                     });
                                     wake();
                                     if event == LapEvent::Lap {
@@ -1448,10 +1449,8 @@ impl Race {
                     // сменяется застывшим незакрытым — свежий дистилят
                     // его перезаписывает.
                     if matches!(air, RaceStage::Running { .. }) || was_running {
-                        let now = Instant::now();
-                        let at = core.stamp(now);
-                        for (pad_id, lines) in core.all_laps(now) {
-                            let _ = notice_tx.try_send(Notice::Laps { pad_id, lines, at });
+                        for (pad_id, lines) in core.all_laps(Instant::now()) {
+                            let _ = notice_tx.try_send(Notice::Laps { pad_id, lines });
                         }
                     }
                 }
@@ -1479,10 +1478,13 @@ impl Race {
                 }
             }
         });
-        Race {
-            intents: intent_tx,
-            notices: notice_rx,
-        }
+        (
+            Race {
+                intents: intent_tx,
+                notices: notice_rx,
+            },
+            axis_zero,
+        )
     }
 }
 

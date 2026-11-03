@@ -14,16 +14,13 @@ use std::fmt::{Formatter, Result as FmtResult};
 /// by canonical names. Matching is by subset: the event matches when
 /// every binding key is held.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct KeyBind {
     /// Exclusive keyboard id: a key of `Setup.exclusive_keyboards`.
     /// None (the field absent in yaml) — a binding of the GUI focus
     /// (main) keyboard. Linux-only.
     #[cfg(target_os = "linux")]
-    #[serde(
-        default,
-        rename = "exclusive-keyboard-id",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusive_keyboard_id: Option<String>,
     /// The held-keys combo: "Ctrl+A", "1", "F13+F14".
     #[serde(deserialize_with = "de_keys", serialize_with = "ser_keys")]
@@ -31,6 +28,12 @@ pub struct KeyBind {
     /// Pad action ("lap", …): сматчившийся биндинг логируется с ним
     /// (Idle и Live-дрены); исполнение действий — следующим шагом.
     pub action: String,
+    /// Pad of the action. Signals (lap/warn/fault/correct) need it:
+    /// Some — over that pad, None — over the active pad (no active
+    /// pad — the action does not fire). Control actions (pad toggles,
+    /// delete/backspace) ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_id: Option<String>,
 }
 
 impl KeyBind {
@@ -154,6 +157,7 @@ fn ser_hex<S: serde::Serializer>(v: &Option<u16>, s: S) -> Result<S::Ok, S::Erro
 /// `Setup.exclusive_keyboards` is the keyboard id delivered in `KeyPressed`.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ExclusiveKeyboardConfig {
     /// Substring of the evdev name, case-insensitive.
     #[serde(default, skip_serializing_if = "Option::is_none")]

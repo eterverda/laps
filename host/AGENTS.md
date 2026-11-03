@@ -232,7 +232,7 @@ JournalEntry)>`): метки — непрозрачный `Stamp` (мс от н�
 filename}` (метка — первый кадр файла, из `RecordState::Writing.
 first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
   `RaceCountdown` (нажатие RACE: стартовая позиция курсора DVR + точка
-  на таймлайне) / `RaceStarted` / `RaceFinished{prematurely}` /
+  на таймлайне) / `RaceStarted` / `RaceFinished{rule: RaceFinishRule}` (max-laps / max-duration / manual) /
   `RecordFinished` (коммит). События до старта гонки откладываются и
   пишутся в старт гонки, при отмене выбрасываются; сессии без файла
   молча снимаются при коммите (GUI рисует Error для камер без

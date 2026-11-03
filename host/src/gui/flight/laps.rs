@@ -7,7 +7,7 @@ use super::{FrameContents, Selection};
 use crate::gui::measure_text;
 use crate::gui::ruler::{CELL_SIZE, cell_x, cell_y};
 use crate::gui::style;
-use crate::model::flight::{LapEvent, LapLine, Stamp};
+use crate::model::flight::{LapEvent, LapLine, Stamp, lap_label};
 use std::time::Duration;
 
 /// Событие в колонке кругов занимает 2 колонки сетки: глиф (1) и
@@ -44,6 +44,7 @@ pub fn show(
                 frame.laps_race_start,
                 active_ms,
                 frame.laps_flash,
+                frame.holeshot_enabled,
             );
             let from = rows.len().saturating_sub(capacity);
             // Без клипа: по вертикали строки влезают по
@@ -140,7 +141,9 @@ pub fn show(
             // строки круга: пустые колонки
             // событий (мин. 2) и имени (мин. 2) +
             // время (мин. 6) — позиция совпадает
-            // с первым кругом гонки. Тон —
+            // с первым кругом гонки. Имя —
+            // предполагаемое первого круга
+            // (HS с холшотом, «1)» без). Тон —
             // будущее: круг не завершён;
             // потухшая фаза — гаснущий сигнал
             // отсчёта.
@@ -152,7 +155,9 @@ pub fn show(
             let cells = [
                 LapCell::plain(String::new(), tone, None),
                 LapCell::plain(String::new(), tone, None),
-                LapCell::plain("HS", tone, None),
+                // Имя первого круга: база нумерации из правил
+                // (0 — «HS», 1 — «1)»).
+                LapCell::plain(lap_label(u32::from(!frame.holeshot_enabled)), tone, None),
                 LapCell::plain(lap_time(Duration::ZERO, 6), tone, None),
             ];
             let galley = ui.painter().layout_job(lap_row_job(&cells));
@@ -292,6 +297,7 @@ fn lap_table(
     _race_start: Option<Stamp>,
     active_ms: Option<Stamp>,
     flash: (i64, i64),
+    holeshot_enabled: bool,
 ) -> Vec<Vec<LapCell>> {
     // Время строки; у текущего — бегущее (он участвует и в выборе
     // формата колонки).
@@ -309,18 +315,15 @@ fn lap_table(
     } else {
         6 // SS.mmm
     };
-    // Текущий круг — предполагаемое имя: что получит, если завершится
-    // успехом (HS, если успешных ещё не было; иначе следующий номер).
-    // Нумерация совпадает с дистиллятором: fail номер не съедает.
+    // Текущий круг — предполагаемый номер: завершённые успешные + база
+    // нумерации из правил (0 с холшотом — следующий «HS», без — с 1).
+    // Fail номер не съедает. Отображение — `lap_label`, как у
+    // дистиллятора.
     let successes = lines
         .iter()
         .filter(|(_, line, _)| matches!(line, LapLine::Success { .. }))
         .count();
-    let current_name = if successes == 0 {
-        "HS".to_owned()
-    } else {
-        format!("{successes})")
-    };
+    let current_name = lap_label(successes as u32 + u32::from(!holeshot_enabled));
     let future = |at: Stamp| cursor.is_some_and(|c| c < at);
     let mut rows = Vec::new();
     for (end, line, events) in lines {

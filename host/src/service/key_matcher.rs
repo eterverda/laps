@@ -1,11 +1,15 @@
 //! Матчер клавиатурных биндингов: на вход нажатие (`KeyPressed`) и
 //! активный пад (параметром, состояние — у вызывающего), на выход —
 //! действие. Сетап не матчер: при создании ему отдаётся `Setup`,
-//! матчинг живёт здесь. Бинды падов берутся из сетапа, глобальные —
-//! из таблицы в коде (не в setup.yaml): цифры 1–8 — тогл активного
+//! матчинг живёт здесь. Биндинги — уровня сетапа (`Setup.keybinds`),
+//! каждый несёт опциональный `pad-id`; глобальная таблица (не в
+//! setup.yaml) та же, собранная в коде: цифры 1–8 — тогл активного
 //! пада (повтор снимает), 0 снимает явно, Space — lap активного пада,
 //! W/E/R — warn/fault/correct активного. Тогл разрешается внутри:
 //! наружу — Set (чужой номер) или Reset (свой повтором).
+//! Резолв падов у сигналов: `pad-id` биндинга → активный пад →
+//! ничего (действие не выстреливает). Управляющим действиям пад не
+//! нужен — `pad-id` у них игнорируется.
 
 use crate::config::keyboard::KeyBind;
 use crate::config::setup::Setup;
@@ -13,6 +17,7 @@ use crate::driver::keyboard::KeyPressed;
 use crate::model::flight::LapEvent;
 
 /// Глобальные биндинги: (клавиши, действие). В коде, не в setup.yaml.
+/// Сигналы без pad-id — над активным падом.
 const GLOBAL_KEYBINDS: &[(&str, &str)] = &[
     ("1", "toggle-active-pad-1"),
     ("2", "toggle-active-pad-2"),
@@ -23,12 +28,12 @@ const GLOBAL_KEYBINDS: &[(&str, &str)] = &[
     ("7", "toggle-active-pad-7"),
     ("8", "toggle-active-pad-8"),
     ("0", "reset-active-pad"),
-    ("Spacebar", "lap-active-pad"),
+    ("Spacebar", "lap"),
     ("Delete", "delete"),
     ("Backspace", "backspace"),
-    ("W", "warn-active-pad"),
-    ("E", "fault-active-pad"),
-    ("R", "correct-active-pad"),
+    ("W", "warn"),
+    ("E", "fault"),
+    ("R", "correct"),
 ];
 
 /// Результат матчинга нажатия. Пад — всегда по имени; активный пад
@@ -78,28 +83,17 @@ fn global_keybinds() -> Vec<KeyBind> {
 pub struct KeyMatcher {
     /// Порядок падов из сетапа (нумерация с 1 — индекс + 1).
     pads: Vec<String>,
-    /// Бинды падов сетапа, плоским списком с адресом пада.
-    pad_binds: Vec<(String, KeyBind)>,
+    /// Биндинги сетапа (уровень сетапа; пад — полем биндинга).
+    binds: Vec<KeyBind>,
     /// Глобальная таблица (в коде).
     global_binds: Vec<KeyBind>,
 }
 
 impl KeyMatcher {
     pub fn new(setup: &Setup) -> Self {
-        let pads: Vec<String> = setup.pads.keys().cloned().collect();
-        let pad_binds = setup
-            .pads
-            .iter()
-            .flat_map(|(pad_id, pad)| {
-                pad.keybinds
-                    .iter()
-                    .cloned()
-                    .map(|bind| (pad_id.clone(), bind))
-            })
-            .collect();
         Self {
-            pads,
-            pad_binds,
+            pads: setup.pads.keys().cloned().collect(),
+            binds: setup.keybinds.clone(),
             global_binds: global_keybinds(),
         }
     }
@@ -107,22 +101,18 @@ impl KeyMatcher {
     /// Нажатие → действие. Активный пад подаёт параметром (состояние
     /// вызывающего): `toggle-active-pad-N` разрешается по нему в Set
     /// (чужой номер) или Reset (свой повтором), `reset-active-pad` —
-    /// всегда Reset, `<signal>-active-pad` — сигнал над ним (без него —
-    /// None). Сматчившийся падовый биндинг имеет приоритет над
-    /// глобальным (неизвестное действие нажатие съедает).
+    /// всегда Reset. Сигналы (lap/warn/fault/correct — всё, что
+    /// парсится `LapEvent::from_action`) резолвят пад: `pad-id`
+    /// биндинга → активный; нет ни того ни другого — нажатие гаснет.
+    /// Сматчившийся биндинг сетапа имеет приоритет над глобальным
+    /// (неизвестное действие нажатие съедает).
     pub fn match_key(&self, event: &KeyPressed, active_pad: Option<&str>) -> Option<KeyMatch> {
-        if let Some((pad, bind)) = self.pad_binds.iter().find(|(_, b)| b.matches(event)) {
-            let event = LapEvent::from_action(&bind.action)?;
-            return Some(KeyMatch::Signal {
-                pad: pad.clone(),
-                event,
-            });
-        }
-        let action = &self
-            .global_binds
+        let bind = self
+            .binds
             .iter()
-            .find(|bind| bind.matches(event))?
-            .action;
+            .chain(&self.global_binds)
+            .find(|bind| bind.matches(event))?;
+        let action = &bind.action;
         if let Some(n) = action.strip_prefix("toggle-active-pad-") {
             let n: usize = n.parse().ok()?;
             if !(1..=8).contains(&n) || n > self.pads.len() {
@@ -144,12 +134,14 @@ impl KeyMatcher {
         if action == "backspace" {
             return Some(KeyMatch::Backspace);
         }
-        if let Some(signal) = action.strip_suffix("-active-pad") {
-            let event = LapEvent::from_action(signal)?;
-            let pad = active_pad?.to_owned();
-            return Some(KeyMatch::Signal { pad, event });
-        }
-        None
+        // Сигнал судьи: пад — из биндинга, иначе активный (без него —
+        // действие не выстреливает).
+        let event = LapEvent::from_action(action)?;
+        let pad = bind
+            .pad_id
+            .clone()
+            .or_else(|| active_pad.map(str::to_owned))?;
+        Some(KeyMatch::Signal { pad, event })
     }
 }
 
@@ -159,7 +151,7 @@ impl Default for KeyMatcher {
     fn default() -> Self {
         Self {
             pads: Vec::new(),
-            pad_binds: Vec::new(),
+            binds: Vec::new(),
             global_binds: global_keybinds(),
         }
     }
@@ -172,7 +164,7 @@ mod tests {
     use serde_yaml::from_str as from_yaml_string;
     use std::time::Instant;
 
-    /// Два пада: у pad-1 биндинг F13 → fault.
+    /// Два пада: биндинг F13 → fault над pad-1 (уровень сетапа).
     fn setup() -> Setup {
         from_yaml_string(
             "cameras: {}
@@ -181,13 +173,14 @@ pads:
     label: A1
     color: red
     fpv: { camera-id: camera-1 }
-    keybinds:
-      - keys: F13
-        action: fault
   pad-2:
     label: A2
     color: blue
     fpv: { camera-id: camera-1 }
+keybinds:
+  - pad-id: pad-1
+    keys: F13
+    action: fault
 ",
         )
         .unwrap()
@@ -205,11 +198,27 @@ pads:
     #[test]
     fn pad_bind_resolves_to_signal() {
         let m = KeyMatcher::new(&setup());
+        // pad-id из биндинга: пад не нужен даже в аргументе.
         assert_eq!(
             m.match_key(&press(&[0x68]), None), // F13
             Some(KeyMatch::Signal {
                 pad: "pad-1".to_owned(),
                 event: LapEvent::Fault,
+            })
+        );
+    }
+
+    #[test]
+    fn signal_without_pad_needs_active_pad() {
+        let m = KeyMatcher::new(&setup());
+        // Space (lap) без pad-id в биндинге: без активного пада не
+        // выстреливает, с активным — над ним.
+        assert_eq!(m.match_key(&press(&[0x2C]), None), None);
+        assert_eq!(
+            m.match_key(&press(&[0x2C]), Some("pad-2")),
+            Some(KeyMatch::Signal {
+                pad: "pad-2".to_owned(),
+                event: LapEvent::Lap,
             })
         );
     }

@@ -66,10 +66,10 @@ impl Display for ParseCameraError {
 impl std::error::Error for ParseCameraError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct CameraConfig {
     pub name: String,
     pub resolution: ResolutionConfig,
-    #[serde(rename = "frame-rate")]
     pub frame_rate: FrameRateConfig,
     pub format: PixelConfig,
     #[serde(default)]
@@ -78,15 +78,12 @@ pub struct CameraConfig {
 
 /// Настройки записи камеры. Отсутствие блока в yaml = значения по умолчанию.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct DvrConfig {
     #[serde(default)]
     pub container: ContainerConfig,
     /// Целевой fps записи. None (дефолт) = fps камеры (camera.frame-rate).
-    #[serde(
-        default,
-        rename = "frame-rate",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_rate: Option<FrameRateConfig>,
 }
 

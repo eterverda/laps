@@ -7,30 +7,33 @@ use crate::config::keyboard::ExclusiveKeyboardConfig;
 use crate::config::keyboard::KeyBind;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Setup {
     pub cameras: BTreeMap<String, CameraConfig>,
     pub pads: BTreeMap<String, PadConfig>,
+    /// Клавиатурные биндинги (уровень сетапа, не пада): каждый несёт
+    /// `pad-id` — над каким падом сигнал; без него сигнал уходит
+    /// активному паду.
+    #[serde(default)]
+    pub keybinds: Vec<KeyBind>,
     // Аттачатся гоночной сессией (GUI → Race); парсинг здесь, чтобы
     // сетап-файлы уже могли описывать клавиатуры.
-    #[serde(default, rename = "exclusive-keyboards")]
+    #[serde(default)]
     #[cfg(target_os = "linux")]
     pub exclusive_keyboards: BTreeMap<String, ExclusiveKeyboardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct PadConfig {
     pub label: String,
     pub color: ColorConfig,
     pub fpv: FpvConfig,
-    /// Клавиши настроенных клавиатур, привязанные к паду (пусто —
-    /// пад без клавиатурных биндов).
-    #[serde(default)]
-    pub keybinds: Vec<KeyBind>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct FpvConfig {
-    #[serde(rename = "camera-id")]
     pub camera_id: String,
     #[serde(default)]
     pub viewport: ViewportConfig,
@@ -102,30 +105,36 @@ mod tests {
     }
 
     #[test]
-    fn test_pad_keybinds() {
-        // keybinds parse: key as a yaml number resolves to the usage.
-        let pad: PadConfig = from_yaml_string(
-            "label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\nkeybinds:\n  - exclusive-keyboard-id: key-1\n    keys: 1\n    action: lap\n",
+    fn test_setup_keybinds() {
+        // keybinds parse: key as a yaml number resolves to the usage;
+        // уровень сетапа, пад — полем биндинга.
+        let setup: Setup = from_yaml_string(
+            "cameras: {}\npads: {}\nkeybinds:\n  - exclusive-keyboard-id: key-1\n    pad-id: pad-1\n    keys: 1\n    action: lap\n",
         )
         .unwrap();
-        assert_eq!(pad.keybinds.len(), 1);
+        assert_eq!(setup.keybinds.len(), 1);
         assert_eq!(
-            pad.keybinds[0].keys,
+            setup.keybinds[0].keys,
             crate::driver::keyboard::key_set(&[0x1E])
         );
-        #[cfg(target_os = "linux")]
+        assert_eq!(setup.keybinds[0].pad_id.as_deref(), Some("pad-1"));
         #[cfg(target_os = "linux")]
         assert_eq!(
-            pad.keybinds[0].exclusive_keyboard_id.as_deref(),
+            setup.keybinds[0].exclusive_keyboard_id.as_deref(),
             Some("key-1")
         );
+        // Биндинг без пада — легален (сигнал уйдёт активному паду).
+        let setup: Setup = from_yaml_string(
+            "cameras: {}\npads: {}\nkeybinds:\n  - keys: Spacebar\n    action: lap\n",
+        )
+        .unwrap();
+        assert_eq!(setup.keybinds[0].pad_id, None);
         // Отсутствие блока — пустой список, не ошибка.
-        let pad: PadConfig =
-            from_yaml_string("label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\n").unwrap();
-        assert!(pad.keybinds.is_empty());
+        let setup: Setup = from_yaml_string("cameras: {}\npads: {}\n").unwrap();
+        assert!(setup.keybinds.is_empty());
         // Неизвестное имя клавиши — ошибка конфига.
-        assert!(from_yaml_string::<PadConfig>(
-            "label: CH1\ncolor: red\nfpv:\n  camera-id: camera-1\nkeybinds:\n  - exclusive-keyboard-id: key-1\n    key: banana\n    action: lap\n"
+        assert!(from_yaml_string::<Setup>(
+            "cameras: {}\npads: {}\nkeybinds:\n  - exclusive-keyboard-id: key-1\n    key: banana\n    action: lap\n"
         )
         .is_err());
     }

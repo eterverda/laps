@@ -10,7 +10,7 @@ use crate::driver::audio::{Audio, Sound};
 use crate::driver::camera::Recorder;
 use crate::driver::dvr::{RecordParams, RecordState};
 use crate::driver::keyboard::KeyPressed;
-use crate::model::flight::{Journal, JournalEntry, LapEvent, LapLine, Stamp};
+use crate::model::flight::{Journal, JournalEntry, LapEvent, LapLine, RaceFinishRule, Stamp};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
 use crate::service::key_matcher::{KeyMatch, KeyMatcher};
@@ -214,7 +214,7 @@ impl RaceCore {
         let mut core = Self {
             phase: RaceStage::Before,
             rules,
-            journal: Journal::new(date_time, pads, assignments),
+            journal: Journal::new(date_time, pads, assignments, rules),
             captures_dir,
             started: now,
             buzzer_len,
@@ -268,7 +268,7 @@ impl RaceCore {
     pub fn next_deadline(&self) -> Option<Instant> {
         match self.phase {
             RaceStage::Countdown { start_at } => Some(start_at),
-            RaceStage::Running { start_at } => self.rules.duration.map(|d| start_at + d),
+            RaceStage::Running { start_at } => self.rules.max_duration.map(|d| start_at + d),
             _ => None,
         }
     }
@@ -289,10 +289,16 @@ impl RaceCore {
             }
             RaceStage::Running { start_at } => {
                 let elapsed = now.saturating_duration_since(start_at);
-                if self.rules.duration.is_some_and(|limit| elapsed >= limit) {
+                if self
+                    .rules
+                    .max_duration
+                    .is_some_and(|limit| elapsed >= limit)
+                {
                     self.journal.push(
                         self.stamp(now),
-                        JournalEntry::RaceFinished { prematurely: false },
+                        JournalEntry::RaceFinished {
+                            rule: RaceFinishRule::MaxDuration,
+                        },
                     );
                     self.phase = RaceStage::After { race: elapsed };
                     vec![Effect::Sound(BUZZER)]
@@ -350,6 +356,7 @@ impl RaceCore {
         if *event == LapEvent::Lap {
             self.lap_started_at.insert(pad.clone(), now);
             self.lap_events.remove(&pad);
+            self.finish_if_lap_limit(now);
         } else {
             self.lap_events
                 .entry(pad.clone())
@@ -357,6 +364,44 @@ impl RaceCore {
                 .push((at, *event));
         }
         Some(matched)
+    }
+
+    /// Лимит кругов: гонка закрывается в момент, когда ВСЕ пилоты
+    /// достигли максимума (пилоты — назначения журнала; пустой набор
+    /// лимит не замыкает — считать не с кем). Пересечение последним
+    /// пилотом звучит как финиш: обёртка добавляет гудок к сигналу
+    /// ворот. Счёт успешных — дистиллятором (fail номер не съедает;
+    /// холшот — круг 0 и считается).
+    fn finish_if_lap_limit(&mut self, now: Instant) {
+        let Some(limit) = self.rules.max_laps else {
+            return;
+        };
+        let assignments = &self.journal.header().assignments;
+        if assignments.is_empty() {
+            return;
+        }
+        let reached = assignments.keys().all(|pad_id| {
+            self.journal
+                .lap_infos(pad_id)
+                .iter()
+                .filter(|(_, line, _)| matches!(line, LapLine::Success { .. }))
+                .count() as u32
+                >= limit
+        });
+        if !reached {
+            return;
+        }
+        let RaceStage::Running { start_at } = self.phase else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(start_at);
+        self.journal.push(
+            self.stamp(now),
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::MaxLaps,
+            },
+        );
+        self.phase = RaceStage::After { race: elapsed };
     }
 
     /// Активный пад (id) или None — для GUI после Set/ResetActivePad
@@ -416,7 +461,9 @@ impl RaceCore {
                 // REC гасит запись посреди гонки — гонка финиширует здесь.
                 self.journal.push(
                     self.stamp(now),
-                    JournalEntry::RaceFinished { prematurely: false },
+                    JournalEntry::RaceFinished {
+                        rule: RaceFinishRule::Manual,
+                    },
                 );
                 self.finish_recording(now);
                 self.phase = RaceStage::Finished;
@@ -458,7 +505,9 @@ impl RaceCore {
                 let race = now.saturating_duration_since(start_at);
                 self.journal.push(
                     self.stamp(now),
-                    JournalEntry::RaceFinished { prematurely: true },
+                    JournalEntry::RaceFinished {
+                        rule: RaceFinishRule::Manual,
+                    },
                 );
                 self.phase = RaceStage::After { race };
                 vec![Effect::Sound(BUZZER)]
@@ -475,7 +524,9 @@ impl RaceCore {
             RaceStage::Running { .. } => {
                 self.journal.push(
                     self.stamp(now),
-                    JournalEntry::RaceFinished { prematurely: true },
+                    JournalEntry::RaceFinished {
+                        rule: RaceFinishRule::Manual,
+                    },
                 );
                 self.finish_recording(now);
                 vec![
@@ -639,8 +690,10 @@ mod tests {
         RaceCore::new(
             clock.now,
             RaceRules {
-                duration: Some(DURATION),
+                max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+                holeshot_enabled: true,
+                ..RaceRules::default()
             },
             temp_dir(),
             Duration::ZERO, // гудок нулевой: числа сценариев проще
@@ -656,9 +709,28 @@ mod tests {
     /// Матчер над заданными падами (setup на входе — только источник
     /// падов и их биндов).
     fn test_matcher(pads: BTreeMap<String, PadConfig>) -> KeyMatcher {
+        // Биндинги тестов — уровень сетапа: «A на key-1 → lap pad-1»,
+        // «Shift+B на key-1 → fault pad-1» (бывшие падовые бинды).
+        let keybinds = vec![
+            KeyBind {
+                #[cfg(target_os = "linux")]
+                exclusive_keyboard_id: Some("key-1".to_owned()),
+                pad_id: Some("pad-1".to_owned()),
+                keys: key_set(&[0x04]),
+                action: "lap".to_owned(),
+            },
+            KeyBind {
+                #[cfg(target_os = "linux")]
+                exclusive_keyboard_id: Some("key-1".to_owned()),
+                pad_id: Some("pad-1".to_owned()),
+                keys: key_set(&[0xE0, 0x05]),
+                action: "fault".to_owned(),
+            },
+        ];
         KeyMatcher::new(&Setup {
             cameras: BTreeMap::new(),
             pads,
+            keybinds,
             #[cfg(target_os = "linux")]
             exclusive_keyboards: BTreeMap::new(),
         })
@@ -676,20 +748,6 @@ mod tests {
                     camera_id: "camera-1".to_owned(),
                     viewport: crate::config::camera::ViewportConfig::default(),
                 },
-                keybinds: vec![
-                    KeyBind {
-                        #[cfg(target_os = "linux")]
-                        exclusive_keyboard_id: Some("key-1".to_owned()),
-                        keys: key_set(&[0x04]),
-                        action: "lap".to_owned(),
-                    },
-                    KeyBind {
-                        #[cfg(target_os = "linux")]
-                        exclusive_keyboard_id: Some("key-1".to_owned()),
-                        keys: key_set(&[0xE0, 0x05]),
-                        action: "fault".to_owned(),
-                    },
-                ],
             },
         );
         pads
@@ -724,8 +782,10 @@ mod tests {
         let (mut core, _effects) = RaceCore::new(
             clock.now,
             RaceRules {
-                duration: Some(DURATION),
+                max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+                holeshot_enabled: true,
+                ..RaceRules::default()
             },
             temp_dir(),
             Duration::ZERO,
@@ -797,8 +857,10 @@ mod tests {
         let (mut core, _effects) = RaceCore::new(
             clock.now,
             RaceRules {
-                duration: Some(DURATION),
+                max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+                holeshot_enabled: true,
+                ..RaceRules::default()
             },
             temp_dir(),
             Duration::ZERO,
@@ -861,7 +923,10 @@ mod tests {
         let current = lines.last().expect("current");
         assert_eq!(
             current.2,
-            vec![(core.journal.record_started().plus_ms(25_000), LapEvent::Fault)],
+            vec![(
+                core.journal.record_started().plus_ms(25_000),
+                LapEvent::Fault
+            )],
             "fault у текущего круга"
         );
         // Следующий lap открывает новый круг: события обнулились.
@@ -896,6 +961,92 @@ mod tests {
         assert!(lines[2].2.is_empty(), "хвост без событий: {lines:?}");
     }
 
+    /// Лимит кругов: гонка закрывается в момент, когда ВСЕ пилоты
+    /// достигли максимума; первый пилот лимит не замыкает.
+    #[test]
+    fn lap_limit_finishes_when_all_pilots_reach_it() {
+        let mut clock = FakeClock::new();
+        let mut pads = test_pads();
+        pads.insert(
+            "pad-2".to_owned(),
+            PadConfig {
+                label: "A2".to_owned(),
+                color: crate::config::setup::ColorConfig::Red,
+                fpv: crate::config::setup::FpvConfig {
+                    camera_id: "camera-1".to_owned(),
+                    viewport: crate::config::camera::ViewportConfig::default(),
+                },
+            },
+        );
+        let assignments = HashMap::from([
+            ("pad-1".to_owned(), Pilot::new("P-1")),
+            ("pad-2".to_owned(), Pilot::new("P-2")),
+        ]);
+        let (mut core, _effects) = RaceCore::new(
+            clock.now,
+            RaceRules {
+                max_duration: None,
+                max_laps: Some(1),
+                start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+                ..RaceRules::default()
+            },
+            temp_dir(),
+            Duration::ZERO,
+            pads.clone(),
+            assignments,
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(pads),
+            None,
+        );
+        core.race_pressed(clock.now);
+        core.tick(clock.advance(10_000)); // Running
+        // Первый пилот на лимите — гонка идёт (второй ещё не достиг).
+        core.key_pressed(&main_press(&[0x1E]), clock.now); // выбор pad-1 («1»)
+        core.key_pressed(&main_press(&[0x2C]), clock.now); // lap pad-1
+        assert!(
+            matches!(core.phase(), RaceStage::Running { .. }),
+            "один пилот лимит не замыкает: {:?}",
+            core.phase()
+        );
+        // Второй пилот: пересечение последним закрывает гонку.
+        eprintln!(
+            "select: {:?}",
+            core.key_pressed(&main_press(&[0x1F]), clock.now)
+        );
+        eprintln!(
+            "lap2: {:?}",
+            core.key_pressed(&main_press(&[0x2C]), clock.now)
+        );
+        eprintln!("phase: {:?}", core.phase());
+        eprintln!(
+            "p1: {:?}",
+            core.journal
+                .lap_infos("pad-1")
+                .iter()
+                .map(|(_, l, _)| format!("{l:?}"))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "p2: {:?}",
+            core.journal
+                .lap_infos("pad-2")
+                .iter()
+                .map(|(_, l, _)| format!("{l:?}"))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "assignments: {:?}",
+            core.journal.header().assignments.keys().collect::<Vec<_>>()
+        );
+        eprintln!("marks: {:?}", journal_marks(&core));
+        assert!(matches!(core.phase(), RaceStage::After { .. }));
+        let marks = journal_marks(&core);
+        assert!(
+            marks.iter().any(|(_, m)| *m == "finish-laps"),
+            "авто-финиш лимита в журнале: {marks:?}"
+        );
+    }
+
     /// События журнала как (ms, короткая метка) для asserts.
     fn journal_marks(core: &RaceCore) -> Vec<(u64, &'static str)> {
         core.journal
@@ -908,13 +1059,11 @@ mod tests {
                     JournalEntry::VideoAttached { .. } => "file",
                     JournalEntry::RaceCountdown {} => "cd",
                     JournalEntry::RaceStarted {} => "go",
-                    JournalEntry::RaceFinished { prematurely } => {
-                        if *prematurely {
-                            "finish-user"
-                        } else {
-                            "finish-auto"
-                        }
-                    }
+                    JournalEntry::RaceFinished { rule } => match rule {
+                        RaceFinishRule::MaxLaps => "finish-laps",
+                        RaceFinishRule::MaxDuration => "finish-duration",
+                        RaceFinishRule::Manual => "finish-manual",
+                    },
                     JournalEntry::RaceEvent { .. } => "race-event",
                 };
                 (ms, mark)
@@ -973,7 +1122,7 @@ mod tests {
             journal_marks(&core)[4],
             (
                 500 + delay.as_millis() as u64 + DURATION.as_millis() as u64,
-                "finish-auto"
+                "finish-duration"
             ),
             "{:?}",
             journal_marks(&core)
@@ -1073,7 +1222,7 @@ mod tests {
             [Effect::Sound(sound)] if *sound == BUZZER
         ));
         let marks = journal_marks(&core);
-        assert_eq!(marks.last(), Some(&(15_345, "finish-user")), "{marks:?}");
+        assert_eq!(marks.last(), Some(&(15_345, "finish-manual")), "{marks:?}");
         assert!(core.phase().rec_on(), "хвост продолжается");
         assert!(!core.phase().finished());
     }
@@ -1144,8 +1293,10 @@ mod tests {
         let mut core = RaceCore::new(
             clock.now,
             RaceRules {
-                duration: Some(DURATION),
+                max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+                holeshot_enabled: true,
+                ..RaceRules::default()
             },
             temp_dir(),
             Duration::ZERO,
@@ -1175,7 +1326,7 @@ mod tests {
                 (0, "cd"),
                 (3_000, "go"),
                 (3_100, "file"),
-                (23_100, "finish-auto"),
+                (23_100, "finish-manual"),
                 (23_100, "rec-end"),
             ],
             "камера-2 — ни события, ни следа: {marks:?}"
@@ -1189,8 +1340,9 @@ mod tests {
         let mut core = RaceCore::new(
             clock.now,
             RaceRules {
-                duration: None,
+                max_duration: None,
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+                ..RaceRules::default()
             },
             temp_dir(),
             Duration::ZERO,
@@ -1399,7 +1551,15 @@ impl Race {
                                     });
                                     wake();
                                     if event == LapEvent::Lap {
-                                        vec![Effect::Sound(GATE)]
+                                        let mut effects = vec![Effect::Sound(GATE)];
+                                        // Лимит кругов: этот пролёт
+                                        // последним закрыл лимит — гонка
+                                        // финиширует, гудок окончания
+                                        // поверх сигнала ворот.
+                                        if !matches!(core.phase(), RaceStage::Running { .. }) {
+                                            effects.push(Effect::Sound(BUZZER));
+                                        }
+                                        effects
                                     } else {
                                         Vec::new()
                                     }

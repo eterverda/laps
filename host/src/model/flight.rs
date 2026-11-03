@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 
 use crate::config::setup::PadConfig;
 use crate::model::pilot::Pilot;
+use crate::model::rules::RaceRules;
 use serde_yaml::from_str as from_yaml_string;
 use serde_yaml::to_string as to_yaml_string;
 use std::fs;
@@ -17,9 +18,13 @@ use std::io::Result as IoResult;
 /// метки) — файл читается даже без единого события. date_time
 /// авторитетен для имён файлов (стем видео и журнала один).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct JournalHeader {
     #[serde(with = "time::serde::rfc3339")]
     pub date_time: OffsetDateTime,
+    /// Правила гонки: контекст полёта, журнал их хранит — без них
+    /// холодный вход не воспроизведёт имена кругов и результаты.
+    pub rules: RaceRules,
     pub pads: BTreeMap<String, PadConfig>,
     pub assignments: HashMap<String, Pilot>,
 }
@@ -104,6 +109,7 @@ impl Journal {
         date_time: OffsetDateTime,
         pads: BTreeMap<String, PadConfig>,
         assignments: HashMap<String, Pilot>,
+        rules: RaceRules,
     ) -> Self {
         Self {
             entries: Vec::new(),
@@ -111,6 +117,7 @@ impl Journal {
                 date_time,
                 pads,
                 assignments,
+                rules,
             },
         }
     }
@@ -276,13 +283,16 @@ impl Journal {
     /// круг в эфире сюда не входит — его докидывает RaceCore, а после
     /// RaceFinished выдаётся здесь же незакрытый круг (`Unfinished`).
     /// Успешный круг: последним действием перед Lap не был Fault;
-    /// первый успешный — «HS», дальше 1, 2, … (fail номер не съедает).
+    /// fail номер не съедает. Нумерация: холшот — круг 0 («HS»),
+    /// база счётчика 0; без холшота — с 1. Отображение — `lap_label`.
     pub fn lap_infos(&self, pad_id: &str) -> Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)> {
         let mut lines = Vec::new();
         let mut in_race = false;
         let mut lap_start = Stamp::ZERO;
         let mut last_action: Option<LapEvent> = None;
-        let mut successful = 0u32;
+        // База нумерации: с холшотом первый круг — 0 («HS»), без —
+        // с единицы (нулевая точка не фиксируется).
+        let mut successful = u32::from(!self.header.rules.holeshot_enabled);
         let mut lap_events = Vec::new();
         let mut race_finished = None;
         for (ms, entry) in self.iter() {
@@ -303,12 +313,9 @@ impl Journal {
                         let line = if failed {
                             LapLine::Fail { duration }
                         } else {
-                            // Имя круга — целиком от дистилятора:
-                            // HS без скобки, нумерованные — с («1)»).
-                            let num = match successful {
-                                0 => "HS".to_owned(),
-                                n => format!("{n})"),
-                            };
+                            // Имя — номер через `lap_label`: HS без
+                            // скобки, нумерованные — с («1)»).
+                            let num = lap_label(successful);
                             successful += 1;
                             LapLine::Success { num, duration }
                         };
@@ -365,6 +372,20 @@ fn write_atomic(path: &Path, contents: &str) -> IoResult<()> {
     fs::rename(&tmp, path)
 }
 
+/// Правило, по которому закрылась гонка: чем закончился вылет.
+/// Ручное завершение (RACE/REC-off/EXIT) против двух авто-лимитов —
+/// сработавший первый.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RaceFinishRule {
+    /// Все пилоты достигли лимита кругов.
+    MaxLaps,
+    /// Лимит длительности гонки.
+    MaxDuration,
+    /// Ручное завершение: кнопка RACE, REC-off в бегу, EXIT.
+    Manual,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum JournalEntry {
@@ -375,6 +396,7 @@ pub enum JournalEntry {
     /// Файл записи камеры появился: метка — момент первого кадра
     /// (ноль файла), по ней файл кладётся на полоску записи.
     VideoAttached {
+        #[serde(rename = "camera-id")]
         camera_id: String,
         filename: String,
     },
@@ -385,11 +407,12 @@ pub enum JournalEntry {
     /// сериализовался бы null).
     RaceStarted {},
     RaceEvent {
+        #[serde(rename = "pad-id")]
         pad_id: String,
         name: LapEvent,
     },
     RaceFinished {
-        prematurely: bool,
+        rule: RaceFinishRule,
     },
     /// Пользователь выключил запись (коммит). Метка — момент закрытия
     /// сессии. Идёт последним: гонка (если была) уже закрыта.
@@ -457,6 +480,17 @@ impl RaceClip {
             }
         }
         clip
+    }
+}
+
+/// Отображение номера круга: 0 — «HS» (холшот — круг ноль), иначе
+/// «N)». Чистая форматка: номер к этому моменту уже учёл правила
+/// (база счётчика — 0 с холшотом, 1 без).
+pub fn lap_label(num: u32) -> String {
+    if num == 0 {
+        "HS".to_owned()
+    } else {
+        format!("{num})")
     }
 }
 
@@ -535,6 +569,26 @@ mod tests {
     use std::env::temp_dir;
     use std::process;
 
+    /// Нумерация: холшот — круг 0 («HS»), без — с «1)».
+    #[test]
+    fn lap_names_number_by_holeshot() {
+        let mut journal = sample_journal();
+        journal.push(Stamp(10_000), JournalEntry::RaceStarted {});
+        journal.push(
+            Stamp(25_000),
+            JournalEntry::RaceEvent {
+                pad_id: "pad-1".to_owned(),
+                name: LapEvent::Lap,
+            },
+        );
+        let hs = journal.lap_infos("pad-1");
+        assert!(matches!(&hs[0].1, LapLine::Success { num, .. } if num == "HS"));
+        // Холшот выключен — нумерация с единицы.
+        journal.header.rules.holeshot_enabled = false;
+        let no_hs = journal.lap_infos("pad-1");
+        assert!(matches!(&no_hs[0].1, LapLine::Success { num, .. } if num == "1)"));
+    }
+
     fn sample_journal() -> Journal {
         let date_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let mut pads = BTreeMap::new();
@@ -547,12 +601,19 @@ mod tests {
                     camera_id: "camera-1".to_owned(),
                     viewport: ViewportConfig::default(),
                 },
-                keybinds: Vec::new(),
             },
         );
         let mut assignments = HashMap::new();
         assignments.insert("pad-1".to_owned(), Pilot::new("Цой Жив"));
-        let mut journal = Journal::new(date_time, pads, assignments);
+        let mut journal = Journal::new(
+            date_time,
+            pads,
+            assignments,
+            RaceRules {
+                holeshot_enabled: true,
+                ..RaceRules::default()
+            },
+        );
         journal.push(Stamp(0), JournalEntry::RecordStarted {});
         journal
     }
@@ -580,7 +641,9 @@ mod tests {
         journal.push(Stamp(1600), JournalEntry::RaceStarted {});
         journal.push(
             Stamp(42_000),
-            JournalEntry::RaceFinished { prematurely: true },
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::Manual,
+            },
         );
         let yaml = journal.stream();
         assert!(yaml.contains("---\n"), "multi-document stream: {yaml}");
@@ -588,12 +651,12 @@ mod tests {
         assert!(yaml.contains("ms: 1500"), "{yaml}");
         assert!(yaml.contains("ms: 42000"), "{yaml}");
         // Заголовок — первый документ, без ms.
-        assert!(yaml.starts_with("date_time: 2023-11-14T22:13:20"), "{yaml}");
+        assert!(yaml.starts_with("date-time: 2023-11-14T22:13:20"), "{yaml}");
         assert!(
             yaml.contains("record-started: {}"),
             "empty variant as map: {yaml}"
         );
-        assert!(yaml.contains("prematurely: true"), "{yaml}");
+        assert!(yaml.contains("rule: manual"), "{yaml}");
         assert!(
             yaml.contains("filename: 2026-01-01-00-00-00.000-camera-1-mjpeg.mkv"),
             "{yaml}"
@@ -614,7 +677,9 @@ mod tests {
         );
         journal.push(
             Stamp(42_000),
-            JournalEntry::RaceFinished { prematurely: false },
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::MaxDuration,
+            },
         );
         let (header, entries) = Journal::parse_stream(&journal.stream());
         let header = header.expect("header roundtrip");
@@ -630,7 +695,9 @@ mod tests {
         assert_eq!(entries[2].0, Stamp(42_000));
         assert_eq!(
             entries[2].1,
-            JournalEntry::RaceFinished { prematurely: false }
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::MaxDuration
+            }
         );
     }
 
@@ -682,7 +749,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
         journal.push(Stamp(100), JournalEntry::RaceStarted {});
-        journal.push(Stamp(200), JournalEntry::RaceFinished { prematurely: true });
+        journal.push(
+            Stamp(200),
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::Manual,
+            },
+        );
         let path = journal.snapshot(&dir).expect("snapshot written");
         journal.retain(|(ms, _)| *ms != Stamp(200));
         journal.snapshot(&dir).expect("rewrite after edit");
@@ -749,7 +821,9 @@ mod tests {
         );
         journal.push(
             Stamp(70_000),
-            JournalEntry::RaceFinished { prematurely: false },
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::MaxDuration,
+            },
         );
 
         let lines = journal.lap_infos("pad-1");
@@ -841,7 +915,9 @@ mod tests {
         );
         journal.push(
             Stamp(50_000),
-            JournalEntry::RaceFinished { prematurely: false },
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::MaxDuration,
+            },
         );
 
         let lines = journal.lap_infos("pad-1");
@@ -899,7 +975,9 @@ mod tests {
         );
         journal.push(
             Stamp(40_000),
-            JournalEntry::RaceFinished { prematurely: false },
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::MaxDuration,
+            },
         );
 
         let lines = journal.lap_infos("pad-1");
@@ -973,7 +1051,9 @@ mod tests {
         journal.push(Stamp(300), JournalEntry::RaceCountdown {});
         journal.push(
             Stamp(300),
-            JournalEntry::RaceFinished { prematurely: false },
+            JournalEntry::RaceFinished {
+                rule: RaceFinishRule::MaxDuration,
+            },
         );
         let marks: Vec<(Stamp, &str)> = journal
             .iter()
@@ -1035,12 +1115,20 @@ mod tests {
             (23_000, JournalEntry::RaceCountdown {}),
             (23_500, JournalEntry::RaceStarted {}),
             (60_000, JournalEntry::RecordFinished {}),
-            (68_000, JournalEntry::RaceFinished { prematurely: true }),
+            (
+                68_000,
+                JournalEntry::RaceFinished {
+                    rule: RaceFinishRule::Manual,
+                },
+            ),
         ];
         let clip = RaceClip::from_events(events.iter().map(|(ms, e)| (Stamp(*ms), e)));
         assert!(!clip.is_empty());
         // Полоска — окно записи; файл лежит на нём со сдвигом.
-        assert_eq!(clip.recording, Some(Interval::new(Stamp(20_000), Stamp(60_000))));
+        assert_eq!(
+            clip.recording,
+            Some(Interval::new(Stamp(20_000), Stamp(60_000)))
+        );
         assert_eq!(clip.files.len(), 1);
         assert_eq!(
             clip.files["camera-1"],

@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Pilot {
     pub name: String,
 }

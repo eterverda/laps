@@ -171,6 +171,9 @@ impl Selection {
 struct Review {
     /// Журнал полёта — владение в GUI (правки DVR — здесь).
     journal: Journal,
+    /// Правила гонки из заголовка журнала: нужны вне ядра (имена
+    /// кругов — холшот).
+    rules: RaceRules,
     /// Матчер клавиатурных биндингов фазы: тогл активного пада и
     /// глобальные биндинги в Review; события пока только логируются
     /// (правки журнала — следующим шагом). При тёплом входе сеян
@@ -237,6 +240,9 @@ struct FrameContents {
     timeline_events: Vec<(Stamp, LapEvent)>,
     /// Клики по ячейкам кругов: только DVR.
     laps_clickable: bool,
+    /// Холшот: первый круг нулевой («HS»); выключен — нумерация
+    /// с «1)».
+    holeshot_enabled: bool,
 }
 
 /// Контент одного пада: всё для его рамки и картинки.
@@ -496,8 +502,12 @@ impl Flight {
             .and_then(|yaml| {
                 let (header, entries) = Journal::parse_stream(&yaml);
                 header.map(|header| {
-                    let mut journal =
-                        Journal::new(header.date_time, header.pads, header.assignments);
+                    let mut journal = Journal::new(
+                        header.date_time,
+                        header.pads,
+                        header.assignments,
+                        header.rules,
+                    );
                     for (ms, entry) in entries {
                         journal.push(ms, entry);
                     }
@@ -571,6 +581,7 @@ impl Flight {
                 &self.assignments,
                 &self.shown_cameras,
                 &mut self.selection,
+                self.rules,
                 ctx,
                 alt,
             ),
@@ -728,7 +739,7 @@ impl Flight {
         };
         // Alt над RACE: Σ / остаток со знаком минус (без лимита нечего
         // показывать ни до, ни после старта).
-        let duration = l.rules.duration;
+        let duration = l.rules.max_duration;
         let race_hint = if alt {
             match (state, duration) {
                 (RaceStage::Running { start_at }, Some(duration)) => Some(format!(
@@ -804,6 +815,7 @@ impl Flight {
             laps_flash: LAP_FLASH_INTERVAL_LIVE,
             timeline_events: Vec::new(),
             laps_clickable: false,
+            holeshot_enabled: l.rules.holeshot_enabled,
         }
     }
 
@@ -815,6 +827,7 @@ impl Flight {
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
         selection: &mut Selection,
+        rules: RaceRules,
         ctx: &egui::Context,
         alt: bool,
     ) -> FrameContents {
@@ -883,6 +896,7 @@ impl Flight {
             laps_flash: LAP_FLASH_INTERVAL_LIVE,
             timeline_events: Vec::new(),
             laps_clickable: false,
+            holeshot_enabled: rules.holeshot_enabled,
         }
     }
 
@@ -1140,6 +1154,7 @@ impl Flight {
             laps_flash: LAP_FLASH_INTERVAL_DVR,
             timeline_events,
             laps_clickable: true,
+            holeshot_enabled: d.rules.holeshot_enabled,
         }
     }
 
@@ -2022,11 +2037,17 @@ impl Review {
     /// асинхронно — транзит, пока все не открылись (Ready/Failed).
     fn open(ctx: &egui::Context, journal: Option<Journal>, setup: &Setup) -> Self {
         let journal = journal.unwrap_or_else(|| {
+            // Пустой DVR (файла нет): правил нет — дефолт.
             let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
                 log::warn!("flight: local time unavailable, journal falls back to UTC");
                 time::OffsetDateTime::now_utc()
             });
-            Journal::new(date_time, setup.pads.clone(), HashMap::new())
+            Journal::new(
+                date_time,
+                setup.pads.clone(),
+                HashMap::new(),
+                RaceRules::default(),
+            )
         });
         let clip = RaceClip::from_events(journal.iter());
         let mut players = HashMap::new();
@@ -2061,8 +2082,12 @@ impl Review {
             transport.seek((cd.ms_since(zero) as u64).min(span));
         }
         let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
+        // Правила — из заголовка журнала (холодный вход читает те же,
+        // что были в эфире).
+        let rules = journal.header().rules;
         Self {
             journal,
+            rules,
             key_matcher: KeyMatcher::new(setup),
             main_keyboard: Keyboard::new(&keyboard_tx),
             keyboard_rx,

@@ -25,7 +25,9 @@ use crate::gui::flight::scrub::{
 };
 use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
-use crate::model::flight::{Journal, JournalRecord, LapEvent, LapLine, RaceClip, latest_journal};
+use crate::model::flight::{
+    Interval, Journal, JournalEntry, LapEvent, LapLine, RaceClip, Stamp, latest_journal,
+};
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::Response;
@@ -121,12 +123,11 @@ impl Default for Idle {
 struct Live {
     /// Гоночный поток: намерения туда, уведомления оттуда.
     race: Race,
-    /// Момент рождения (REC нажали): ноль журнала — курсор кругов в
-    /// эфире = elapsed (журнальные мс «сейчас»).
-    rec_at: Instant,
     /// pad_id → дистилят кругов (последний Notice::Laps): строки журнала
     /// + текущий круг (бегущее время рендер считает по `since`).
-    laps: HashMap<String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>>,
+    laps: HashMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
+    /// Курсор кругов: метка «сейчас» по оси журнала (последний нотис).
+    laps_at: Option<Stamp>,
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: RaceStage,
     rules: RaceRules,
@@ -152,7 +153,7 @@ struct Live {
 enum Selection {
     None,
     Pad(String),
-    Event(String, u64),
+    Event(String, Stamp),
 }
 
 impl Selection {
@@ -213,24 +214,25 @@ struct FrameContents {
     timer: TimerContents,
     /// Таймлайн (мс-домен; в дроби переводит рендер). None в эфире.
     timeline: Option<TimelineContents>,
-    /// Курсор кругов: позиция воспроизведения, мс журнала. None —
-    /// эфир: всё в прошлом, раскраска не работает (без спецветок).
-    laps_cursor: Option<u64>,
-    /// Старт гонки, мс журнала: начало первого круга (для «ещё не
-    /// начался»). 0 в эфире (не используется без курсора).
-    laps_race_start: u64,
+    /// Курсор кругов: метка «сейчас» (последний дистиллят; всё, что
+    /// было, активно; свежее событие вспыхивает на 100 мс).
+    laps_cursor: Option<Stamp>,
+    /// Старт гонки: начало первого круга (для «ещё не начался»).
+    /// None в эфире (GUI оси журнала не видит; не используется
+    /// без курсора).
+    laps_race_start: Option<Stamp>,
     /// Отсчёт в пэдах: Some(dim) — фаза Countdown, dim — тот же сигнал
     /// мигания, что у основного таймера (вторая половина секунды).
     /// None — не отсчёт, пэды рисуют круги/пустоту.
     countdown: Option<bool>,
     /// Выделение кругов (DVR) — клик: голубая обводка события.
     laps_active: Selection,
-    /// Окно вспышки свежего события (от метки, до метки), журнальные
-    /// мс, знаковые: DVR симметрично, эфир — вперёд и дольше.
+    /// Окно вспышки свежего события (от метки, до метки), знаковые
+    /// смещения мс: DVR симметрично, эфир — вперёд и дольше.
     laps_flash: (i64, i64),
-    /// События выделенного пада (мс, событие) для строки над
-    /// таймлайном (DVR): пусто без выделенного пада.
-    timeline_events: Vec<(u64, LapEvent)>,
+    /// События выделенного пада для строки над таймлайном (DVR):
+    /// пусто без выделенного пада.
+    timeline_events: Vec<(Stamp, LapEvent)>,
     /// Клики по ячейкам кругов: только DVR.
     laps_clickable: bool,
 }
@@ -254,7 +256,7 @@ struct PadContents {
     /// Дистилят кругов: (метка конца круга, строка, события с метками);
     /// текущий круг идёт последним (бегущее время считается рендером
     /// по `since`). Метки — для раскраски «ещё не случилось» серым.
-    laps: Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>,
+    laps: Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>,
 }
 
 /// Состояние одной кнопки для кадра. Иконки и цвета — часть вёрстки
@@ -301,15 +303,15 @@ struct TimerContents {
 
 /// Таймлайн в мс-домене (журнальном): окно записи — [start, end].
 struct TimelineContents {
-    start: u64,
-    pos: u64,
-    end: u64,
+    /// Окно таймлайна (полоска записи): шкала, на которой ходит голова.
+    window: Interval,
+    pos: Stamp,
     /// Границы гонки (журнал): белый фрагмент трека.
-    window: Option<(u64, u64)>,
+    race: Option<Interval>,
     /// Момент RaceCountdown: точка на треке.
-    marker: Option<u64>,
-    /// Круг зацикливания: (центр, радиус) в мс.
-    circle: Option<(u64, u64)>,
+    marker: Option<Stamp>,
+    /// Круг зацикливания: окно (центр ± радиус).
+    circle: Option<Interval>,
 }
 
 pub struct Flight {
@@ -442,8 +444,8 @@ impl Flight {
         }
         self.phase = Mode::Live(Live {
             race,
-            rec_at: Instant::now(),
             laps: HashMap::new(),
+            laps_at: None,
             state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
@@ -486,12 +488,12 @@ impl Flight {
         let journal = latest_journal(Path::new(CAPTURES_DIR))
             .and_then(|path| fs::read_to_string(&path).ok())
             .and_then(|yaml| {
-                let (header, events) = Journal::parse_stream(&yaml);
+                let (header, entries) = Journal::parse_stream(&yaml);
                 header.map(|header| {
                     let mut journal =
                         Journal::new(header.date_time, header.pads, header.assignments);
-                    for (ms, event) in events {
-                        journal.push(ms, event);
+                    for (ms, entry) in entries {
+                        journal.push(ms, entry);
                     }
                     journal
                 })
@@ -524,8 +526,9 @@ impl Flight {
                     Notice::State(state) => l.state = state,
                     Notice::EnterReview { journal } => enter_review = Some(journal),
                     Notice::BackToIdle => back_to_idle = true,
-                    Notice::Laps { pad_id, lines } => {
+                    Notice::Laps { pad_id, lines, at } => {
                         l.laps.insert(pad_id, lines);
+                        l.laps_at = Some(at);
                     }
                     Notice::ActivePad(pad) => {
                         self.selection = match &pad {
@@ -629,7 +632,7 @@ impl Flight {
         setup: &Setup,
         assignments: &HashMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
-        laps: &HashMap<String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>>,
+        laps: &HashMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
         active_pad: Option<&str>,
         alt: bool,
     ) -> Vec<PadContents> {
@@ -785,10 +788,10 @@ impl Flight {
             },
             timer: TimerContents { text, dim },
             timeline: None,
-            // Курсор кругов: журнальные мс «сейчас» — всё, что было,
-            // активно; свежее событие вспыхивает на 100 мс.
-            laps_cursor: Some(l.rec_at.elapsed().as_millis() as u64),
-            laps_race_start: 0,
+            // Курсор кругов: метка «сейчас» из последнего дистиллята —
+            // всё, что было, активно; свежее событие вспыхивает на 100 мс.
+            laps_cursor: l.laps_at,
+            laps_race_start: None,
             countdown,
             laps_active: Selection::None,
             laps_flash: LAP_FLASH_INTERVAL_LIVE,
@@ -867,7 +870,7 @@ impl Flight {
             },
             timeline: None,
             laps_cursor: None,
-            laps_race_start: 0,
+            laps_race_start: None,
             countdown: None,
             laps_active: Selection::None,
             laps_flash: LAP_FLASH_INTERVAL_LIVE,
@@ -885,8 +888,13 @@ impl Flight {
         active_pad: Option<&str>,
         alt: bool,
     ) -> Vec<PadContents> {
-        let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
-        let pos = d.transport.position();
+        let clip = Some(RaceClip::from_events(d.journal.iter()));
+        // Позиция транспорта переносится на ось журнала (нули совпадают:
+        // REC родил и журнал, и шкалу сессии).
+        let pos = d
+            .journal
+            .record_started()
+            .plus_ms(d.transport.position() as i64);
         for player in d.players.values_mut() {
             player.update_frame();
         }
@@ -972,7 +980,10 @@ impl Flight {
                 // Судейский сигнал — правка журнала (DVR): события пада
                 // в окне вспышки заменяются одним по курсору.
                 KeyMatch::Signal { pad, event } => {
-                    let cursor = d.transport.position();
+                    let cursor = d
+                        .journal
+                        .record_started()
+                        .plus_ms(d.transport.position() as i64);
                     d.apply_signal(&pad, event, cursor, selection);
                 }
                 KeyMatch::SetActivePad(_) | KeyMatch::ResetActivePad => unreachable!(),
@@ -992,30 +1003,37 @@ impl Flight {
         // Транспорт → плееры: позиция (сессия) и скорость синком на каждый
         // кадр; worker'ы экстраполируют между синками на своих часах.
         d.transport.sync();
-        let pos = d.transport.position();
+        let zero = d.journal.record_started();
+        // Позиция транспорта переносится на ось журнала; кадр дальше
+        // живёт в Stamp. Мс-значение держим рядом: обратный перенос
+        // (stamp.ms_since(zero)) — это оно же, пересчитывать нечего.
+        let pos_ms = d.transport.position();
+        let pos = zero.plus_ms(pos_ms as i64);
         let speed = d.transport.velocity();
-        let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
+        let clip = Some(RaceClip::from_events(d.journal.iter()));
         // Курсор кругов — позиция транспорта; начало первого круга —
         // старт гонки.
         let laps_pos = pos;
-        let laps_race_start = clip.as_ref().and_then(|c| c.race_started_ms).unwrap_or(0);
+        let laps_race_start = d.journal.race_started().unwrap_or(zero);
         for (id, player) in d.players.iter() {
-            let file = Self::clip_rec_ms(&clip, id).map_or(pos, |rec| pos.saturating_sub(rec));
+            let file = Self::clip_rec_ms(&clip, id).map_or(pos_ms, |rec| {
+                pos_ms.saturating_sub(rec.ms_since(zero) as u64)
+            });
             player.sync(file.min(player.duration()), speed);
         }
         // Интерактив транспорта: все плееры открылись (Ready/Failed) —
         // единый enabled четырёх кнопок; таймлайн читает его же.
         let interactive = d.players_ready();
-        let (start, clock_pos, end) = Self::dvr_clock(d, &clip);
+        let (window, clock_pos) = Self::dvr_clock(d, &clip);
         // Знаковое отступление от границ гонки (журнал): минус — голова
         // до старта, плюс — хвост после финиша. Рамки нет — чистая позиция
         // без знака; знак занимает позицию десятков минут — все варианты
         // одной ширины: -0:05.234 / 00:00.000 / +0:03.100.
         let (sign, shown) = match Self::race_bounds(&clip) {
-            Some((lo, _)) if clock_pos < lo => (Some('-'), lo - clock_pos),
-            Some((_, hi)) if clock_pos > hi => (Some('+'), clock_pos - hi),
-            Some((lo, _)) => (None, clock_pos.saturating_sub(lo)),
-            None => (None, clock_pos.saturating_sub(start)),
+            Some(b) if clock_pos < b.from => (Some('-'), b.from.ms_since(clock_pos) as u64),
+            Some(b) if clock_pos > b.to => (Some('+'), clock_pos.ms_since(b.to) as u64),
+            Some(b) => (None, clock_pos.ms_since(b.from) as u64),
+            None => (None, clock_pos.ms_since(window.from) as u64),
         };
         let timer_text = match sign {
             Some(sign) => format!(
@@ -1037,9 +1055,9 @@ impl Flight {
             .pad()
             .map(|pad| {
                 d.journal
-                    .iter_ms()
-                    .filter_map(|(ms, record)| match record {
-                        JournalRecord::RaceEvent { pad_id, name } if pad_id == pad => {
+                    .iter()
+                    .filter_map(|(ms, entry)| match entry {
+                        JournalEntry::RaceEvent { pad_id, name } if pad_id == pad => {
                             Some((ms, *name))
                         }
                         _ => None,
@@ -1085,14 +1103,19 @@ impl Flight {
             rec: ButtonContents::DEAD,
             race: ButtonContents::DEAD,
         };
-        // Таймлайн (мс-домен; в дроби переводит рендер).
+        // Таймлайн (журнальный домен; в дроби переводит рендер).
         let timeline = TimelineContents {
-            start,
+            window,
             pos: clock_pos,
-            end,
-            window: Self::race_bounds(&clip),
-            marker: clip.as_ref().and_then(|c| c.race_countdown_ms),
-            circle: d.transport.circle().map(|c| (c.center, c.radius)),
+            race: Self::race_bounds(&clip),
+            marker: clip.as_ref().and_then(|c| c.race_countdown),
+            circle: d.transport.circle().map(|c| {
+                let center = d.journal.record_started().plus_ms(c.center as i64);
+                Interval::new(
+                    center.plus_ms(-(c.radius as i64)),
+                    center.plus_ms(c.radius as i64),
+                )
+            }),
         };
         FrameContents {
             pads,
@@ -1104,7 +1127,7 @@ impl Flight {
             },
             timeline: Some(timeline),
             laps_cursor: Some(laps_pos),
-            laps_race_start,
+            laps_race_start: Some(laps_race_start),
             countdown: None,
             laps_active: selection.clone(),
             laps_flash: LAP_FLASH_INTERVAL_DVR,
@@ -1163,32 +1186,36 @@ impl Flight {
                 // Таймлайн жив ровно тогда же, когда кнопки транспорта
                 // (enabled общий для всех четырёх — из players_ready).
                 if let (Some(t), true) = (&frame.timeline, frame.transport.rew.enabled) {
-                    let span = t.end.saturating_sub(t.start).max(1);
-                    let to_frac =
-                        |ms: u64| (ms.saturating_sub(t.start) as f32 / span as f32).clamp(0.0, 1.0);
+                    let span = t.window.span_ms().max(1);
+                    let to_frac = |at: Stamp| {
+                        (at.ms_since(t.window.from) as f32 / span as f32).clamp(0.0, 1.0)
+                    };
                     // Активный фрагмент (вылет) — границы гонки из журнала;
                     // без рамки вся линия серая. Точка отсчёта — момент
                     // RaceCountdown. Каретка — цветом активного транспорта.
-                    let window = t
-                        .window
-                        .map(|(lo, hi)| (to_frac(lo), to_frac(hi.min(t.end))));
+                    let race = t
+                        .race
+                        .map(|b| (to_frac(b.from), to_frac(b.to.min(t.window.to))));
                     let marker = t.marker.map(to_frac);
                     // Круг зацикливания — реальные доли; растяжение
                     // сосиски до минимума — внутри виджета.
-                    let circle = t.circle.map(|(center, radius)| {
-                        let lo = center.saturating_sub(radius).saturating_sub(t.start);
-                        let hi = (center + radius).min(t.end).saturating_sub(t.start);
+                    let circle = t.circle.map(|w| {
+                        // Кламп в 0: круг может начинаться раньше окна
+                        // таймлайна (отрицательное ms_since нельзя
+                        // кастить в u64 — обернётся).
+                        let lo = w.from.ms_since(t.window.from).max(0) as u64;
+                        let hi = w.to.min(t.window.to).ms_since(t.window.from).max(0) as u64;
                         (lo as f32 / span as f32, hi as f32 / span as f32)
                     });
                     if let Mode::Review(d) = &mut self.phase {
                         let pos_frac = to_frac(t.pos);
-                        let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
+                        let clip = Some(RaceClip::from_events(d.journal.iter()));
                         let (response, events) = d.scrub.timeline.show(
                             ui,
                             timeline_rect,
                             pos_frac,
                             span,
-                            window,
+                            race,
                             circle,
                             marker,
                         );
@@ -1200,7 +1227,10 @@ impl Flight {
                                 TimelineEvent::Seek(t_ms) => {
                                     // t — мс от начала таймлайна: в домен
                                     // сессии (транспорт сам клампит к шкале).
-                                    d.transport.seek(t.start + t_ms);
+                                    d.transport.seek(
+                                        t.window.from.ms_since(d.journal.record_started()) as u64
+                                            + t_ms,
+                                    );
                                 }
                             }
                         }
@@ -1230,8 +1260,7 @@ impl Flight {
                     if let Some(at) = show_events(
                         ui,
                         timeline_rect,
-                        t.start,
-                        span,
+                        t.window,
                         t.pos,
                         &frame.timeline_events,
                         current,
@@ -1242,7 +1271,8 @@ impl Flight {
                             let pad = pad.to_owned();
                             self.selection = Selection::Event(pad, at);
                             if let Mode::Review(d) = &mut self.phase {
-                                d.transport.seek(at);
+                                let zero = d.journal.record_started();
+                                d.transport.seek(at.ms_since(zero) as u64);
                             }
                         }
                     }
@@ -1336,7 +1366,8 @@ impl Flight {
                 if let Some((pad, ms)) = laps::show(ui, &frame, &laps_rects) {
                     self.selection = Selection::Event(pad, ms);
                     if let Mode::Review(d) = &mut self.phase {
-                        d.transport.seek(ms);
+                        let zero = d.journal.record_started();
+                        d.transport.seek(ms.ms_since(zero) as u64);
                     }
                 }
 
@@ -1498,7 +1529,7 @@ impl Flight {
                     ),
                 ];
                 if let Mode::Review(d) = &mut self.phase {
-                    let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
+                    let clip = Some(RaceClip::from_events(d.journal.iter()));
                     let mut responses: Vec<Option<egui::Response>> = Vec::new();
                     for (content, rect, id, icon, idle, lit) in &transport {
                         responses.push(if content.enabled {
@@ -1732,19 +1763,20 @@ impl Flight {
         self.phase = Mode::Review(Review::open(ctx, Some(journal), &self.setup));
     }
 
-    /// Часы DVR в журнальном домене: (старт, позиция, конец). Полоска
-    /// — окно записи (REC on → REC off); файлы лежат на ней по первым
-    /// кадрам. Дегенеративная рамка (нет ни окна, ни файлов) — файловый
-    /// домен (0, позиция, длительность).
-    fn dvr_clock(d: &Review, clip: &Option<RaceClip>) -> (u64, u64, u64) {
+    /// Часы DVR в журнальном домене: (окно, позиция). Полоска — окно
+    /// записи (REC on → REC off); файлы лежат на ней по первым кадрам.
+    /// Дегенеративная рамка (нет ни окна, ни файлов) — файловый домен:
+    /// окно [ноль, длительность], позиция — max показанного.
+    fn dvr_clock(d: &Review, clip: &Option<RaceClip>) -> (Interval, Stamp) {
+        let zero = d.journal.record_started();
         let degenerate = clip
             .as_ref()
             .is_some_and(|c| c.recording.is_none() && c.files.is_empty());
         match clip {
             Some(clip) if !degenerate => {
-                let (lo, hi) = clip.recording.unwrap_or_else(|| {
-                    let lo = clip.files.values().map(|(_, ms)| *ms).min().unwrap_or(0);
-                    (lo, clip.end_ms().unwrap_or(lo))
+                let window = clip.recording.unwrap_or_else(|| {
+                    let from = clip.files.values().map(|(_, ms)| *ms).min().unwrap_or(zero);
+                    Interval::new(from, clip.end().unwrap_or(from))
                 });
                 // Позиция циферблата: показанный кадр мастер-камеры
                 // (маппинг в сессию через ноль её файла), пока он близок
@@ -1754,29 +1786,38 @@ impl Flight {
                 // позиция транспорта. Критерий — дистанция, не окно:
                 // границы как точки переключения не существует, обе
                 // ветки на стыке равны — фликер невозможен.
-                let tp = Some(d.transport.position());
+                let tp = Some(
+                    d.journal
+                        .record_started()
+                        .plus_ms(d.transport.position() as i64),
+                );
                 let pos = match (d.players.get(&d.master), clip.files.get(&d.master)) {
                     (Some(p), Some((_, rec))) => {
-                        let shown_session = rec + p.shown();
+                        let shown_session = rec.plus_ms(p.shown() as i64);
                         match tp {
-                            Some(tp) if tp.abs_diff(shown_session) <= DIAL_LAG_MS => shown_session,
+                            Some(tp) if tp.ms_since(shown_session).abs() as u64 <= DIAL_LAG_MS => {
+                                shown_session
+                            }
                             _ => tp.unwrap_or(shown_session),
                         }
                     }
-                    _ => tp.unwrap_or(lo),
+                    _ => tp.unwrap_or(window.from),
                 };
-                (lo, pos.clamp(lo, hi.max(lo)), hi)
+                (window, window.clamp(pos))
             }
             _ => {
                 let pos = d.players.values().map(|p| p.shown()).max().unwrap_or(0);
                 let dur = d.players.values().map(|p| p.duration()).max().unwrap_or(0);
-                (0, pos.min(dur), dur)
+                (
+                    Interval::new(zero, zero.plus_ms(dur as i64)),
+                    zero.plus_ms(pos.min(dur) as i64),
+                )
             }
         }
     }
 
-    /// journal-ms первого кадра камеры (ноль её файла).
-    fn clip_rec_ms(clip: &Option<RaceClip>, camera_id: &str) -> Option<u64> {
+    /// Метка первого кадра камеры (ноль её файла).
+    fn clip_rec_ms(clip: &Option<RaceClip>, camera_id: &str) -> Option<Stamp> {
         clip.as_ref()?
             .files
             .get(camera_id)
@@ -1789,7 +1830,7 @@ impl Flight {
         clip: &Option<RaceClip>,
         players: &HashMap<String, Player>,
         camera_id: &str,
-        journal_pos: u64,
+        journal_pos: Stamp,
     ) -> bool {
         match clip {
             Some(clip) => match (clip.files.get(camera_id), players.get(camera_id)) {
@@ -1799,8 +1840,9 @@ impl Flight {
                     // (last_step), а не мгновением — иначе голова записи
                     // (record-started раньше первого кадра на доли периода)
                     // и хвост до record-finished читались бы как гэпы.
-                    journal_pos + p.last_step() < *file_ms
-                        || journal_pos >= *file_ms + p.duration() + p.last_step()
+                    (journal_pos.ms_since(*file_ms) + p.last_step() as i64) < 0
+                        || journal_pos.ms_since(*file_ms)
+                            >= p.duration() as i64 + p.last_step() as i64
                 }
                 _ => false,
             },
@@ -1809,17 +1851,19 @@ impl Flight {
     }
 
     /// Границы гонки в журнальном домене (None — рамки нет).
-    fn race_bounds(clip: &Option<RaceClip>) -> Option<(u64, u64)> {
+    fn race_bounds(clip: &Option<RaceClip>) -> Option<Interval> {
         let clip = clip.as_ref()?;
-        Some((clip.race_started_ms?, clip.race_finished_ms?))
+        Some(Interval::new(clip.race_started?, clip.race_finished?))
     }
 
     /// Перемотка транспорта на delta мс в журнальном домене: база —
     /// конверт таймлайна. Плееры получат новую позицию следующим синком.
     fn seek_by(d: &mut Review, clip: &Option<RaceClip>, delta: i64) {
-        let (start, pos, end) = Self::dvr_clock(d, clip);
-        let target = (pos as i64 + delta).clamp(start as i64, end as i64) as u64;
-        d.transport.seek(target);
+        let zero = d.journal.record_started();
+        let (window, pos) = Self::dvr_clock(d, clip);
+        let target = (pos.ms_since(zero) + delta)
+            .clamp(window.from.ms_since(zero), window.to.ms_since(zero));
+        d.transport.seek(target as u64);
     }
 
     /// Исполнение события кнопки перемотки (машина — в SeekButton):
@@ -1881,7 +1925,7 @@ impl Flight {
                 ok(String::new())
             }
             (&"ff" | &"rew", Mode::Review(d)) => {
-                let clip = Some(RaceClip::from_events(d.journal.iter_ms()));
+                let clip = Some(RaceClip::from_events(d.journal.iter()));
                 let dir: i64 = if head == "ff" { 1 } else { -1 };
                 let step = dir * SEEK_SPEEDS[d.scrub.seek_speed] as i64 * SEEK_TAP as i64;
                 Self::seek_by(d, &clip, step);
@@ -1917,8 +1961,9 @@ impl Review {
     /// Удаление события (Delete/Backspace): запись убирается из
     /// журнала, файл переписывается снапшотом целиком. true — событие
     /// было и удалено.
-    fn delete_selected(&mut self, pad: &str, ms: u64) -> bool {
-        if self.journal.remove(pad, ms, ms + 1) == 0 {
+    fn delete_selected(&mut self, pad: &str, at: Stamp) -> bool {
+        // Полуинтервал [at, at + 1 мс): ровно одна запись по метке.
+        if self.journal.remove(pad, at, at.plus_ms(1)) == 0 {
             return false;
         }
         self.snapshot_after_edit();
@@ -1937,14 +1982,24 @@ impl Review {
     /// нажатое встаёт по курсору; событий в окне нет — просто вставка по
     /// курсору. Выделение события снимается, выделение пада остаётся.
     /// Выделенное событие здесь не используется — оно для удаления.
-    fn apply_signal(&mut self, pad: &str, event: LapEvent, cursor: u64, selection: &mut Selection) {
+    fn apply_signal(
+        &mut self,
+        pad: &str,
+        event: LapEvent,
+        cursor: Stamp,
+        selection: &mut Selection,
+    ) {
+        let zero = self.journal.record_started();
+        let cursor_ms = cursor.ms_since(zero);
         let (from, to) = LAP_FLASH_INTERVAL_DVR;
-        let from = (cursor as i64 + from).max(0) as u64;
-        let to = (cursor as i64 + to).max(0) as u64;
-        self.journal.remove(pad, from, to);
+        self.journal.remove(
+            pad,
+            zero.plus_ms(cursor_ms + from),
+            zero.plus_ms(cursor_ms + to),
+        );
         self.journal.push(
             cursor,
-            JournalRecord::RaceEvent {
+            JournalEntry::RaceEvent {
                 pad_id: pad.to_owned(),
                 name: event,
             },
@@ -1966,7 +2021,7 @@ impl Review {
             });
             Journal::new(date_time, setup.pads.clone(), HashMap::new())
         });
-        let clip = RaceClip::from_events(journal.iter_ms());
+        let clip = RaceClip::from_events(journal.iter());
         let mut players = HashMap::new();
         let dir = Path::new(CAPTURES_DIR);
         for (camera_id, (filename, _)) in &clip.files {
@@ -1985,15 +2040,18 @@ impl Review {
             .find(|cam| clip.files.contains_key(cam))
             .unwrap_or_default();
         // Транспорт: шкала — окно записи, курсор — на момент отсчёта
-        // (каждая камера покажет свой предшествующий кадр).
+        // (каждая камера покажет свой предшествующий кадр). Транспорт
+        // живёт в мс сессии; ноль совпадает с нулём оси журнала.
+        let zero = journal.record_started();
         let span = clip
             .recording
-            .map(|(_, hi)| hi)
-            .or_else(|| clip.end_ms())
-            .unwrap_or(0);
+            .map(|w| w.to)
+            .or_else(|| clip.end())
+            .unwrap_or(zero)
+            .ms_since(zero) as u64;
         let mut transport = Transport::new(Instant::now(), span);
-        if let Some(cd) = clip.race_countdown_ms {
-            transport.seek(cd.min(span));
+        if let Some(cd) = clip.race_countdown {
+            transport.seek((cd.ms_since(zero) as u64).min(span));
         }
         let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
         Self {

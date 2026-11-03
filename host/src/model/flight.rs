@@ -31,12 +31,69 @@ impl JournalHeader {
     }
 }
 
-/// Журнал полёта: заголовок + события с метками мс, файл yaml-стрима.
-/// Метки — мс от момента создания (ноль шкалы — у производителя событий,
-/// сервиса; журнал метки только хранит). Файлом журнал не владеет:
-/// запись — методы `snapshot`/`append_to`.
+/// Метка на оси журнала: момент от нуля шкалы (REC). Тип непрозрачный:
+/// конструируется только журналом, числового значения наружу нет —
+/// только арифметика методами. Арифметика меток РАЗНЫХ журналов лишена
+/// смысла: оси независимы, сравнения/разности между ними — мусор
+/// (документация, не проверка). Display нет намеренно: метка не для
+/// вывода, yaml ходит в мс-оффсетах. Ноль оси наружу не торчит
+/// константой — только через `Journal::record_started()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Stamp(u64);
+
+impl Stamp {
+    /// Ноль оси (момент создания журнала, REC). Внутреннее дело
+    /// журнала; снаружи ось берётся через `Journal::record_started()`.
+    const ZERO: Stamp = Stamp(0);
+
+    /// self − earlier, в мс, знаково: отрицательно — self раньше
+    /// earlier. Единственный способ получить число из меток.
+    pub fn ms_since(self, earlier: Stamp) -> i64 {
+        self.0 as i64 - earlier.0 as i64
+    }
+
+    /// Сдвиг по оси на знаковые мс (кламп в [0, u64::MAX]).
+    pub fn plus_ms(self, ms: i64) -> Stamp {
+        Stamp(if ms >= 0 {
+            self.0.saturating_add(ms as u64)
+        } else {
+            self.0.saturating_sub(ms.unsigned_abs())
+        })
+    }
+}
+
+/// Интервал на оси журнала [from, to): полуинтервал — from входит,
+/// to нет. Метки одного журнала. Тупая пара: арифметика — методами
+/// Stamp, тут — только то, что нужно интервалу.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interval {
+    pub from: Stamp,
+    pub to: Stamp,
+}
+
+impl Interval {
+    pub fn new(from: Stamp, to: Stamp) -> Self {
+        Self { from, to }
+    }
+
+    /// Длительность интервала, мс (0 — вырожденный или инвертированный).
+    pub fn span_ms(&self) -> u64 {
+        self.to.ms_since(self.from).max(0) as u64
+    }
+
+    /// Метка, клампнутная в интервал (вырожденный клампит к from).
+    pub fn clamp(&self, at: Stamp) -> Stamp {
+        at.clamp(self.from, self.to.max(self.from))
+    }
+}
+
+/// Журнал полёта: заголовок + события с метками, файл yaml-стрима.
+/// Ось журнала — мс от момента создания (REC); журнал — хозяин оси:
+/// метки рождаются только у него (сдвиг от `record_started`), сырой мс
+/// в домен не входит и не выходит. Файлом журнал не владеет: запись —
+/// методы `snapshot`/`append_to`.
 pub struct Journal {
-    events: Vec<(u64, JournalRecord)>,
+    entries: Vec<(Stamp, JournalEntry)>,
     /// Контекст полёта (заголовок). date_time — источник стема имён
     /// файлов записи.
     header: JournalHeader,
@@ -49,7 +106,7 @@ impl Journal {
         assignments: HashMap<String, Pilot>,
     ) -> Self {
         Self {
-            events: Vec::new(),
+            entries: Vec::new(),
             header: JournalHeader {
                 date_time,
                 pads,
@@ -63,34 +120,48 @@ impl Journal {
         &self.header
     }
 
-    /// Итератор событий с метками мс (домен, в котором живёт скраббинг).
-    pub fn iter_ms(&self) -> impl Iterator<Item = (u64, &JournalRecord)> {
-        self.events.iter().map(|(ms, event)| (*ms, event))
+    /// Начало записи (REC) — ноль оси журнала. Точка, от которой
+    /// снаружи считаются все метки: `journal.record_started().plus_ms(x)`.
+    /// Константой ноль наружу не торчит — только через этот метод.
+    pub fn record_started(&self) -> Stamp {
+        Stamp::ZERO
+    }
+
+    /// Начало вылета (первое RaceStarted), если гонка была.
+    pub fn race_started(&self) -> Option<Stamp> {
+        self.entries
+            .iter()
+            .find_map(|(at, entry)| matches!(entry, JournalEntry::RaceStarted {}).then_some(*at))
+    }
+
+    /// Итератор событий с метками (домен, в котором живёт скраббинг).
+    pub fn iter(&self) -> impl Iterator<Item = (Stamp, &JournalEntry)> {
+        self.entries.iter().map(|(ms, entry)| (*ms, entry))
     }
 
     /// Число событий (счётчик дописанных в файл — см. `append`).
     pub fn event_count(&self) -> usize {
-        self.events.len()
+        self.entries.len()
     }
 
-    /// Добавить событие (память; на диск уходит через `append`/`snapshot`
-    /// — журнал файла не касается). Вставка по времени: позиция —
-    /// бинарным поиском; среди равных меток — после равных (порядок
-    /// вставки сохраняется). Вставка в конец (обычный путь
-    /// хронологической записи) — без сдвига.
-    pub fn push(&mut self, ms: u64, event: JournalRecord) {
-        let pos = self.events.partition_point(|(at, _)| *at <= ms);
-        self.events.insert(pos, (ms, event));
+    /// Добавить событие по метке (память; на диск уходит через
+    /// `append`/`snapshot` — журнал файла не касается). Вставка по
+    /// времени: позиция — бинарным поиском; среди равных меток — после
+    /// равных (порядок вставки сохраняется). Вставка в конец (обычный
+    /// путь хронологической записи) — без сдвига.
+    pub fn push(&mut self, at: Stamp, entry: JournalEntry) {
+        let pos = self.entries.partition_point(|(ms, _)| *ms <= at);
+        self.entries.insert(pos, (at, entry));
     }
 
-    /// Удалить события пада в полуинтервале [from, to) (правки DVR).
-    /// Возвращает число удалённых.
-    pub fn remove(&mut self, pad_id: &str, from: u64, to: u64) -> usize {
+    /// Удалить события пада в полуинтервале меток [from, to) (правки
+    /// DVR). Возвращает число удалённых.
+    pub fn remove(&mut self, pad_id: &str, from: Stamp, to: Stamp) -> usize {
         let before = self.event_count();
-        self.retain(|(ms, record)| {
-            !(ms >= &from
-                && ms < &to
-                && matches!(record, JournalRecord::RaceEvent { pad_id: id, .. } if *id == pad_id))
+        self.retain(|(ms, entry)| {
+            !(*ms >= from
+                && *ms < to
+                && matches!(entry, JournalEntry::RaceEvent { pad_id: id, .. } if *id == pad_id))
         });
         before - self.event_count()
     }
@@ -98,24 +169,25 @@ impl Journal {
     /// Удалить события по предикату (правки DVR): правка в памяти, файл
     /// переписывается снапшотом целиком. Первый эвент не удаляется
     /// (держит ноль шкалы).
-    pub fn retain<F: FnMut(&(u64, &JournalRecord)) -> bool>(&mut self, mut pred: F) {
+    pub fn retain<F: FnMut(&(Stamp, &JournalEntry)) -> bool>(&mut self, mut pred: F) {
         let mut i = 0;
-        self.events.retain(|(ms, event)| {
+        self.entries.retain(|(ms, entry)| {
             i += 1;
-            i == 1 || pred(&(*ms, event))
+            i == 1 || pred(&(*ms, entry))
         });
     }
 
     /// Один эвент — один yaml-документ: `{ms, <variant>: {...}}`.
-    /// Документы стрима разделяются `---` (см. `stream`).
-    pub fn event_doc(&self, ms: u64, event: &JournalRecord) -> String {
+    /// Документы стрима разделяются `---` (см. `stream`). Метка
+    /// сериализуется мс-оффсетом (формат файла — оффсеты).
+    pub fn entry_doc(&self, at: Stamp, entry: &JournalEntry) -> String {
         #[derive(Serialize)]
         struct EventSer<'a> {
             ms: u64,
             #[serde(flatten)]
-            event: &'a JournalRecord,
+            entry: &'a JournalEntry,
         }
-        let ser = EventSer { ms, event };
+        let ser = EventSer { ms: at.0, entry };
         to_yaml_string(&ser).unwrap_or_else(|e| panic!("journal yaml: {e}"))
     }
 
@@ -124,9 +196,9 @@ impl Journal {
     pub fn stream(&self) -> String {
         let mut out =
             to_yaml_string(&self.header).unwrap_or_else(|e| panic!("journal header yaml: {e}"));
-        for (ms, event) in &self.events {
+        for (ms, entry) in &self.entries {
             out.push_str("---\n");
-            out.push_str(&self.event_doc(*ms, event));
+            out.push_str(&self.entry_doc(*ms, entry));
         }
         out
     }
@@ -134,12 +206,12 @@ impl Journal {
     /// Парсинг yaml-стрима (холодный вход в скраббинг): первый
     /// документ — заголовок, дальше события через `---`. Битые
     /// документы пропускаются с warn.
-    pub fn parse_stream(yaml: &str) -> (Option<JournalHeader>, Vec<(u64, JournalRecord)>) {
+    pub fn parse_stream(yaml: &str) -> (Option<JournalHeader>, Vec<(Stamp, JournalEntry)>) {
         #[derive(Deserialize)]
         struct EventDoc {
             ms: u64,
             #[serde(flatten)]
-            event: JournalRecord,
+            event: JournalEntry,
         }
         let mut docs = yaml.split("\n---\n").filter(|doc| !doc.trim().is_empty());
         let header = docs
@@ -151,16 +223,16 @@ impl Journal {
                     None
                 }
             });
-        let events = docs
+        let entries = docs
             .filter_map(|doc| match from_yaml_string::<EventDoc>(doc) {
-                Ok(event) => Some((event.ms, event.event)),
+                Ok(event) => Some((Stamp(event.ms), event.event)),
                 Err(e) => {
                     log::warn!("flight journal: bad document skipped: {e}");
                     None
                 }
             })
             .collect();
-        (header, events)
+        (header, entries)
     }
     /// Снапшот журнала в `dir/<stem>.yaml` (стем из date_time): полный
     /// стрим через tmp + rename. Первое создание файла и перезапись
@@ -183,9 +255,9 @@ impl Journal {
         }
         match fs::read_to_string(path) {
             Ok(mut contents) => {
-                for (ms, event) in self.iter_ms().skip(*written) {
+                for (ms, entry) in self.iter().skip(*written) {
                     contents.push_str("---\n");
-                    contents.push_str(&self.event_doc(ms, event));
+                    contents.push_str(&self.entry_doc(ms, entry));
                 }
                 *written = count;
                 write_atomic(path, &contents)
@@ -205,29 +277,29 @@ impl Journal {
     /// RaceFinished выдаётся здесь же незакрытый круг (`Unfinished`).
     /// Успешный круг: последним действием перед Lap не был Fault;
     /// первый успешный — «HS», дальше 1, 2, … (fail номер не съедает).
-    pub fn lap_infos(&self, pad_id: &str) -> Vec<(u64, LapLine, Vec<(u64, LapEvent)>)> {
+    pub fn lap_infos(&self, pad_id: &str) -> Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)> {
         let mut lines = Vec::new();
         let mut in_race = false;
-        let mut lap_start = 0;
+        let mut lap_start = Stamp::ZERO;
         let mut last_action: Option<LapEvent> = None;
         let mut successful = 0u32;
         let mut lap_events = Vec::new();
         let mut race_finished = None;
-        for (ms, event) in self.iter_ms() {
-            match event {
-                JournalRecord::RaceStarted {} => {
+        for (ms, entry) in self.iter() {
+            match entry {
+                JournalEntry::RaceStarted {} => {
                     in_race = true;
                     lap_start = ms;
                 }
-                JournalRecord::RaceFinished { .. } => {
+                JournalEntry::RaceFinished { .. } => {
                     in_race = false;
                     race_finished = Some(ms);
                 }
-                JournalRecord::RaceEvent { pad_id: id, name } if in_race && id == pad_id => {
+                JournalEntry::RaceEvent { pad_id: id, name } if in_race && id == pad_id => {
                     lap_events.push((ms, *name));
                     if *name == LapEvent::Lap {
                         let failed = last_action == Some(LapEvent::Fault);
-                        let duration = Duration::from_millis(ms - lap_start);
+                        let duration = Duration::from_millis(ms.ms_since(lap_start).max(0) as u64);
                         let line = if failed {
                             LapLine::Fail { duration }
                         } else {
@@ -262,7 +334,7 @@ impl Journal {
             lines.push((
                 finish,
                 LapLine::Unfinished {
-                    duration: Duration::from_millis(finish - lap_start),
+                    duration: Duration::from_millis(finish.ms_since(lap_start).max(0) as u64),
                 },
                 mem::take(&mut lap_events),
             ));
@@ -295,7 +367,7 @@ fn write_atomic(path: &Path, contents: &str) -> IoResult<()> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum JournalRecord {
+pub enum JournalEntry {
     /// Пользователь включил запись (REC, или RACE из эфира без записи).
     /// Без камер: запись — сессия, по её времени строится полоска DVR.
     /// Контекст полёта — в заголовке стрима (JournalHeader).
@@ -330,23 +402,23 @@ pub enum JournalRecord {
 #[derive(Default)]
 pub struct RaceClip {
     /// Окно записи (REC on → REC off), журнальный домен: полоска DVR.
-    pub recording: Option<(u64, u64)>,
-    /// camera_id → (имя файла, journal-ms первого кадра = ноль файла):
+    pub recording: Option<Interval>,
+    /// camera_id → (имя файла, метка первого кадра = ноль файла):
     /// файл кладётся на полоску по первому кадру.
-    pub files: HashMap<String, (String, u64)>,
+    pub files: HashMap<String, (String, Stamp)>,
     /// Момент нажатия RACE (начало отсчёта): стартовая позиция
     /// курсора DVR и точка на таймлайне.
-    pub race_countdown_ms: Option<u64>,
-    pub race_started_ms: Option<u64>,
-    pub race_finished_ms: Option<u64>,
+    pub race_countdown: Option<Stamp>,
+    pub race_started: Option<Stamp>,
+    pub race_finished: Option<Stamp>,
 }
 
 impl RaceClip {
     /// Экстент журнала: последняя известная метка (финиш гонки, конец
     /// записи, последний файл). Запасной домен для таймлайна.
-    pub fn end_ms(&self) -> Option<u64> {
-        self.race_finished_ms
-            .or_else(|| self.recording.map(|(_, hi)| hi))
+    pub fn end(&self) -> Option<Stamp> {
+        self.race_finished
+            .or_else(|| self.recording.map(|w| w.to))
             .or_else(|| self.files.values().map(|(_, ms)| *ms).max())
     }
 
@@ -356,30 +428,32 @@ impl RaceClip {
     }
 }
 
-/// Сбор рамки полёта из событий журнала (мс журнала).
+/// Сбор рамки полёта из событий журнала.
 impl RaceClip {
-    pub fn from_events<'a>(events: impl IntoIterator<Item = (u64, &'a JournalRecord)>) -> RaceClip {
+    pub fn from_events<'a>(
+        entries: impl IntoIterator<Item = (Stamp, &'a JournalEntry)>,
+    ) -> RaceClip {
         let mut clip = RaceClip::default();
-        for (ms, event) in events {
-            match event {
-                JournalRecord::RecordStarted { .. } => match &mut clip.recording {
-                    Some((lo, _)) => *lo = (*lo).min(ms),
-                    None => clip.recording = Some((ms, ms)),
+        for (ms, entry) in entries {
+            match entry {
+                JournalEntry::RecordStarted { .. } => match &mut clip.recording {
+                    Some(w) => w.from = w.from.min(ms),
+                    None => clip.recording = Some(Interval::new(ms, ms)),
                 },
-                JournalRecord::RecordFinished {} => match &mut clip.recording {
-                    Some((_, hi)) => *hi = ms,
-                    None => clip.recording = Some((ms, ms)),
+                JournalEntry::RecordFinished {} => match &mut clip.recording {
+                    Some(w) => w.to = ms,
+                    None => clip.recording = Some(Interval::new(ms, ms)),
                 },
-                JournalRecord::VideoAttached {
+                JournalEntry::VideoAttached {
                     camera_id,
                     filename,
                 } => {
                     clip.files.insert(camera_id.clone(), (filename.clone(), ms));
                 }
-                JournalRecord::RaceCountdown {} => clip.race_countdown_ms = Some(ms),
-                JournalRecord::RaceStarted {} => clip.race_started_ms = Some(ms),
-                JournalRecord::RaceFinished { .. } => clip.race_finished_ms = Some(ms),
-                JournalRecord::RaceEvent { .. } => {}
+                JournalEntry::RaceCountdown {} => clip.race_countdown = Some(ms),
+                JournalEntry::RaceStarted {} => clip.race_started = Some(ms),
+                JournalEntry::RaceFinished { .. } => clip.race_finished = Some(ms),
+                JournalEntry::RaceEvent { .. } => {}
             }
         }
         clip
@@ -479,7 +553,7 @@ mod tests {
         let mut assignments = HashMap::new();
         assignments.insert("pad-1".to_owned(), Pilot::new("Цой Жив"));
         let mut journal = Journal::new(date_time, pads, assignments);
-        journal.push(0, JournalRecord::RecordStarted {});
+        journal.push(Stamp(0), JournalEntry::RecordStarted {});
         journal
     }
 
@@ -497,14 +571,17 @@ mod tests {
     fn yaml_ms_offsets_and_variants() {
         let mut journal = sample_journal();
         journal.push(
-            1500,
-            JournalRecord::VideoAttached {
+            Stamp(1500),
+            JournalEntry::VideoAttached {
                 camera_id: "camera-1".to_owned(),
                 filename: "2026-01-01-00-00-00.000-camera-1-mjpeg.mkv".to_owned(),
             },
         );
-        journal.push(1600, JournalRecord::RaceStarted {});
-        journal.push(42_000, JournalRecord::RaceFinished { prematurely: true });
+        journal.push(Stamp(1600), JournalEntry::RaceStarted {});
+        journal.push(
+            Stamp(42_000),
+            JournalEntry::RaceFinished { prematurely: true },
+        );
         let yaml = journal.stream();
         assert!(yaml.contains("---\n"), "multi-document stream: {yaml}");
         assert!(yaml.contains("ms: 0"), "{yaml}");
@@ -529,28 +606,31 @@ mod tests {
     fn yaml_stream_roundtrip() {
         let mut journal = sample_journal();
         journal.push(
-            1500,
-            JournalRecord::VideoAttached {
+            Stamp(1500),
+            JournalEntry::VideoAttached {
                 camera_id: "camera-1".to_owned(),
                 filename: "2026-01-01-00-00-00.000-camera-1-mjpeg.mkv".to_owned(),
             },
         );
-        journal.push(42_000, JournalRecord::RaceFinished { prematurely: false });
-        let (header, events) = Journal::parse_stream(&journal.stream());
+        journal.push(
+            Stamp(42_000),
+            JournalEntry::RaceFinished { prematurely: false },
+        );
+        let (header, entries) = Journal::parse_stream(&journal.stream());
         let header = header.expect("header roundtrip");
         assert_eq!(
             header.date_time,
             OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
         );
-        assert_eq!(events.len(), 3, "{events:?}");
-        assert!(matches!(events[0].1, JournalRecord::RecordStarted {}));
-        assert_eq!(events[0].0, 0);
-        assert_eq!(events[1].0, 1500);
-        assert!(matches!(events[1].1, JournalRecord::VideoAttached { .. }));
-        assert_eq!(events[2].0, 42000);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert!(matches!(entries[0].1, JournalEntry::RecordStarted {}));
+        assert_eq!(entries[0].0, Stamp::ZERO);
+        assert_eq!(entries[1].0, Stamp(1500));
+        assert!(matches!(entries[1].1, JournalEntry::VideoAttached { .. }));
+        assert_eq!(entries[2].0, Stamp(42_000));
         assert_eq!(
-            events[2].1,
-            JournalRecord::RaceFinished { prematurely: false }
+            entries[2].1,
+            JournalEntry::RaceFinished { prematurely: false }
         );
     }
 
@@ -559,12 +639,12 @@ mod tests {
     fn parse_stream_skips_bad_documents() {
         // Битый заголовок — пропускается, события за ним живы.
         let yaml = "garbage: true\n---\nms: 0\nrecord-started: {}\n---\nnot: an: event\n---\nms: 100\nrace-started: {}\n";
-        let (header, events) = Journal::parse_stream(yaml);
+        let (header, entries) = Journal::parse_stream(yaml);
         assert!(header.is_none(), "{header:?}");
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert!(matches!(events[0].1, JournalRecord::RecordStarted {}));
-        assert_eq!(events[1].0, 100);
-        assert!(matches!(events[1].1, JournalRecord::RaceStarted {}));
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(matches!(entries[0].1, JournalEntry::RecordStarted {}));
+        assert_eq!(entries[1].0, Stamp(100));
+        assert!(matches!(entries[1].1, JournalEntry::RaceStarted {}));
     }
 
     /// Снапшот: полный стрим в финальном файле, временный `~` после
@@ -576,7 +656,7 @@ mod tests {
         let mut journal = sample_journal();
         let path = journal.snapshot(&dir).expect("snapshot written");
         let mut written = journal.event_count();
-        journal.push(1500, JournalRecord::RaceStarted {});
+        journal.push(Stamp(1500), JournalEntry::RaceStarted {});
         journal.append_to(&path, &mut written).expect("append");
 
         let mut files: Vec<_> = fs::read_dir(&dir)
@@ -601,10 +681,10 @@ mod tests {
         let dir = temp_dir().join(format!("laps-journal-retain-test-{}", process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut journal = sample_journal();
-        journal.push(100, JournalRecord::RaceStarted {});
-        journal.push(200, JournalRecord::RaceFinished { prematurely: true });
+        journal.push(Stamp(100), JournalEntry::RaceStarted {});
+        journal.push(Stamp(200), JournalEntry::RaceFinished { prematurely: true });
         let path = journal.snapshot(&dir).expect("snapshot written");
-        journal.retain(|(ms, _)| *ms != 200);
+        journal.retain(|(ms, _)| *ms != Stamp(200));
         journal.snapshot(&dir).expect("rewrite after edit");
 
         let yaml = journal.stream();
@@ -621,57 +701,60 @@ mod tests {
     #[test]
     fn lap_infos_distills_success_fail_and_correct() {
         let mut journal = sample_journal();
-        journal.push(10_000, JournalRecord::RaceStarted {});
+        journal.push(Stamp(10_000), JournalEntry::RaceStarted {});
         // Круг 1: lap без fault — HS.
         journal.push(
-            25_000,
-            JournalRecord::RaceEvent {
+            Stamp(25_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Lap,
             },
         );
         // Круг 2: fault, затем lap без correct — fail, номер не жжёт.
         journal.push(
-            30_000,
-            JournalRecord::RaceEvent {
+            Stamp(30_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Fault,
             },
         );
         journal.push(
-            40_000,
-            JournalRecord::RaceEvent {
+            Stamp(40_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Lap,
             },
         );
         // Круг 3: fault → correct → lap — успех «1».
         journal.push(
-            45_000,
-            JournalRecord::RaceEvent {
+            Stamp(45_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Fault,
             },
         );
         journal.push(
-            46_000,
-            JournalRecord::RaceEvent {
+            Stamp(46_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Correction,
             },
         );
         journal.push(
-            60_000,
-            JournalRecord::RaceEvent {
+            Stamp(60_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Lap,
             },
         );
-        journal.push(70_000, JournalRecord::RaceFinished { prematurely: false });
+        journal.push(
+            Stamp(70_000),
+            JournalEntry::RaceFinished { prematurely: false },
+        );
 
         let lines = journal.lap_infos("pad-1");
         assert_eq!(lines.len(), 4, "{lines:?}");
-        assert_eq!(lines[0].0, 25_000);
+        assert_eq!(lines[0].0, Stamp(25_000));
         assert_eq!(
             lines[0].1,
             LapLine::Success {
@@ -695,10 +778,13 @@ mod tests {
         // События круга прикреплены (с метками): у fail-круга fault + lap.
         assert_eq!(
             lines[1].2,
-            vec![(30_000, LapEvent::Fault), (40_000, LapEvent::Lap)]
+            vec![
+                (Stamp(30_000), LapEvent::Fault),
+                (Stamp(40_000), LapEvent::Lap)
+            ]
         );
         // Незакрытый хвост после финиша: застывшее время, событий нет.
-        assert_eq!(lines[3].0, 70_000);
+        assert_eq!(lines[3].0, Stamp(70_000));
         assert_eq!(
             lines[3].1,
             LapLine::Unfinished {
@@ -723,37 +809,40 @@ mod tests {
     #[test]
     fn lap_infos_warn_is_display_only() {
         let mut journal = sample_journal();
-        journal.push(10_000, JournalRecord::RaceStarted {});
+        journal.push(Stamp(10_000), JournalEntry::RaceStarted {});
         // warn до и после fault: круг всё равно fail.
         journal.push(
-            20_000,
-            JournalRecord::RaceEvent {
+            Stamp(20_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Warn,
             },
         );
         journal.push(
-            30_000,
-            JournalRecord::RaceEvent {
+            Stamp(30_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Fault,
             },
         );
         journal.push(
-            35_000,
-            JournalRecord::RaceEvent {
+            Stamp(35_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Warn,
             },
         );
         journal.push(
-            40_000,
-            JournalRecord::RaceEvent {
+            Stamp(40_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Lap,
             },
         );
-        journal.push(50_000, JournalRecord::RaceFinished { prematurely: false });
+        journal.push(
+            Stamp(50_000),
+            JournalEntry::RaceFinished { prematurely: false },
+        );
 
         let lines = journal.lap_infos("pad-1");
         assert_eq!(lines.len(), 2, "{lines:?}");
@@ -762,14 +851,14 @@ mod tests {
         assert_eq!(
             lines[0].2,
             vec![
-                (20_000, LapEvent::Warn),
-                (30_000, LapEvent::Fault),
-                (35_000, LapEvent::Warn),
-                (40_000, LapEvent::Lap),
+                (Stamp(20_000), LapEvent::Warn),
+                (Stamp(30_000), LapEvent::Fault),
+                (Stamp(35_000), LapEvent::Warn),
+                (Stamp(40_000), LapEvent::Lap),
             ]
         );
         // Незакрытый хвост (40→50) без событий — всё равно строка.
-        assert_eq!(lines[1].0, 50_000);
+        assert_eq!(lines[1].0, Stamp(50_000));
         assert_eq!(
             lines[1].1,
             LapLine::Unfinished {
@@ -785,34 +874,37 @@ mod tests {
     #[test]
     fn lap_infos_appends_unfinished_lap_after_finish() {
         let mut journal = sample_journal();
-        journal.push(10_000, JournalRecord::RaceStarted {});
+        journal.push(Stamp(10_000), JournalEntry::RaceStarted {});
         journal.push(
-            25_000,
-            JournalRecord::RaceEvent {
+            Stamp(25_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Lap,
             },
         );
         // Незакрытый круг: fault + warn, затем финиш.
         journal.push(
-            30_000,
-            JournalRecord::RaceEvent {
+            Stamp(30_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Fault,
             },
         );
         journal.push(
-            32_000,
-            JournalRecord::RaceEvent {
+            Stamp(32_000),
+            JournalEntry::RaceEvent {
                 pad_id: "pad-1".to_owned(),
                 name: LapEvent::Warn,
             },
         );
-        journal.push(40_000, JournalRecord::RaceFinished { prematurely: false });
+        journal.push(
+            Stamp(40_000),
+            JournalEntry::RaceFinished { prematurely: false },
+        );
 
         let lines = journal.lap_infos("pad-1");
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(lines[1].0, 40_000);
+        assert_eq!(lines[1].0, Stamp(40_000));
         assert_eq!(
             lines[1].1,
             LapLine::Unfinished {
@@ -821,7 +913,10 @@ mod tests {
         );
         assert_eq!(
             lines[1].2,
-            vec![(30_000, LapEvent::Fault), (32_000, LapEvent::Warn)]
+            vec![
+                (Stamp(30_000), LapEvent::Fault),
+                (Stamp(32_000), LapEvent::Warn)
+            ]
         );
     }
 
@@ -851,40 +946,43 @@ mod tests {
             (300, "pad-1"),
         ] {
             journal.push(
-                ms,
-                JournalRecord::RaceEvent {
+                Stamp(ms),
+                JournalEntry::RaceEvent {
                     pad_id: pad.to_owned(),
                     name: LapEvent::Fault,
                 },
             );
         }
         // Половинчатый интервал: 200 входит, 300 — нет.
-        assert_eq!(journal.remove("pad-1", 100, 300), 2);
-        let rest: Vec<(u64, &str)> = journal
-            .iter_ms()
+        assert_eq!(journal.remove("pad-1", Stamp(100), Stamp(300)), 2);
+        let rest: Vec<(Stamp, &str)> = journal
+            .iter()
             .filter_map(|(ms, e)| match e {
-                JournalRecord::RaceEvent { pad_id, .. } => Some((ms, pad_id.as_str())),
+                JournalEntry::RaceEvent { pad_id, .. } => Some((ms, pad_id.as_str())),
                 _ => None,
             })
             .collect();
-        assert_eq!(rest, vec![(200, "pad-2"), (300, "pad-1")]);
+        assert_eq!(rest, vec![(Stamp(200), "pad-2"), (Stamp(300), "pad-1")]);
     }
 
     #[test]
     fn journal_push_inserts_by_time() {
         let mut journal = sample_journal();
-        journal.push(500, JournalRecord::RaceStarted {});
-        journal.push(100, JournalRecord::RecordStarted {});
-        journal.push(300, JournalRecord::RaceCountdown {});
-        journal.push(300, JournalRecord::RaceFinished { prematurely: false });
-        let marks: Vec<(u64, &str)> = journal
-            .iter_ms()
+        journal.push(Stamp(500), JournalEntry::RaceStarted {});
+        journal.push(Stamp(100), JournalEntry::RecordStarted {});
+        journal.push(Stamp(300), JournalEntry::RaceCountdown {});
+        journal.push(
+            Stamp(300),
+            JournalEntry::RaceFinished { prematurely: false },
+        );
+        let marks: Vec<(Stamp, &str)> = journal
+            .iter()
             .map(|(ms, e)| {
                 let mark = match e {
-                    JournalRecord::RecordStarted {} => "rec",
-                    JournalRecord::RaceCountdown {} => "cd",
-                    JournalRecord::RaceStarted {} => "go",
-                    JournalRecord::RaceFinished { .. } => "finish",
+                    JournalEntry::RecordStarted {} => "rec",
+                    JournalEntry::RaceCountdown {} => "cd",
+                    JournalEntry::RaceStarted {} => "go",
+                    JournalEntry::RaceFinished { .. } => "finish",
                     _ => "?",
                 };
                 (ms, mark)
@@ -893,11 +991,11 @@ mod tests {
         assert_eq!(
             marks,
             vec![
-                (0, "rec"),
-                (100, "rec"),
-                (300, "cd"),
-                (300, "finish"),
-                (500, "go"),
+                (Stamp::ZERO, "rec"),
+                (Stamp(100), "rec"),
+                (Stamp(300), "cd"),
+                (Stamp(300), "finish"),
+                (Stamp(500), "go"),
             ]
         );
     }
@@ -926,36 +1024,36 @@ mod tests {
     #[test]
     fn race_clip_window_in_file_positions() {
         let events = vec![
-            (20_000, JournalRecord::RecordStarted {}),
+            (20_000, JournalEntry::RecordStarted {}),
             (
                 20_500,
-                JournalRecord::VideoAttached {
+                JournalEntry::VideoAttached {
                     camera_id: "camera-1".to_owned(),
                     filename: "f-camera-1-mjpeg.mkv".to_owned(),
                 },
             ),
-            (23_000, JournalRecord::RaceCountdown {}),
-            (23_500, JournalRecord::RaceStarted {}),
-            (60_000, JournalRecord::RecordFinished {}),
-            (68_000, JournalRecord::RaceFinished { prematurely: true }),
+            (23_000, JournalEntry::RaceCountdown {}),
+            (23_500, JournalEntry::RaceStarted {}),
+            (60_000, JournalEntry::RecordFinished {}),
+            (68_000, JournalEntry::RaceFinished { prematurely: true }),
         ];
-        let clip = RaceClip::from_events(events.iter().map(|(ms, e)| (*ms, e)));
+        let clip = RaceClip::from_events(events.iter().map(|(ms, e)| (Stamp(*ms), e)));
         assert!(!clip.is_empty());
         // Полоска — окно записи; файл лежит на нём со сдвигом.
-        assert_eq!(clip.recording, Some((20_000, 60_000)));
+        assert_eq!(clip.recording, Some(Interval::new(Stamp(20_000), Stamp(60_000))));
         assert_eq!(clip.files.len(), 1);
         assert_eq!(
             clip.files["camera-1"],
-            ("f-camera-1-mjpeg.mkv".to_owned(), 20_500)
+            ("f-camera-1-mjpeg.mkv".to_owned(), Stamp(20_500))
         );
         // Отсчёт собран: курсор DVR встаёт на него.
-        assert_eq!(clip.race_countdown_ms, Some(23_000));
+        assert_eq!(clip.race_countdown, Some(Stamp(23_000)));
         // Экстент журнала — финиш гонки.
-        assert_eq!(clip.end_ms(), Some(68_000));
+        assert_eq!(clip.end(), Some(Stamp(68_000)));
         // Границы гонки — в журнальном домене (файловые позиции — на
         // стороне плееров: ноль файла = первый кадр).
-        assert_eq!(clip.race_started_ms, Some(23_500));
-        assert_eq!(clip.race_finished_ms, Some(68_000));
+        assert_eq!(clip.race_started, Some(Stamp(23_500)));
+        assert_eq!(clip.race_finished, Some(Stamp(68_000)));
     }
 }
 

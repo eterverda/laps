@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use super::laps::{LapTone, lap_glyph, paint_event_cell};
 use crate::gui::ruler::{CELL_SIZE, cell_y};
-use crate::model::flight::LapEvent;
+use crate::model::flight::{Interval, LapEvent, Stamp};
 
 /// База позиционного шага по тапу (клик): тап мотает на
 /// speed × SEEK_TAP файла (10x → 1 с).
@@ -508,22 +508,22 @@ impl HScroll {
 pub fn show_events(
     ui: &mut egui::Ui,
     timeline_rect: egui::Rect,
-    start: u64,
-    span: u64,
-    pos: u64,
-    events: &[(u64, LapEvent)],
-    current: Option<u64>,
-    selected: Option<u64>,
+    window: Interval,
+    pos: Stamp,
+    events: &[(Stamp, LapEvent)],
+    current: Option<Stamp>,
+    selected: Option<Stamp>,
     flash: (i64, i64),
-) -> Option<u64> {
+) -> Option<Stamp> {
     if events.is_empty() {
         return None;
     }
+    let span = window.span_ms().max(1);
     let row = egui::Rect::from_min_max(
         egui::pos2(timeline_rect.left(), timeline_rect.top() - cell_y(1) / 2.0),
         egui::pos2(timeline_rect.right(), timeline_rect.top() + cell_y(1) / 2.0),
     );
-    let mut order: Vec<(u64, LapEvent)> = events
+    let mut order: Vec<(Stamp, LapEvent)> = events
         .iter()
         .rev()
         .take_while(|(at, _)| current.is_none_or(|c| *at > c))
@@ -535,10 +535,11 @@ pub fn show_events(
     let (before, after) = flash;
     let mut clicked = None;
     for (at, event) in &order {
-        if !(*at >= start && *at <= start + span) {
+        let at_off = at.ms_since(window.from);
+        if !(at_off >= 0 && at_off <= span as i64) {
             continue;
         }
-        let frac = (*at - start) as f32 / span as f32;
+        let frac = at_off as f32 / span as f32;
         let center = egui::pos2(
             timeline_rect.left() + frac * timeline_rect.width(),
             row.center().y,
@@ -547,7 +548,7 @@ pub fn show_events(
         // по центру (суб-клетно).
         let rect = egui::Rect::from_center_size(center, CELL_SIZE).expand2(egui::vec2(6.0, -2.0));
         let highlighted = {
-            let d = pos as i64 - *at as i64;
+            let d = pos.ms_since(*at);
             d >= before && d < after
         };
         paint_event_cell(

@@ -10,7 +10,7 @@ use crate::driver::audio::{Audio, Sound};
 use crate::driver::camera::Recorder;
 use crate::driver::dvr::{RecordParams, RecordState};
 use crate::driver::keyboard::KeyPressed;
-use crate::model::flight::{Journal, JournalRecord, LapEvent, LapLine};
+use crate::model::flight::{Journal, JournalEntry, LapEvent, LapLine, Stamp};
 use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
 use crate::service::key_matcher::{KeyMatch, KeyMatcher};
@@ -165,7 +165,7 @@ struct RaceCore {
     /// Отложенные события (REC-on и VideoAttached головы до старта
     /// гонки): пишутся в журнал в момент старта гонки, при отмене —
     /// выбрасываются.
-    rec_deferred: Vec<(u64, JournalRecord)>,
+    rec_deferred: Vec<(Stamp, JournalEntry)>,
     /// Последнее известное first_frame_at по камерам (edge-детект).
     rec_seen: HashMap<String, Option<Instant>>,
     /// Гонка состоялась (Running или дальше): отличает финиш после гонки
@@ -178,7 +178,7 @@ struct RaceCore {
     lap_started_at: HashMap<String, Instant>,
     /// pad_id → события текущего круга (fault/correct с последнего Lap):
     /// живут в дистиляте `Current`, журнал их хранит сам.
-    lap_events: HashMap<String, Vec<(u64, LapEvent)>>,
+    lap_events: HashMap<String, Vec<(Stamp, LapEvent)>>,
     /// Матчер клавиатурных биндингов: бинды падов из сетапа + глобальная
     /// таблица (цифры — активный пад, Space — lap активного). Матчер
     /// чистый: активный пад — состояние ядра, матчится с ним как с
@@ -229,16 +229,19 @@ impl RaceCore {
             active_pad,
         };
         core.rec_deferred
-            .push((core.ms(now), JournalRecord::RecordStarted {}));
+            .push((core.stamp(now), JournalEntry::RecordStarted {}));
         let effects = vec![Effect::Record {
             sessions: core.start_sessions(),
         }];
         (core, effects)
     }
 
-    /// Метка мс от нуля журнала.
-    fn ms(&self, at: Instant) -> u64 {
-        at.saturating_duration_since(self.started).as_millis() as u64
+    /// Метка «этот момент» по оси журнала: часы → мс от нуля журнала →
+    /// сдвиг от `record_started()` (ноль оси наружу не торчит — вход в
+    /// домен только здесь).
+    fn stamp(&self, at: Instant) -> Stamp {
+        let offset_ms = at.saturating_duration_since(self.started).as_millis() as u64;
+        self.journal.record_started().plus_ms(offset_ms as i64)
     }
 
     pub fn phase(&self) -> RaceStage {
@@ -279,7 +282,7 @@ impl RaceCore {
                 // писатель (поток-обёртка) снапшотом на этом же тике.
                 self.flush_rec_deferred();
                 self.journal
-                    .push(self.ms(start_at), JournalRecord::RaceStarted {});
+                    .push(self.stamp(start_at), JournalEntry::RaceStarted {});
                 self.phase = RaceStage::Running { start_at };
                 self.raced = true;
                 Vec::new()
@@ -288,8 +291,8 @@ impl RaceCore {
                 let elapsed = now.saturating_duration_since(start_at);
                 if self.rules.duration.is_some_and(|limit| elapsed >= limit) {
                     self.journal.push(
-                        self.ms(now),
-                        JournalRecord::RaceFinished { prematurely: false },
+                        self.stamp(now),
+                        JournalEntry::RaceFinished { prematurely: false },
                     );
                     self.phase = RaceStage::After { race: elapsed };
                     vec![Effect::Sound(BUZZER)]
@@ -336,10 +339,10 @@ impl RaceCore {
             return None; // вне гонки судейские сигналы игнорируем
         }
         let pad = pad.clone();
-        let ms = self.ms(now);
+        let at = self.stamp(now);
         self.journal.push(
-            ms,
-            JournalRecord::RaceEvent {
+            at,
+            JournalEntry::RaceEvent {
                 pad_id: pad.clone(),
                 name: *event,
             },
@@ -351,7 +354,7 @@ impl RaceCore {
             self.lap_events
                 .entry(pad.clone())
                 .or_default()
-                .push((ms, *event));
+                .push((at, *event));
         }
         Some(matched)
     }
@@ -367,7 +370,7 @@ impl RaceCore {
     pub fn all_laps(
         &self,
         now: Instant,
-    ) -> Vec<(String, Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>)> {
+    ) -> Vec<(String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>)> {
         self.journal
             .header()
             .pads
@@ -378,12 +381,16 @@ impl RaceCore {
 
     /// Дистилят кругов пэда: строки журнала плюс текущий круг, пока
     /// гонка идёт (время GUI считает сам по `since`).
-    pub fn laps(&self, pad_id: &str, now: Instant) -> Vec<(u64, LapLine, Vec<(u64, LapEvent)>)> {
+    pub fn laps(
+        &self,
+        pad_id: &str,
+        now: Instant,
+    ) -> Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)> {
         let mut lines = self.journal.lap_infos(pad_id);
         if let RaceStage::Running { start_at } = self.phase {
             let since = self.lap_started_at.get(pad_id).copied().unwrap_or(start_at);
             let events = self.lap_events.get(pad_id).cloned().unwrap_or_default();
-            lines.push((self.ms(now), LapLine::Current { since }, events));
+            lines.push((self.stamp(now), LapLine::Current { since }, events));
         }
         lines
     }
@@ -408,8 +415,8 @@ impl RaceCore {
             RaceStage::Running { .. } => {
                 // REC гасит запись посреди гонки — гонка финиширует здесь.
                 self.journal.push(
-                    self.ms(now),
-                    JournalRecord::RaceFinished { prematurely: false },
+                    self.stamp(now),
+                    JournalEntry::RaceFinished { prematurely: false },
                 );
                 self.finish_recording(now);
                 self.phase = RaceStage::Finished;
@@ -442,7 +449,7 @@ impl RaceCore {
             RaceStage::Countdown { .. } => {
                 // Отмена: отложенный отсчёт не состоялся — выбрасываем.
                 self.rec_deferred
-                    .retain(|(_, ev)| !matches!(ev, JournalRecord::RaceCountdown {}));
+                    .retain(|(_, ev)| !matches!(ev, JournalEntry::RaceCountdown {}));
                 self.phase = RaceStage::Before;
                 vec![Effect::CancelAudio]
             }
@@ -450,8 +457,8 @@ impl RaceCore {
                 // Финиш кнопкой — гудок, запись хвоста продолжается.
                 let race = now.saturating_duration_since(start_at);
                 self.journal.push(
-                    self.ms(now),
-                    JournalRecord::RaceFinished { prematurely: true },
+                    self.stamp(now),
+                    JournalEntry::RaceFinished { prematurely: true },
                 );
                 self.phase = RaceStage::After { race };
                 vec![Effect::Sound(BUZZER)]
@@ -467,8 +474,8 @@ impl RaceCore {
         match self.phase {
             RaceStage::Running { .. } => {
                 self.journal.push(
-                    self.ms(now),
-                    JournalRecord::RaceFinished { prematurely: true },
+                    self.stamp(now),
+                    JournalEntry::RaceFinished { prematurely: true },
                 );
                 self.finish_recording(now);
                 vec![
@@ -502,7 +509,7 @@ impl RaceCore {
             }
         }
         self.journal
-            .push(self.ms(now), JournalRecord::RecordFinished {});
+            .push(self.stamp(now), JournalEntry::RecordFinished {});
     }
 
     /// Свежий first_frame_at камеры из поллинга record_state. Новое
@@ -525,22 +532,22 @@ impl RaceCore {
             log::warn!("flight: first frame of {camera_id} without pending filename");
             return;
         };
-        let event = JournalRecord::VideoAttached {
+        let event = JournalEntry::VideoAttached {
             camera_id: camera_id.to_owned(),
             filename,
         };
         if self.phase().race_started() {
-            self.journal.push(self.ms(at), event);
+            self.journal.push(self.stamp(at), event);
         } else {
-            self.rec_deferred.push((self.ms(at), event));
+            self.rec_deferred.push((self.stamp(at), event));
         }
     }
 
     /// Отложенные события (запись головы до старта гонки) — в журнал
     /// (момент старта гонки, метки исходные, порядок хронологический).
     fn flush_rec_deferred(&mut self) {
-        for (ms, event) in mem::take(&mut self.rec_deferred) {
-            self.journal.push(ms, event);
+        for (at, event) in mem::take(&mut self.rec_deferred) {
+            self.journal.push(at, event);
         }
     }
 
@@ -548,9 +555,9 @@ impl RaceCore {
     /// до гонки) не плодит дубликаты — старый выбрасываем.
     fn defer_countdown(&mut self, now: Instant) {
         self.rec_deferred
-            .retain(|(_, ev)| !matches!(ev, JournalRecord::RaceCountdown {}));
+            .retain(|(_, ev)| !matches!(ev, JournalEntry::RaceCountdown {}));
         self.rec_deferred
-            .push((self.ms(now), JournalRecord::RaceCountdown {}));
+            .push((self.stamp(now), JournalEntry::RaceCountdown {}));
     }
 
     fn countdown_delay(&self) -> Duration {
@@ -854,7 +861,7 @@ mod tests {
         let current = lines.last().expect("current");
         assert_eq!(
             current.2,
-            vec![(25_000, LapEvent::Fault)],
+            vec![(core.journal.record_started().plus_ms(25_000), LapEvent::Fault)],
             "fault у текущего круга"
         );
         // Следующий lap открывает новый круг: события обнулились.
@@ -892,22 +899,23 @@ mod tests {
     /// События журнала как (ms, короткая метка) для asserts.
     fn journal_marks(core: &RaceCore) -> Vec<(u64, &'static str)> {
         core.journal
-            .iter_ms()
-            .map(|(ms, event)| {
-                let mark = match event {
-                    JournalRecord::RecordStarted {} => "rec",
-                    JournalRecord::RecordFinished {} => "rec-end",
-                    JournalRecord::VideoAttached { .. } => "file",
-                    JournalRecord::RaceCountdown {} => "cd",
-                    JournalRecord::RaceStarted {} => "go",
-                    JournalRecord::RaceFinished { prematurely } => {
+            .iter()
+            .map(|(at, entry)| {
+                let ms = at.ms_since(core.journal.record_started()) as u64;
+                let mark = match entry {
+                    JournalEntry::RecordStarted {} => "rec",
+                    JournalEntry::RecordFinished {} => "rec-end",
+                    JournalEntry::VideoAttached { .. } => "file",
+                    JournalEntry::RaceCountdown {} => "cd",
+                    JournalEntry::RaceStarted {} => "go",
+                    JournalEntry::RaceFinished { prematurely } => {
                         if *prematurely {
                             "finish-user"
                         } else {
                             "finish-auto"
                         }
                     }
-                    JournalRecord::RaceEvent { .. } => "race-event",
+                    JournalEntry::RaceEvent { .. } => "race-event",
                 };
                 (ms, mark)
             })
@@ -1244,9 +1252,13 @@ pub enum Notice {
     BackToIdle,
     /// Дистилят кругов пэда после RaceEvent: строки журнала + текущий
     /// круг, пока гонка идёт (GUI считает бегущее время по `since`).
+    /// Дистилят кругов пэда после RaceEvent: строки журнала + текущий
+    /// круг, пока гонка идёт (GUI считает бегущее время по `since`).
+    /// `at` — метка «сейчас» по оси журнала (курсор кругов в эфире).
     Laps {
         pad_id: String,
-        lines: Vec<(u64, LapLine, Vec<(u64, LapEvent)>)>,
+        lines: Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>,
+        at: Stamp,
     },
     /// Активный пад переключён (глобальные клавиши 1–8): новое
     /// состояние, None — деактивирован.
@@ -1382,6 +1394,7 @@ impl Race {
                                     let _ = notice_tx.try_send(Notice::Laps {
                                         pad_id: pad.clone(),
                                         lines: core.laps(&pad, now),
+                                        at: core.stamp(now),
                                     });
                                     wake();
                                     if event == LapEvent::Lap {
@@ -1435,8 +1448,10 @@ impl Race {
                     // сменяется застывшим незакрытым — свежий дистилят
                     // его перезаписывает.
                     if matches!(air, RaceStage::Running { .. }) || was_running {
-                        for (pad_id, lines) in core.all_laps(Instant::now()) {
-                            let _ = notice_tx.try_send(Notice::Laps { pad_id, lines });
+                        let now = Instant::now();
+                        let at = core.stamp(now);
+                        for (pad_id, lines) in core.all_laps(now) {
+                            let _ = notice_tx.try_send(Notice::Laps { pad_id, lines, at });
                         }
                     }
                 }

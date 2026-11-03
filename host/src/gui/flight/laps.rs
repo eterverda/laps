@@ -7,7 +7,7 @@ use super::{FrameContents, Selection};
 use crate::gui::measure_text;
 use crate::gui::ruler::{CELL_SIZE, cell_x, cell_y};
 use crate::gui::style;
-use crate::model::flight::{LapEvent, LapLine};
+use crate::model::flight::{LapEvent, LapLine, Stamp};
 use std::time::Duration;
 
 /// Событие в колонке кругов занимает 2 колонки сетки: глиф (1) и
@@ -25,7 +25,7 @@ pub fn show(
     ui: &mut egui::Ui,
     frame: &FrameContents,
     rects: &[egui::Rect],
-) -> Option<(String, u64)> {
+) -> Option<(String, Stamp)> {
     let mut lap_click = None;
     for (i, second) in rects.iter().enumerate() {
         let Some(pad) = frame.pads.get(i) else {
@@ -125,8 +125,10 @@ pub fn show(
                         if response.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        if response.clicked() {
-                            lap_click = Some((pad_id.clone(), cell.seek));
+                        if response.clicked()
+                            && let Some(seek) = cell.seek
+                        {
+                            lap_click = Some((pad_id.clone(), seek));
                         }
                     }
                 }
@@ -148,10 +150,10 @@ pub fn show(
                 LapTone::Future
             };
             let cells = [
-                LapCell::plain(String::new(), tone, 0),
-                LapCell::plain(String::new(), tone, 0),
-                LapCell::plain("HS", tone, 0),
-                LapCell::plain(lap_time(Duration::ZERO, 6), tone, 0),
+                LapCell::plain(String::new(), tone, None),
+                LapCell::plain(String::new(), tone, None),
+                LapCell::plain("HS", tone, None),
+                LapCell::plain(lap_time(Duration::ZERO, 6), tone, None),
             ];
             let galley = ui.painter().layout_job(lap_row_job(&cells));
             ui.painter().galley(
@@ -184,12 +186,12 @@ struct LapCell {
     strike: bool,
     highlight: bool,
     active: bool,
-    seek: u64,
+    seek: Option<Stamp>,
 }
 
 impl LapCell {
     /// Ячейка без зачёркивания и подсветок — таких большинство.
-    fn plain(text: impl Into<String>, tone: LapTone, seek: u64) -> Self {
+    fn plain(text: impl Into<String>, tone: LapTone, seek: Option<Stamp>) -> Self {
         Self {
             text: text.into(),
             tone,
@@ -285,10 +287,10 @@ fn lap_event_cells(cells: &[LapCell]) -> &[LapCell] {
 /// с его кружком; текущий круг не завершён никогда), событие — до
 /// его метки. None — без раскраски (эфир: всё в прошлом).
 fn lap_table(
-    lines: &[(u64, LapLine, Vec<(u64, LapEvent)>)],
-    cursor: Option<u64>,
-    _race_start: u64,
-    active_ms: Option<u64>,
+    lines: &[(Stamp, LapLine, Vec<(Stamp, LapEvent)>)],
+    cursor: Option<Stamp>,
+    _race_start: Option<Stamp>,
+    active_ms: Option<Stamp>,
     flash: (i64, i64),
 ) -> Vec<Vec<LapCell>> {
     // Время строки; у текущего — бегущее (он участвует и в выборе
@@ -319,7 +321,7 @@ fn lap_table(
     } else {
         format!("{successes})")
     };
-    let future = |at: u64| cursor.is_some_and(|c| c < at);
+    let future = |at: Stamp| cursor.is_some_and(|c| c < at);
     let mut rows = Vec::new();
     for (end, line, events) in lines {
         // Имя — из дистиллятора целиком (HS без скобки, «1)» с ней).
@@ -338,9 +340,9 @@ fn lap_table(
                 LapTone::Active
             }
         };
-        let highlighted = |at: u64| {
+        let highlighted = |at: Stamp| {
             cursor.is_some_and(|c| {
-                let d = c as i64 - at as i64;
+                let d = c.ms_since(at);
                 d >= flash.0 && d < flash.1
             })
         };
@@ -357,19 +359,21 @@ fn lap_table(
                 strike: false,
                 highlight: highlighted(*at),
                 active: active_ms == Some(*at),
-                seek: *at,
+                seek: Some(*at),
             })
             .collect();
         let finished = !matches!(line, LapLine::Current { .. } | LapLine::Unfinished { .. });
-        let done_at = if finished { *end } else { u64::MAX };
-        cells.push(LapCell::plain(name, tone(future(done_at)), *end));
+        // Имя и время белеют по метке конца круга (одновременно с его
+        // кружком); у незавершённого конца нет — серые всегда.
+        let done_tone = if finished {
+            tone(future(*end))
+        } else {
+            LapTone::Future
+        };
+        cells.push(LapCell::plain(name, done_tone, Some(*end)));
         cells.push(LapCell {
             strike: matches!(line, LapLine::Fail { .. }),
-            ..LapCell::plain(
-                lap_time(line.duration(), time_width),
-                tone(future(done_at)),
-                *end,
-            )
+            ..LapCell::plain(lap_time(line.duration(), time_width), done_tone, Some(*end))
         });
         rows.push(cells);
     }

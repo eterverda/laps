@@ -211,9 +211,16 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 - One file per recording start; **no segment rotation** (documented gap)
 - Стем имён файлов — `date_time` первого события журнала (`model/flight.rs`, fn `file_stem`): журнал `<stem>.yaml` в `captures/`, видео `<stem>-<camera_id>-mjpeg.<ext>`; повторная запись той же камеры в полёте получает суффикс `-r2`, `-r3`, … (стем полный приходит снаружи через `RecordParams.stem`; был `timestamp_prefix()` — удалён)
 - Журнал полёта (`model::flight::Journal` — чистые данные: заголовок
-  `JournalHeader` первым документом без метки + записи `Vec<(ms,
-JournalRecord)>`): yaml-стрим `captures/<stem>.yaml`, документ на запись
-  (`{ms, <variant>: …}`), разделители `---`. Файлом журнал не владеет:
+  `JournalHeader` первым документом без метки + записи `Vec<(Stamp,
+JournalEntry)>`): метки — непрозрачный `Stamp` (мс от нуля журнала).
+  Ось принадлежит журналу: метки рождаются только сдвигом от
+  `Journal::record_started()` (`plus_ms`), сырой мс в домен не входит и
+  не выходит (`ms_since` — знаковая разность; `Stamp::ZERO` — внутреннее
+  дело журнала). Интервалы пары меток — `Interval { from, to }`
+  (полуинтервал: from входит, to нет; `span_ms`, `clamp`). yaml-стрим
+  `captures/<stem>.yaml` ходит в мс-оффсетах (конверсия на границе
+  parse/serialize), документ на запись (`{ms, <variant>: …}`), разделители
+  `---`. Файлом журнал не владеет:
   запись — методы `snapshot` (полный стрим, tmp+rename: первое создание
   и перезапись после правок) и `append_to` (copy-append-rename новых
   документов, счётчик дописанных держит писатель). В эфире

@@ -18,6 +18,10 @@ use std::io::Result as IoResult;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
+/// Buffers requested from the driver for the mmap ring. The granted
+/// count (req.count after REQBUFS) is what we actually map and queue.
+const BUFFER_COUNT: u32 = 4;
+
 pub struct V4l2Capture;
 
 pub struct V4l2Session {
@@ -649,7 +653,7 @@ fn open_session(path: &str, config: &CameraConfig) -> IoResult<V4l2Session> {
         let negotiated_pix = unsafe { fmt.fmt.pix };
 
         let mut req = RequestBuffers {
-            count: 4,
+            count: BUFFER_COUNT,
             typ: CAPTURE,
             memory: V4L2_MEMORY_MMAP,
             capabilities: 0,

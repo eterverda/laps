@@ -5,7 +5,7 @@
 
 use super::{FrameContents, Selection};
 use crate::gui::measure_text;
-use crate::gui::ruler::{CELL_SIZE, cell_x, cell_y};
+use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::gui::style;
 use crate::model::flight::{LapEvent, LapLine, Stamp};
 use std::time::Duration;
@@ -31,12 +31,9 @@ pub fn show(
         let Some(pad) = frame.pads.get(i) else {
             continue;
         };
-        // Якоря строки фита: сколько строк занято и резерв колонки
-        // событий.
-        let mut used_rows = 0usize;
-        let mut feat_cells = LAP_EVENT_COLS;
         if !pad.laps.is_empty() {
-            let capacity = (second.height() / cell_y(1)).max(0.0) as usize;
+            // Две нижние строки занимает полоса места.
+            let capacity = (second.height() / cell_y(1) - 2.0).max(0.0) as usize;
             let pad_id = &pad.pad_id;
             let active_ms = match &frame.laps_active {
                 Selection::Event(pad, ms) if pad == pad_id => Some(*ms),
@@ -51,7 +48,6 @@ pub fn show(
                 frame.holeshot_enabled,
             );
             let from = rows.len().saturating_sub(capacity);
-            used_rows = rows.len() - from;
             // Без клипа: по вертикали строки влезают по
             // построению (capacity), обводки подсветки
             // ничем не обрезаются, а широкая строка пусть
@@ -70,7 +66,6 @@ pub fn show(
                 .max()
                 .unwrap_or(0)
                 .max(1);
-            feat_cells = LAP_EVENT_COLS * max_events as isize;
             for (row, cells) in rows[from..].iter().enumerate() {
                 let full_row = from + row;
                 let pos = egui::pos2(
@@ -94,8 +89,7 @@ pub fn show(
                     } else {
                         measure_text(ui.ctx(), style::FONT_REGULAR, &cell.text)
                     };
-                    let rect = egui::Rect::from_min_size(egui::pos2(x, pos.y), size)
-                        .expand2(egui::vec2(6.0, -2.0));
+                    let rect = egui::Rect::from_min_size(egui::pos2(x, pos.y), size);
                     rects.push(rect);
                     x += size.x + cell_x(1);
                     if i + 1 == events_len {
@@ -124,8 +118,9 @@ pub fn show(
                     // кружок: свой у события,
                     // предыдущий у имени/времени.
                     if frame.laps_clickable && !cell.text.is_empty() {
+                        // Клик-зона на полсимвола шире ректа ячейки.
                         let response = ui.interact(
-                            *rect,
+                            rect.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)),
                             egui::Id::unique(("lap", i, full_row, ci)),
                             egui::Sense::click(),
                         );
@@ -173,40 +168,63 @@ pub fn show(
                 galley,
                 style::PAD_TIMER_ACTIVE,
             );
-            used_rows = 1;
         }
-        // Фит: под кругами, отступ в строку, лимонадным. «N/ время»
-        // в колонках кругов; при нуле — «0/ -.---».
-        if let Some(feat) = &pad.feat {
-            let y = second.top() + cell_y((used_rows + 1) as isize);
-            let name = format!("{}/", feat.count);
-            let mut time = if feat.count > 0 {
+        // Место — планка у правого нижнего края зоны: 2 клетки
+        // поля, место двойным шрифтом, 2 клетки поля; цвет —
+        // медаль спорного места (большего в диапазоне), текст
+        // чёрный. Подсчёт — у левого края зоны (2 клетки поля),
+        // пластиковым, база у подсчёта и места общая.
+        if let (Some(feat), Some((lo, hi))) = (&pad.feat, pad.place) {
+            let place_text = if lo == hi {
+                format!("{lo}")
+            } else {
+                format!("{lo}-{hi}")
+            };
+            let place_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, &place_text).x;
+            // Правый край планки — на прежнем месте экрана: зона
+            // сузилась на клетку, якорь сдвинут на клетку вправо.
+            let plate: egui::Rect = second
+                .right_bottom()
+                .into_ruler()
+                .translate(cell_x(1) - (place_w + cell_x(3)), -cell_y(2))
+                .extrude(place_w + cell_x(2), cell_y(2))
+                .into();
+            // Полоса цвета места во всю ширину зоны (= вьюфайндер)
+            // на уровне верха планки, высотой четверть клетки.
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(second.left(), plate.top()),
+                egui::pos2(second.right(), plate.top() + cell_y(1) / 4.0),
+            );
+            ui.painter().rect_filled(
+                bar.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)),
+                0.0,
+                place_color(hi),
+            );
+            ui.painter().rect_filled(
+                plate.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)),
+                0.0,
+                place_color(hi),
+            );
+            ui.painter().text(
+                egui::pos2(plate.left() + cell_x(1), plate.bottom()),
+                egui::Align2::LEFT_BOTTOM,
+                &place_text,
+                style::FONT_REGULAR_X2,
+                egui::Color32::BLACK,
+            );
+            let count = format!("{}/", feat.count);
+            let time = if feat.count > 0 {
                 lap_time(Duration::from_millis(feat.raw_time_ms()), 6)
             } else {
                 " -.---".to_owned()
             };
-            // Место в гонке — пробел и скобки после результата;
-            // ничья — диапазоном ([1-2]).
-            if let Some((lo, hi)) = pad.place {
-                time += &if lo == hi {
-                    format!(" [{lo}]")
-                } else {
-                    format!(" [{lo}-{hi}]")
-                };
-            }
-            // Цвет — в TextFormat: galley(.., color) лишь fallback.
-            let format = egui::TextFormat {
-                font_id: style::FONT_REGULAR,
-                color: style::FEAT_LEMON,
-                ..Default::default()
-            };
-            let mut job = egui::text::LayoutJob::default();
-            job.append(&name, 0.0, format.clone());
-            job.append(" ", 0.0, format.clone());
-            job.append(&time, 0.0, format);
-            let galley = ui.painter().layout_job(job);
-            ui.painter()
-                .galley(egui::pos2(second.left() + cell_x(feat_cells), y), galley, style::FEAT_LEMON);
+            ui.painter().text(
+                egui::pos2(plate.left() - cell_x(2), plate.bottom() - cell_y(1) / 4.0),
+                egui::Align2::RIGHT_BOTTOM,
+                format!("{count} {time}"),
+                style::FONT_REGULAR,
+                style::TRANSPORT_ACTIVE,
+            );
         }
     }
     lap_click
@@ -261,7 +279,9 @@ pub fn lap_glyph(event: &LapEvent) -> char {
 
 /// Живопись ячейки события (глиф): кислотная заливка вспышки (глиф
 /// чёрный поверх неё), голубая обводка выделения. Общая для таблицы
-/// кругов и строки событий над таймлайном.
+/// кругов и строки событий над таймлайном. Обводка и подсветка
+/// опираются на rect клетки: на полсимвола шире в каждую сторону и
+/// на 2 px меньше со всех сторон, без скругления.
 pub fn paint_event_cell(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -270,8 +290,19 @@ pub fn paint_event_cell(
     highlighted: bool,
     selected: bool,
 ) {
+    if selected {
+        painter.rect_filled(
+            rect.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)).shrink(2.0),
+            0.0,
+            egui::Color32::BLACK,
+        );
+    }
     if highlighted {
-        painter.rect_filled(rect.shrink(1.0), 4.0, style::LAP_FLASH);
+        painter.rect_filled(
+            rect.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)).shrink(2.0),
+            0.0,
+            style::LAP_FLASH,
+        );
     }
     let color = if highlighted {
         egui::Color32::BLACK
@@ -282,6 +313,22 @@ pub fn paint_event_cell(
             LapTone::Future => style::LAP_FUTURE,
         }
     };
+    if selected {
+        // Чёрный 1 px внутрь, голубой 2 px наружу (итого 3).
+        let outline = rect.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)).shrink(2.0);
+        painter.rect_stroke(
+            outline,
+            0.0,
+            egui::Stroke::new(2.0, egui::Color32::BLACK),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            outline,
+            0.0,
+            egui::Stroke::new(3.0, style::LAP_SELECTION),
+            egui::StrokeKind::Outside,
+        );
+    }
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -289,23 +336,6 @@ pub fn paint_event_cell(
         style::FONT_REGULAR,
         color,
     );
-    if selected {
-        // Обводка выделения: голубой контур наружу + чёрный внутрь
-        // от увеличенного прямоугольника; подсветка выше — без вариантов.
-        let outline = rect.expand(1.0);
-        painter.rect_stroke(
-            outline,
-            4.0,
-            egui::Stroke::new(3.0, style::LAP_SELECTION),
-            egui::StrokeKind::Outside,
-        );
-        painter.rect_stroke(
-            outline,
-            4.0,
-            egui::Stroke::new(2.0, egui::Color32::BLACK),
-            egui::StrokeKind::Inside,
-        );
-    }
 }
 
 /// Ячейки событий строки: последние две ячейки — имя и время.
@@ -492,6 +522,17 @@ fn lap_row_job(cells: &[LapCell]) -> egui::text::LayoutJob {
         job.append(&cell.text, 0.0, format(cell, true));
     }
     job
+}
+
+/// Медаль планки места: по большему месту в диапазоне (спорное
+/// «1-2» — серебро).
+fn place_color(place: u32) -> egui::Color32 {
+    match place {
+        1 => style::PLACE_GOLD,
+        2 => style::PLACE_SILVER,
+        3 => style::PLACE_BRONZE,
+        _ => style::PLACE_GRAY,
+    }
 }
 
 /// Время круга. Порядок: рендер «как есть» (круг короче минуты — без

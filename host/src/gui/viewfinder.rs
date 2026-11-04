@@ -100,11 +100,12 @@ impl<'a> ViewfinderFrame<'a> {
             .extrude(0.0, cell_y(1))
             .into();
         ui.painter().text(
-            name_rect.left_top(),
+            // Имя пилота: пластиковым, на полсимвола ниже края.
+            name_rect.left_top() + egui::vec2(0.0, cell_y(1) / 4.0),
             egui::Align2::LEFT_TOP,
             self.name,
             style::FONT_REGULAR,
-            egui::Color32::WHITE,
+            style::TRANSPORT_ACTIVE,
         );
 
         contents(ui, viewfinder_rect);

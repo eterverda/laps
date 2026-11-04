@@ -546,7 +546,7 @@ pub fn show_events(
         );
         // Ячейка события — ровно клетка сетки, позиционирование —
         // по центру (суб-клетно).
-        let rect = egui::Rect::from_center_size(center, CELL_SIZE).expand2(egui::vec2(6.0, -2.0));
+        let rect = egui::Rect::from_center_size(center, CELL_SIZE);
         let highlighted = {
             let d = pos.ms_since(*at);
             d >= before && d < after
@@ -565,8 +565,9 @@ pub fn show_events(
         );
         // Клик — выделение события (+ seek, как по ячейке таблицы) —
         // хозяина. События строки — пада из выделения.
+        // Клик-зона на полсимвола шире ректа ячейки.
         let response = ui.interact(
-            rect,
+            rect.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)),
             egui::Id::unique(("tl_event", *at)),
             egui::Sense::click(),
         );

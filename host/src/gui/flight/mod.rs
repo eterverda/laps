@@ -1125,8 +1125,7 @@ impl Flight {
                     .collect()
             })
             .unwrap_or_default();
-        let mut pads =
-            Self::prepare_dvr_pads(d, setup, assignments, selection_pad.as_deref(), alt);
+        let mut pads = Self::prepare_dvr_pads(d, setup, assignments, selection_pad.as_deref(), alt);
         Self::assign_places(&mut pads);
         let transport = TransportContents {
             rew: ButtonContents {
@@ -1375,8 +1374,8 @@ impl Flight {
                 }
 
                 // Зоны под вьюфайндерами: плейсхолдер под засечку
-                // (рамка) и круги (без рамки, на клетку шире
-                // вьюфайндера с каждой стороны). Рамки — до контента.
+                // (рамка) и круги (без рамки, шириной во вьюфайндер).
+                // Рамки — до контента.
                 let zones = pad_zones(ui, &column_geometry, viewfinder_cols, pads.len());
                 for (first, _) in &zones {
                     guidelines::dashed_rect(ui, *first);
@@ -1396,8 +1395,11 @@ impl Flight {
                     // выделяет пад, курсор не меняем. Ячейки кругов ниже —
                     // их клики приоритетнее в пересечении (регистрируются
                     // позже, egui: позднее = поверх).
+                    // Область пада — по зоне кругов (ширина
+                    // вьюфайндера): обводка симметрична относительно
+                    // центра колонки.
                     let content = egui::Rect::from_min_max(
-                        egui::pos2(first.left(), cell_y(TOP_BAR_ROWS + 1)),
+                        egui::pos2(second.left(), cell_y(TOP_BAR_ROWS + 1)),
                         second.right_bottom(),
                     );
                     let response =
@@ -1414,9 +1416,13 @@ impl Flight {
                     // обводки выделения, цвет тот же.
                     if frame.pads.get(i).is_some_and(|p| p.active) {
                         ui.painter().rect_stroke(
-                            // На клетку шире списка кругов.
-                            content.expand2(egui::vec2(32.0, 8.0)),
-                            3.0,
+                            // Ширина зоны кругов (= вьюфайндер),
+                            // +2 px со всех сторон; 3 px наружу, без
+                            // скругления.
+                            content
+                                .expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0))
+                                .expand(6.0),
+                            0.0,
                             egui::Stroke::new(3.0, style::LAP_ACCENT),
                             egui::StrokeKind::Outside,
                         );
@@ -2241,11 +2247,13 @@ fn pad_zones(
                 .into_ruler()
                 .extrude(w, cell_y(4))
                 .into();
-            // Список кругов — на клетку шире вьюфайндера с каждой
-            // стороны (рамки нет — ширина сама держит поле).
-            let second: egui::Rect = egui::pos2(x - cell_x(1), first.bottom() + cell_y(1))
+            // Список кругов — шириной во вьюфайндер.
+            let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
                 .into_ruler()
-                .extrude(w + cell_x(2), bottom.bottom_left().y - cell_y(2) - first.bottom())
+                .extrude(
+                    w,
+                    bottom.bottom_left().y - cell_y(2) - first.bottom(),
+                )
                 .into();
             (first, second)
         })

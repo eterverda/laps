@@ -51,6 +51,9 @@ pub const LAP_SELECTION: egui::Color32 = LAP_ACCENT;
 /// Вспышка свежего события у курсора: заливка цветом активной гонки.
 pub const LAP_FLASH: egui::Color32 = RACE_ACTIVE;
 
-/// Лимонадный жёлтый строки достижения (фита) под кругами: светлый,
-/// между белым и пластиковым айвори.
-pub const FEAT_LEMON: egui::Color32 = egui::Color32::from_rgb(0xF7, 0xED, 0x68);
+/// Медали полосы мест внизу списка кругов (фон двух нижних строк).
+/// Бронза и серый — потемнее (выкраски: docs/places-colors.html).
+pub const PLACE_GOLD: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xC9, 0x4C);
+pub const PLACE_SILVER: egui::Color32 = egui::Color32::from_rgb(0xC9, 0xCE, 0xD6);
+pub const PLACE_BRONZE: egui::Color32 = egui::Color32::from_rgb(0xCD, 0x7F, 0x32);
+pub const PLACE_GRAY: egui::Color32 = egui::Color32::from_rgb(0x7E, 0x84, 0x8D);

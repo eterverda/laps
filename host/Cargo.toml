@@ -15,7 +15,7 @@ jpeg-encoder = ["dep:jpeg-encoder"]
 bytemuck = { version = "1.25", features = ["extern_crate_alloc"] }
 clap = { version = "4.6", features = ["derive"] }
 dirs = "7"
-resvg = "0.48"
+resvg = "0.49"
 crossbeam-channel = "0.5"
 fixedbitset = "0.5"
 rodio = { version = "0.23", default-features = false, features = ["playback", "wav"] }

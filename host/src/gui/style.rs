@@ -50,3 +50,7 @@ pub const LAP_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x5A, 0xC1, 0xFE);
 pub const LAP_SELECTION: egui::Color32 = LAP_ACCENT;
 /// Вспышка свежего события у курсора: заливка цветом активной гонки.
 pub const LAP_FLASH: egui::Color32 = RACE_ACTIVE;
+
+/// Лимонадный жёлтый строки достижения (фита) под кругами: светлый,
+/// между белым и пластиковым айвори.
+pub const FEAT_LEMON: egui::Color32 = egui::Color32::from_rgb(0xF7, 0xED, 0x68);

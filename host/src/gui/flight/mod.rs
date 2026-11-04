@@ -26,7 +26,8 @@ use crate::gui::flight::scrub::{
 use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
 use crate::model::flight::{
-    Interval, Journal, JournalEntry, LapEvent, LapLine, RaceClip, Stamp, latest_journal,
+    Feat, Interval, Journal, JournalEntry, LapEvent, LapLine, RaceClip, Stamp, compute_feat,
+    feat_places, latest_journal,
 };
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
@@ -265,6 +266,12 @@ struct PadContents {
     /// текущий круг идёт последним (бегущее время считается рендером
     /// по `since`). Метки — для раскраски «ещё не случилось» серым.
     laps: Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>,
+    /// Достижение (фит) пада — строка под кругами. None — не
+    /// показывать (эфир без единого круга).
+    feat: Option<Feat>,
+    /// Место в гонке: (от, до) — диапазон при ничьей, равные —
+    /// одинаковое. None — фита нет, в гонке не участвует.
+    place: Option<(u32, u32)>,
 }
 
 /// Состояние одной кнопки для кадра. Иконки и цвета — часть вёрстки
@@ -452,9 +459,6 @@ impl Flight {
         }
         self.phase = Mode::Live(Live {
             race,
-            // Часы эфира: момент рождения + ноль оси журнала сессии.
-            // По ним GUI сам кадрит «сейчас» на оси (курсор кругов,
-            // вспышки) — без нотисов на каждое событие.
             rec_at: Instant::now(),
             axis_zero,
             laps: HashMap::new(),
@@ -705,6 +709,8 @@ impl Flight {
                     image,
                     res_badge,
                     laps: laps.get(pad_id).cloned().unwrap_or_default(),
+                    feat: None,
+                    place: None,
                 }
             })
             .collect()
@@ -723,7 +729,7 @@ impl Flight {
         let rec_on = state.rec_on();
         let race_on = state.countdown_active() || matches!(state, RaceStage::Running { .. });
         let now = Instant::now();
-        let pads = Self::prepare_pads(
+        let mut pads = Self::prepare_pads(
             &mut l.webcams,
             setup,
             assignments,
@@ -732,6 +738,19 @@ impl Flight {
             active_pad,
             alt,
         );
+        // Фиты: в эфире — с первого успешного круга; после финиша —
+        // всегда (рендер пишет «0/ -.---» при нуле).
+        let race_finished = matches!(state, RaceStage::After { .. } | RaceStage::Finished);
+        for pad in &mut pads {
+            let has_success = pad
+                .laps
+                .iter()
+                .any(|(_, line, _)| matches!(line, LapLine::Success { .. }));
+            if race_finished || has_success {
+                pad.feat = Some(compute_feat(l.rules.feat_kind, None, &pad.laps));
+            }
+        }
+        Self::assign_places(&mut pads);
         let fps_lines = if alt {
             Self::fps_lines(&l.webcams, shown_cameras, rec_on)
         } else {
@@ -806,9 +825,7 @@ impl Flight {
             timeline: None,
             // Курсор кругов: «сейчас» на оси журнала (часы GUI) — всё,
             // что было, активно; свежее событие вспыхивает на 100 мс.
-            laps_cursor: Some(
-                l.axis_zero.plus_ms(l.rec_at.elapsed().as_millis() as i64),
-            ),
+            laps_cursor: Some(l.axis_zero.plus_ms(l.rec_at.elapsed().as_millis() as i64)),
             laps_race_start: None,
             countdown,
             laps_active: Selection::None,
@@ -910,6 +927,8 @@ impl Flight {
         alt: bool,
     ) -> Vec<PadContents> {
         let clip = Some(RaceClip::from_events(d.journal.iter()));
+        let feat_kind = d.rules.feat_kind;
+        let race_start = d.journal.race_started();
         // Позиция транспорта переносится на ось журнала (нули совпадают:
         // REC родил и журнал, и шкалу сессии).
         let pos = d
@@ -971,10 +990,30 @@ impl Flight {
                     image,
                     res_badge,
                     // Скраббинг: чистый дистилят (без текущего круга).
+                    // Фит — всегда.
                     laps: d.journal.lap_infos(pad_id),
+                    feat: Some(compute_feat(
+                        feat_kind,
+                        race_start,
+                        &d.journal.lap_infos(pad_id),
+                    )),
+                    place: None,
                 }
             })
             .collect()
+    }
+
+    /// Места: сравнение фитов показанных падов (feat_places),
+    /// результат — в pad.place. Пады без фита не участвуют.
+    fn assign_places(pads: &mut [PadContents]) {
+        let feats: Vec<&Feat> = pads.iter().filter_map(|p| p.feat.as_ref()).collect();
+        let places = feat_places(&feats);
+        let mut places = places.into_iter();
+        for pad in pads {
+            if pad.feat.is_some() {
+                pad.place = places.next();
+            }
+        }
     }
 
     /// Кадр DVR: контент из плееров, транспорт, шкала, позиция.
@@ -1086,7 +1125,9 @@ impl Flight {
                     .collect()
             })
             .unwrap_or_default();
-        let pads = Self::prepare_dvr_pads(d, setup, assignments, selection_pad.as_deref(), alt);
+        let mut pads =
+            Self::prepare_dvr_pads(d, setup, assignments, selection_pad.as_deref(), alt);
+        Self::assign_places(&mut pads);
         let transport = TransportContents {
             rew: ButtonContents {
                 enabled: interactive,
@@ -1311,11 +1352,13 @@ impl Flight {
 
                 // Гайдлайны: вертикальные между колонками — от границы под
                 // хедером (2 клетки от верха) до границы над футером
-                // (4 клетки от низа). Горизонтальные линии не рисуем.
+                // (5 клеток от низа — на клетку короче блока кругов,
+                // не достают до его низа). Горизонтальные линии не
+                // рисуем.
                 if guidelines::ENABLED {
                     let screen = ui.max_rect().into_ruler();
                     let top = screen.collapse_top().translate(0.0, cell_y(2));
-                    let bottom = screen.collapse_bottom().translate(0.0, -cell_y(4));
+                    let bottom = screen.collapse_bottom().translate(0.0, -cell_y(5));
                     let stroke = egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x1e));
                     for i in 1..columns {
                         let x = cell_x(LEFT_MARGIN + segment * i);
@@ -1331,14 +1374,12 @@ impl Flight {
                     }
                 }
 
-                // Зоны колонок под вьюфайндерами: первый блок —
-                // плейсхолдер под засечку, второй — круги (таблицы
-                // рисует laps::show). Рамки — отдельным проходом ДО
-                // контента: всё, что рисуется внутри, поверх пунктира.
+                // Зоны под вьюфайндерами: плейсхолдер под засечку
+                // (рамка) и круги (без рамки, на клетку шире
+                // вьюфайндера с каждой стороны). Рамки — до контента.
                 let zones = pad_zones(ui, &column_geometry, viewfinder_cols, pads.len());
-                for (first, second) in &zones {
+                for (first, _) in &zones {
                     guidelines::dashed_rect(ui, *first);
-                    guidelines::dashed_rect(ui, *second);
                 }
                 let placeholder = |ui: &mut egui::Ui, rect: egui::Rect| {
                     ui.painter().text(
@@ -1373,9 +1414,10 @@ impl Flight {
                     // обводки выделения, цвет тот же.
                     if frame.pads.get(i).is_some_and(|p| p.active) {
                         ui.painter().rect_stroke(
-                            content.expand2(egui::vec2(16.0, 8.0)),
-                            4.0,
-                            egui::Stroke::new(4.0, style::LAP_ACCENT),
+                            // На клетку шире списка кругов.
+                            content.expand2(egui::vec2(32.0, 8.0)),
+                            3.0,
+                            egui::Stroke::new(3.0, style::LAP_ACCENT),
                             egui::StrokeKind::Outside,
                         );
                     }
@@ -2199,9 +2241,11 @@ fn pad_zones(
                 .into_ruler()
                 .extrude(w, cell_y(4))
                 .into();
-            let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
+            // Список кругов — на клетку шире вьюфайндера с каждой
+            // стороны (рамки нет — ширина сама держит поле).
+            let second: egui::Rect = egui::pos2(x - cell_x(1), first.bottom() + cell_y(1))
                 .into_ruler()
-                .extrude(w, bottom.bottom_left().y - cell_y(2) - first.bottom())
+                .extrude(w + cell_x(2), bottom.bottom_left().y - cell_y(2) - first.bottom())
                 .into();
             (first, second)
         })

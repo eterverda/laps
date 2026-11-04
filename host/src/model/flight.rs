@@ -9,6 +9,7 @@ use time::OffsetDateTime;
 use crate::config::setup::PadConfig;
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
+use std::cmp::Reverse;
 use serde_yaml::from_str as from_yaml_string;
 use serde_yaml::to_string as to_yaml_string;
 use std::fs;
@@ -283,16 +284,16 @@ impl Journal {
     /// круг в эфире сюда не входит — его докидывает RaceCore, а после
     /// RaceFinished выдаётся здесь же незакрытый круг (`Unfinished`).
     /// Успешный круг: последним действием перед Lap не был Fault;
-    /// fail номер не съедает. Нумерация: холшот — круг 0 («HS»),
-    /// база счётчика 0; без холшота — с 1. Отображение — `lap_label`.
+    /// fail номер не съедает. Круги нумеруются с 1; при включённом
+    /// холшоте первая строка — `Holeshot` (интервал от старта до
+    /// ворот, не круг).
     pub fn lap_infos(&self, pad_id: &str) -> Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)> {
         let mut lines = Vec::new();
         let mut in_race = false;
         let mut lap_start = Stamp::ZERO;
         let mut last_action: Option<LapEvent> = None;
-        // База нумерации: с холшотом первый круг — 0 («HS»), без —
-        // с единицы (нулевая точка не фиксируется).
-        let mut successful = u32::from(!self.header.rules.holeshot_enabled);
+        // Нумерация кругов с 1, холшот номер не съедает.
+        let mut successful = 1u32;
         let mut lap_events = Vec::new();
         let mut race_finished = None;
         for (ms, entry) in self.iter() {
@@ -312,10 +313,19 @@ impl Journal {
                         let duration = Duration::from_millis(ms.ms_since(lap_start).max(0) as u64);
                         let line = if failed {
                             LapLine::Fail { duration }
+                        } else if successful == 1
+                            && self.header.rules.holeshot_enabled
+                            && !lines
+                                .iter()
+                                .any(|(_, line, _)| matches!(line, LapLine::Holeshot { .. }))
+                        {
+                            // Первый успех при включённом холшоте —
+                            // пролёт ворот: интервал от старта до
+                            // ворот, не круг.
+                            LapLine::Holeshot { duration }
                         } else {
-                            // Имя — номер через `lap_label`: HS без
-                            // скобки, нумерованные — с («1)»).
-                            let num = lap_label(successful);
+                            // Счётный круг: нумерация с 1.
+                            let num = format!("{successful})");
                             successful += 1;
                             LapLine::Success { num, duration }
                         };
@@ -484,18 +494,171 @@ impl RaceClip {
 }
 
 /// Отображение номера круга: 0 — «HS» (холшот — круг ноль), иначе
-/// «N)». Чистая форматка: номер к этому моменту уже учёл правила
-/// (база счётчика — 0 с холшотом, 1 без).
-pub fn lap_label(num: u32) -> String {
-    if num == 0 {
-        "HS".to_owned()
-    } else {
-        format!("{num})")
+/// Вид достижения полёта (подведение итогов по образцу laps-trainer).
+/// Все виды — одна структура [`Feat`]; вид определяет алгоритм
+/// вычисления. В yaml — kebab (`best-1`, `most`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeatKind {
+    /// Лучший круг (минимум по успешным).
+    #[serde(rename = "best-1")]
+    Best1,
+    /// Минимальная сумма двух кругов.
+    #[serde(rename = "best-2")]
+    Best2,
+    /// Минимальная сумма трёх кругов.
+    #[serde(rename = "best-3")]
+    Best3,
+    /// Сумма всех законченных нумерованных кругов (включая провалы).
+    Most,
+}
+
+impl Default for FeatKind {
+    /// Итоговый вид по умолчанию: сумма всех кругов.
+    fn default() -> Self {
+        FeatKind::Most
     }
+}
+
+/// Достижение полёта: единая структура для всех видов. `count` — число
+/// успешных кругов достижения (у Most — успешных в полёте, при этом
+/// `intervals` несут все законченные, включая провалы). Интервалы —
+/// метки на оси журнала [start, end): стык end[i] == start[i+1] —
+/// честная серия «подряд» (см. `all_success`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Feat {
+    pub count: usize,
+    pub kind: FeatKind,
+    pub intervals: Vec<(Stamp, Stamp)>,
+}
+
+impl Feat {
+    /// Суммарное время достижения, мс.
+    pub fn raw_time_ms(&self) -> u64 {
+        self.intervals
+            .iter()
+            .map(|(start, end)| end.ms_since(*start).max(0) as u64)
+            .sum()
+    }
+
+}
+
+/// Фит пада по дистилляту, вид — из правил гонки. Участвуют только
+/// завершённые круги (Success/Fail) — холшот, текущий и пост-полётный
+/// незакрытый не круги. Best-N: окно из N подряд идущих завершённых,
+/// серия только успешных (провал рвёт «подряд»); честного окна нет —
+/// окно меньше. Most: интервалы — все завершённые (время провалов
+/// входит в сумму), count — успешных. Ни одного успешного — count 0.
+pub fn compute_feat(
+    kind: FeatKind,
+    race_start: Option<Stamp>,
+    lines: &[(Stamp, LapLine, Vec<(Stamp, LapEvent)>)],
+) -> Feat {
+    let is_success = |line: &LapLine| matches!(line, LapLine::Success { .. });
+    let completed: Vec<(Stamp, &LapLine)> = lines
+        .iter()
+        .filter(|(_, line, _)| is_success(line) || matches!(line, LapLine::Fail { .. }))
+        .map(|(at, line, _)| (*at, line))
+        .collect();
+    // Старт первого интервала — старт гонки; без него (эфир: GUI оси
+    // не видит) — выводим из длительности (дистиллятор считал её ровно
+    // как end − start, стык точный).
+    let start_of = |i: usize| -> Stamp {
+        if i == 0 {
+            race_start.unwrap_or_else(|| {
+                completed[0]
+                    .0
+                    .plus_ms(-(completed[0].1.duration().as_millis() as i64))
+            })
+        } else {
+            completed[i - 1].0
+        }
+    };
+    match kind {
+        FeatKind::Most => Feat {
+            count: completed.iter().filter(|(_, line)| is_success(line)).count(),
+            kind,
+            intervals: (0..completed.len())
+                .map(|i| (start_of(i), completed[i].0))
+                .collect(),
+        },
+        best => {
+            let size = match best {
+                FeatKind::Best1 => 1,
+                FeatKind::Best2 => 2,
+                FeatKind::Best3 => 3,
+                FeatKind::Most => unreachable!(),
+            };
+            // Наибольшее окно с честной серией: сначала size, при
+            // нехватке — меньше. Внутри размера — минимум суммы;
+            // равные — первое окно (как у тренера).
+            for window in (1..=size.min(completed.len())).rev() {
+                let best_at = (0..=completed.len() - window)
+                    .filter(|&i| completed[i..i + window].iter().all(|(_, line)| is_success(line)))
+                    .min_by_key(|&i| {
+                        completed[i..i + window]
+                            .iter()
+                            .map(|(_, line)| line.duration().as_millis() as u64)
+                            .sum::<u64>()
+                    });
+                if let Some(at) = best_at {
+                    return Feat {
+                        count: window,
+                        kind,
+                        intervals: (at..at + window)
+                            .map(|j| (start_of(j), completed[j].0))
+                            .collect(),
+                    };
+                }
+            }
+            Feat {
+                count: 0,
+                kind,
+                intervals: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Места по фитам одного вида (индекс в выходе = индекс фита во
+/// входе). Сравнение как у тренера: больше кругов важнее, при равенстве
+/// — меньшее время. Равенство (count и время) — общая группа: место —
+/// диапазон [start-end], start = 1 + число строго лучших (ничьи на
+/// 1-м у двоих — «1-2» у обоих, тогда дальше бывает «4»). Внутри
+/// группы порядок входа (стабильность падов).
+pub fn feat_places(feats: &[&Feat]) -> Vec<(u32, u32)> {
+    let mut order: Vec<usize> = (0..feats.len()).collect();
+    order.sort_by_key(|&i| (Reverse(feats[i].count), feats[i].raw_time_ms(), i));
+    let mut places = vec![(0, 0); feats.len()];
+    let mut pos = 0;
+    while pos < order.len() {
+        let mut end = pos + 1;
+        while end < order.len()
+            && feats[order[end]].count == feats[order[pos]].count
+            && feats[order[end]].raw_time_ms() == feats[order[pos]].raw_time_ms()
+        {
+            end += 1;
+        }
+        // Группа занимает места [pos+1 ..= end].
+        for &i in &order[pos..end] {
+            places[i] = (pos as u32 + 1, end as u32);
+        }
+        pos = end;
+    }
+    places
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LapLine {
+    /// Холшот — НЕ круг: промежуток от старта до пролёта стартовых
+    /// ворот, с которых начинается счёт кругов. Кругом не считается
+    /// нигде (фиты, лимиты): строка — только показ этого интервала.
+    /// Бывает только первой строкой гонки и только при включённом
+    /// холшоте; если первый пролёт ворот провален (fault), строки
+    /// холшота нет — счёт кругов начинается со следующего успеха.
+    Holeshot {
+        duration: Duration,
+    },
     Success {
         num: String,
         duration: Duration,
@@ -520,7 +683,8 @@ impl LapLine {
     /// незакрытого пост-полётного, бегущая у текущего (эфир).
     pub fn duration(&self) -> Duration {
         match self {
-            LapLine::Success { duration, .. }
+            LapLine::Holeshot { duration }
+            | LapLine::Success { duration, .. }
             | LapLine::Fail { duration }
             | LapLine::Unfinished { duration } => *duration,
             LapLine::Current { since } => since.elapsed(),
@@ -582,8 +746,8 @@ mod tests {
             },
         );
         let hs = journal.lap_infos("pad-1");
-        assert!(matches!(&hs[0].1, LapLine::Success { num, .. } if num == "HS"));
-        // Холшот выключен — нумерация с единицы.
+        assert!(matches!(&hs[0].1, LapLine::Holeshot { .. }));
+        // Холшот выключен — интервала нет, первый же пролёт — круг 1.
         journal.header.rules.holeshot_enabled = false;
         let no_hs = journal.lap_infos("pad-1");
         assert!(matches!(&no_hs[0].1, LapLine::Success { num, .. } if num == "1)"));
@@ -829,10 +993,10 @@ mod tests {
         let lines = journal.lap_infos("pad-1");
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert_eq!(lines[0].0, Stamp(25_000));
+        // Первый успех — холшот: интервал от старта до ворот, не круг.
         assert_eq!(
             lines[0].1,
-            LapLine::Success {
-                num: "HS".to_owned(),
+            LapLine::Holeshot {
                 duration: Duration::from_millis(15_000)
             }
         );
@@ -1153,4 +1317,126 @@ pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
         .max()
+}
+
+#[cfg(test)]
+mod feat_compute_tests {
+    use super::{FeatKind, Journal, JournalEntry, LapEvent, LapLine, Stamp, compute_feat};
+    use std::collections::BTreeMap;
+
+    /// Гонка: старт, затем события пада; холшот включён (дистиллят
+    /// даст строку Holeshot на первый успех — она не считается).
+    fn race_lines(events: &[(u64, &str)]) -> Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)> {
+        let mut journal = Journal::new(
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+            BTreeMap::new(),
+            Default::default(),
+            Default::default(),
+        );
+        // Без холшота: каждый пролёт — круг.
+        journal.header.rules.holeshot_enabled = false;
+        journal.push(Stamp(10_000), JournalEntry::RaceStarted {});
+        for (ms, action) in events {
+            journal.push(
+                Stamp(*ms),
+                JournalEntry::RaceEvent {
+                    pad_id: "pad-1".to_owned(),
+                    name: match *action {
+                        "lap" => LapEvent::Lap,
+                        "fault" => LapEvent::Fault,
+                        _ => unreachable!(),
+                    },
+                },
+            );
+        }
+        journal.push(Stamp(100_000), JournalEntry::RaceFinished { rule: super::RaceFinishRule::Manual });
+        journal.lap_infos("pad-1")
+    }
+
+    #[test]
+    fn best1_takes_fastest_success() {
+        // lap 25s (holeshot), lap 12s, fault, lap 15s → best-1 = 12s.
+        let lines = race_lines(&[(25_000, "lap"), (37_000, "lap"), (40_000, "fault"), (55_000, "lap")]);
+        let feat = compute_feat(FeatKind::Best1, Some(Stamp(10_000)), &lines);
+        assert_eq!(feat.count, 1);
+        assert_eq!(feat.raw_time_ms(), 12_000);
+    }
+
+    #[test]
+    fn best3_consecutive_breaks_on_fail_and_degrades() {
+        // lap 10s, lap 11s, fault, lap 9s: честных 3 подряд нет —
+        // окно 2 (10+11), а не одиночное 9.
+        let lines = race_lines(&[(20_000, "lap"), (31_000, "lap"), (34_000, "fault"), (43_000, "lap")]);
+        let feat = compute_feat(FeatKind::Best3, Some(Stamp(10_000)), &lines);
+        assert_eq!(feat.count, 2);
+        assert_eq!(feat.raw_time_ms(), 21_000);
+    }
+
+    #[test]
+    fn best3_full_window_beats_faster_pair() {
+        // Три подряд 9+9+9 против пары 5+5: больше кругов важнее.
+        let lines = race_lines(&[(19_000, "lap"), (28_000, "lap"), (37_000, "lap")]);
+        let feat = compute_feat(FeatKind::Best3, Some(Stamp(10_000)), &lines);
+        assert_eq!(feat.count, 3);
+        assert_eq!(feat.raw_time_ms(), 27_000);
+    }
+
+    #[test]
+    fn most_sums_all_completed_including_fails() {
+        // lap 15s (успех), fault в открытый круг, lap 30s (fail),
+        // lap 8s (успех): count — 2 успешных, сумма 15+30+8
+        // (время зафейленного круга входит).
+        let lines = race_lines(&[(25_000, "lap"), (35_000, "fault"), (55_000, "lap"), (63_000, "lap")]);
+        let feat = compute_feat(FeatKind::Most, Some(Stamp(10_000)), &lines);
+        assert_eq!(feat.count, 2);
+        assert_eq!(feat.raw_time_ms(), 53_000);
+    }
+
+    #[test]
+    fn no_success_gives_empty_feat() {
+        let lines = race_lines(&[(25_000, "fault"), (35_000, "lap")]);
+        // lap после fault — fail: успешных нет.
+        let feat = compute_feat(FeatKind::Best3, Some(Stamp(10_000)), &lines);
+        assert_eq!(feat.count, 0);
+        assert!(feat.intervals.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod feat_places_tests {
+    use super::{Feat, FeatKind, Stamp, feat_places};
+
+    fn feat(count: usize, total_ms: u64) -> Feat {
+        // Интервалы рвём поровну — raw_time_ms = total_ms.
+        Feat {
+            count,
+            kind: FeatKind::Most,
+            intervals: vec![(Stamp(0), Stamp(total_ms))],
+        }
+    }
+
+    #[test]
+    fn places_rank_count_then_time() {
+        // count важнее: тройка первой; у пар — меньшее время выше.
+        let places = feat_places(&[&feat(2, 100), &feat(3, 999), &feat(2, 90)]);
+        assert_eq!(places, vec![(3, 3), (1, 1), (2, 2)], "{places:?}");
+    }
+
+    #[test]
+    fn ties_share_a_range_and_skip_places() {
+        // Лидер один — «1»; 2-е и 3-е неотличимы — «2-3» у обоих;
+        // дальше — «4». И двое на 1-м: «1-2» у обоих, потом «3».
+        let places = feat_places(&[&feat(3, 100), &feat(2, 50), &feat(2, 50), &feat(1, 10)]);
+        assert_eq!(places, vec![(1, 1), (2, 3), (2, 3), (4, 4)], "{places:?}");
+        let places = feat_places(&[&feat(3, 100), &feat(3, 100), &feat(1, 10)]);
+        assert_eq!(places, vec![(1, 2), (1, 2), (3, 3)], "{places:?}");
+    }
+
+    #[test]
+    fn same_time_same_count_only_tie() {
+        // Равные count+время — общая группа с диапазоном, даже
+        // не соседи по входу.
+        let places = feat_places(&[&feat(2, 100), &feat(2, 90), &feat(2, 100)]);
+        assert_eq!(places, vec![(2, 3), (1, 1), (2, 3)], "{places:?}");
+    }
 }

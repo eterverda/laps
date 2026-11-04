@@ -7,7 +7,7 @@ use super::{FrameContents, Selection};
 use crate::gui::measure_text;
 use crate::gui::ruler::{CELL_SIZE, cell_x, cell_y};
 use crate::gui::style;
-use crate::model::flight::{LapEvent, LapLine, Stamp, lap_label};
+use crate::model::flight::{LapEvent, LapLine, Stamp};
 use std::time::Duration;
 
 /// Событие в колонке кругов занимает 2 колонки сетки: глиф (1) и
@@ -31,6 +31,10 @@ pub fn show(
         let Some(pad) = frame.pads.get(i) else {
             continue;
         };
+        // Якоря строки фита: сколько строк занято и резерв колонки
+        // событий.
+        let mut used_rows = 0usize;
+        let mut feat_cells = LAP_EVENT_COLS;
         if !pad.laps.is_empty() {
             let capacity = (second.height() / cell_y(1)).max(0.0) as usize;
             let pad_id = &pad.pad_id;
@@ -47,6 +51,7 @@ pub fn show(
                 frame.holeshot_enabled,
             );
             let from = rows.len().saturating_sub(capacity);
+            used_rows = rows.len() - from;
             // Без клипа: по вертикали строки влезают по
             // построению (capacity), обводки подсветки
             // ничем не обрезаются, а широкая строка пусть
@@ -65,6 +70,7 @@ pub fn show(
                 .max()
                 .unwrap_or(0)
                 .max(1);
+            feat_cells = LAP_EVENT_COLS * max_events as isize;
             for (row, cells) in rows[from..].iter().enumerate() {
                 let full_row = from + row;
                 let pos = egui::pos2(
@@ -152,12 +158,13 @@ pub fn show(
             } else {
                 LapTone::Future
             };
+            // Имя первой строки блока: с холшотом это будет строка
+            // холшота («HS»), без — первый круг («1)»).
+            let first = if frame.holeshot_enabled { "HS" } else { "1)" };
             let cells = [
                 LapCell::plain(String::new(), tone, None),
                 LapCell::plain(String::new(), tone, None),
-                // Имя первого круга: база нумерации из правил
-                // (0 — «HS», 1 — «1)»).
-                LapCell::plain(lap_label(u32::from(!frame.holeshot_enabled)), tone, None),
+                LapCell::plain(first, tone, None),
                 LapCell::plain(lap_time(Duration::ZERO, 6), tone, None),
             ];
             let galley = ui.painter().layout_job(lap_row_job(&cells));
@@ -166,6 +173,40 @@ pub fn show(
                 galley,
                 style::PAD_TIMER_ACTIVE,
             );
+            used_rows = 1;
+        }
+        // Фит: под кругами, отступ в строку, лимонадным. «N/ время»
+        // в колонках кругов; при нуле — «0/ -.---».
+        if let Some(feat) = &pad.feat {
+            let y = second.top() + cell_y((used_rows + 1) as isize);
+            let name = format!("{}/", feat.count);
+            let mut time = if feat.count > 0 {
+                lap_time(Duration::from_millis(feat.raw_time_ms()), 6)
+            } else {
+                " -.---".to_owned()
+            };
+            // Место в гонке — пробел и скобки после результата;
+            // ничья — диапазоном ([1-2]).
+            if let Some((lo, hi)) = pad.place {
+                time += &if lo == hi {
+                    format!(" [{lo}]")
+                } else {
+                    format!(" [{lo}-{hi}]")
+                };
+            }
+            // Цвет — в TextFormat: galley(.., color) лишь fallback.
+            let format = egui::TextFormat {
+                font_id: style::FONT_REGULAR,
+                color: style::FEAT_LEMON,
+                ..Default::default()
+            };
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&name, 0.0, format.clone());
+            job.append(" ", 0.0, format.clone());
+            job.append(&time, 0.0, format);
+            let galley = ui.painter().layout_job(job);
+            ui.painter()
+                .galley(egui::pos2(second.left() + cell_x(feat_cells), y), galley, style::FEAT_LEMON);
         }
     }
     lap_click
@@ -315,20 +356,29 @@ fn lap_table(
     } else {
         6 // SS.mmm
     };
-    // Текущий круг — предполагаемый номер: завершённые успешные + база
-    // нумерации из правил (0 с холшотом — следующий «HS», без — с 1).
-    // Fail номер не съедает. Отображение — `lap_label`, как у
-    // дистиллятора.
+    // Открытая строка: «HS», пока холшот включён и первый интервал
+    // не закрыт; иначе — «успешные + 1)» (холшот и fail номер не
+    // съедают).
     let successes = lines
         .iter()
         .filter(|(_, line, _)| matches!(line, LapLine::Success { .. }))
         .count();
-    let current_name = lap_label(successes as u32 + u32::from(!holeshot_enabled));
+    let closed = lines
+        .iter()
+        .filter(|(_, line, _)| !matches!(line, LapLine::Current { .. }))
+        .count();
+    let current_name = if holeshot_enabled && closed == 0 {
+        "HS".to_owned()
+    } else {
+        format!("{})", successes + 1)
+    };
     let future = |at: Stamp| cursor.is_some_and(|c| c < at);
     let mut rows = Vec::new();
     for (end, line, events) in lines {
-        // Имя — из дистиллятора целиком (HS без скобки, «1)» с ней).
+        // Имя — из дистиллятора целиком («HS» у холшота, «1)» с
+        // скобкой у нумерованных).
         let name = match line {
+            LapLine::Holeshot { .. } => "HS".to_owned(),
             LapLine::Success { num, .. } => num.clone(),
             LapLine::Current { .. } => current_name.clone(),
             // Незакрытый (пост-полёт): без имени — колонка

@@ -901,12 +901,11 @@ mod tests {
         );
         let lines = core.laps("pad-1", clock.now);
         assert_eq!(lines.len(), 2, "{lines:?}");
-        // Круг от гудка: lap на t0+25 с (10 с до старта + 15 с), гудок
-        // на t0+3 с (PRE_BEEP_SECS отсчёта) → 22 с.
+        // Холшот от гудка: lap на t0+25 с (10 с до старта + 15 с),
+        // гудок на t0+3 с (PRE_BEEP_SECS отсчёта) → 22 с.
         assert_eq!(
             lines[0].1,
-            LapLine::Success {
-                num: "HS".to_owned(),
+            LapLine::Holeshot {
                 duration: Duration::from_millis(22_000)
             }
         );
@@ -987,6 +986,8 @@ mod tests {
             RaceRules {
                 max_duration: None,
                 max_laps: Some(1),
+                // Холшот в лимит не входит.
+                holeshot_enabled: false,
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
                 ..RaceRules::default()
             },
@@ -1445,10 +1446,9 @@ impl Race {
     /// REC: REC-off до старта гонки отменяет её (ядро дропается,
     /// GUI — в Idle), после финиша отдаём журнал в DVR. Рождение
     /// кнопкой RACE: GUI досылает намерение RACE сразу после
-    /// spawn — поток стартует с ним в очереди.
-    /// Хэндл гоночного потока для GUI: шлём намерения, забираем уведомления.
-    /// Параллельно — ноль оси журнала сессии (метка REC): GUI кадрит
-    /// «сейчас» на этой оси между нотисами (курсор кругов в эфире).
+    /// spawn — поток стартует с ним в очереди. Параллельно с хэндлом
+    /// — ноль оси журнала сессии: GUI кадрит по нему «сейчас» (курсор
+    /// кругов в эфире).
     pub fn spawn(
         rules: RaceRules,
         captures_dir: PathBuf,

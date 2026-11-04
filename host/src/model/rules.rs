@@ -2,6 +2,7 @@
 //! Ничего про течение гонки (состояния, запись, журнал) — это сервис
 //! `service::race`.
 
+use crate::model::flight::FeatKind;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::time::{Duration, Instant};
 
@@ -99,6 +100,10 @@ pub struct RaceRules {
     /// На запись в журнал не влияет — только имена строк и будущие
     /// результаты.
     pub holeshot_enabled: bool,
+    /// Итоговый вид достижения: что показываем под кругами и по чему
+    /// распределяются места (сравнение фитов этого вида). Пишется
+    /// всегда — дефолт (most) неочевиден.
+    pub feat_kind: FeatKind,
 }
 
 impl Default for RaceRules {
@@ -108,6 +113,7 @@ impl Default for RaceRules {
             max_duration: Some(Duration::from_secs(90)),
             max_laps: None,
             holeshot_enabled: true,
+            feat_kind: Default::default(),
         }
     }
 }
@@ -198,6 +204,18 @@ mod tests {
                 .unwrap()
                 .start_signal_delay,
             fixed.start_signal_delay
+        );
+        // Итоговый вид пишется всегда (дефолт неочевиден) — kebab.
+        assert!(yaml.contains("feat-kind: most"), "{yaml}");
+        let custom = RaceRules {
+            feat_kind: crate::model::flight::FeatKind::Best1,
+            ..RaceRules::default()
+        };
+        let yaml = serde_yaml::to_string(&custom).unwrap();
+        assert!(yaml.contains("feat-kind: best-1"), "{yaml}");
+        assert_eq!(
+            serde_yaml::from_str::<RaceRules>(&yaml).unwrap().feat_kind,
+            custom.feat_kind
         );
         // None лимита — поле отсутствует (пропуск = без лимита).
         let none = RaceRules {

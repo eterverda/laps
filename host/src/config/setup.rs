@@ -54,7 +54,7 @@ impl ColorConfig {
             ColorConfig::Red => egui::Color32::from_rgb(0xFF, 0x33, 0x33),
             ColorConfig::Blue => egui::Color32::from_rgb(0x33, 0x33, 0xFF),
             ColorConfig::Green => egui::Color32::from_rgb(0x33, 0xCC, 0x33),
-            ColorConfig::Yellow => egui::Color32::from_rgb(0xCC, 0x88, 0x00),
+            ColorConfig::Yellow => egui::Color32::from_rgb(0xF5, 0xBC, 0x00),
         }
     }
 }

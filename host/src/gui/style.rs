@@ -53,7 +53,7 @@ pub const LAP_FLASH: egui::Color32 = RACE_ACTIVE;
 
 /// Медали полосы мест внизу списка кругов (фон двух нижних строк).
 /// Бронза и серый — потемнее (выкраски: docs/places-colors.html).
-pub const PLACE_GOLD: egui::Color32 = egui::Color32::from_rgb(0xF2, 0xC9, 0x4C);
+pub const PLACE_GOLD: egui::Color32 = egui::Color32::from_rgb(0xF4, 0xD5, 0x79);
 pub const PLACE_SILVER: egui::Color32 = egui::Color32::from_rgb(0xC9, 0xCE, 0xD6);
-pub const PLACE_BRONZE: egui::Color32 = egui::Color32::from_rgb(0xCD, 0x7F, 0x32);
-pub const PLACE_GRAY: egui::Color32 = egui::Color32::from_rgb(0x7E, 0x84, 0x8D);
+pub const PLACE_BRONZE: egui::Color32 = egui::Color32::from_rgb(0xC0, 0x8A, 0x55);
+pub const PLACE_GRAY: egui::Color32 = egui::Color32::from_rgb(0x56, 0x5C, 0x64);

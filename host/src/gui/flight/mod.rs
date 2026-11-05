@@ -1344,10 +1344,7 @@ impl Flight {
                 let columns = pads.len() as isize;
                 let viewfinder_rows = viewfinder_rows(pads.len());
                 let viewfinder_cols = viewfinder_cols(pads.len());
-                let segment = (GRID_WIDTH - LEFT_MARGIN - RIGHT_MARGIN) / columns.max(1);
-                let column_geometry: Vec<(isize, isize)> = (0..columns)
-                    .map(|i| (LEFT_MARGIN + segment * i, segment))
-                    .collect();
+                let column_geometry = column_geometry(pads.len());
 
                 // Гайдлайны: вертикальные между колонками — от границы под
                 // хедером (2 клетки от верха) до границы над футером
@@ -1359,8 +1356,9 @@ impl Flight {
                     let top = screen.collapse_top().translate(0.0, cell_y(2));
                     let bottom = screen.collapse_bottom().translate(0.0, -cell_y(5));
                     let stroke = egui::Stroke::new(2.0, egui::Color32::from_white_alpha(0x1e));
-                    for i in 1..columns {
-                        let x = cell_x(LEFT_MARGIN + segment * i);
+                    // Гайдлайны — по центру зазора между падами.
+                    for w in column_geometry.windows(2) {
+                        let x = (cell_x(w[0].0 + w[0].1) + cell_x(w[1].0)) / 2.0;
                         let line = egui::pos2(x, top.bottom_left().y)
                             .into_ruler()
                             .extrude(0.0, bottom.bottom_left().y - top.bottom_left().y);
@@ -1413,18 +1411,15 @@ impl Flight {
                         }
                     }
                     // Рамка активного пада: вокруг контента колонки; толще
-                    // обводки выделения, цвет тот же.
+                    // обводки выделения, цвет тот же. Расширение — клетка
+                    // по горизонтали и полклетки по вертикали, штрих 3 px
+                    // внутрь.
                     if frame.pads.get(i).is_some_and(|p| p.active) {
                         ui.painter().rect_stroke(
-                            // Ширина зоны кругов (= вьюфайндер),
-                            // +2 px со всех сторон; 3 px наружу, без
-                            // скругления.
-                            content
-                                .expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0))
-                                .expand(6.0),
+                            content.expand2(egui::vec2(cell_x(1), CELL_SIZE.y / 2.0)),
                             0.0,
                             egui::Stroke::new(3.0, style::LAP_ACCENT),
-                            egui::StrokeKind::Outside,
+                            egui::StrokeKind::Inside,
                         );
                     }
                 }
@@ -2218,15 +2213,37 @@ fn viewfinder_rows(count: usize) -> isize {
     }
 }
 
-/// Ширина вьюфайндера из соотношения 16:9 (8 клеток на 3 строки).
+/// Ширина пада из соотношения 16:9 (8 клеток на 3 строки) плюс клетка:
+/// рамка ½+½ ушла внутрь, картинка внутри — прежних cols × rows.
 fn viewfinder_cols(count: usize) -> isize {
-    viewfinder_rows(count) * 8 / 3
+    viewfinder_rows(count) * 8 / 3 + 1
+}
+
+/// Раскладка колонок (старт, ширина) в клетках: ширина — во весь пад
+/// (картинка + внутренние поля рамки). Поля и зазоры подобраны под
+/// 152 клетки сетки: 4 пада — ровно (4/4), 3 пада — симметрично,
+/// лишняя клетка уходит в правое поле, 2 пада — широкий центральный
+/// шов (сплит-экран).
+fn column_geometry(count: usize) -> Vec<(isize, isize)> {
+    let (edge, gap) = match count {
+        2 => (9, 20),
+        3 => (7, 7),
+        _ => (4, 4),
+    };
+    let width = viewfinder_cols(count);
+    let mut out = Vec::new();
+    let mut col = LEFT_MARGIN + edge;
+    for _ in 0..count.max(1) {
+        out.push((col, width));
+        col += width + gap;
+    }
+    out
 }
 
 /// Зоны колонки под вьюфайндером (шириной во вьюфайндер): первый блок
-/// — плейсхолдер под засечку (клетка ниже картинки, высота 4 клетки),
-/// второй — круги (клетка ниже плейсхолдера, низ — на 2 клетки выше
-/// нижней границы). Рамки рисуются Outside — не в счёт.
+/// — плейсхолдер под засечку (полклетки ниже картинки, высота 4
+/// клетки), второй — круги (полклетки ниже плейсхолдера, низ — на 2
+/// клетки выше нижней границы). Рамки рисуются Outside — не в счёт.
 fn pad_zones(
     ui: &egui::Ui,
     column_geometry: &[(isize, isize)],
@@ -2236,7 +2253,9 @@ fn pad_zones(
     let screen = ui.max_rect().into_ruler();
     let bottom = screen.collapse_bottom().translate(0.0, -cell_y(4));
     let vf_bottom = cell_y(TOP_BAR_ROWS + 1 + viewfinder_rows(pads) + 2);
-    let first_top = vf_bottom + cell_y(1);
+    // Плейсхолдер — на полклетки выше низа вьюфайндера; круги — на
+    // клетку выше (размеры обоих не меняются).
+    let first_top = vf_bottom + cell_y(1) / 2.0;
     column_geometry
         .iter()
         .map(|&(zone_start, zone_width)| {
@@ -2247,13 +2266,13 @@ fn pad_zones(
                 .into_ruler()
                 .extrude(w, cell_y(4))
                 .into();
-            // Список кругов — шириной во вьюфайндер.
-            let second: egui::Rect = egui::pos2(x, first.bottom() + cell_y(1))
+            // Список кругов — шириной во вьюфайндер; верх — на пол-
+            // клетки ниже плейсхолдера, низ — на 2 клетки выше нижней
+            // границы (высота прежняя).
+            let second_top = first.bottom() + cell_y(1) / 2.0;
+            let second: egui::Rect = egui::pos2(x, second_top)
                 .into_ruler()
-                .extrude(
-                    w,
-                    bottom.bottom_left().y - cell_y(2) - first.bottom(),
-                )
+                .extrude(w, bottom.bottom_left().y - cell_y(2) - second_top)
                 .into();
             (first, second)
         })

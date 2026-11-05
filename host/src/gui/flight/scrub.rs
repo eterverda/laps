@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::laps::{LapTone, lap_glyph, paint_event_cell};
-use crate::gui::ruler::{CELL_SIZE, cell_y};
+use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::model::flight::{Interval, LapEvent, Stamp};
 
 /// База позиционного шага по тапу (клик): тап мотает на
@@ -499,10 +499,8 @@ impl HScroll {
 /// текущего) с конца, потом прошлое включительно с начала — ближайшие
 /// к текущему рисуются поверх. Текущее — выделенное, иначе самое
 /// свежее ≤ курсора (current приходит готовым — хозяина знает
-/// выделение). Строка на полстроки ниже границы: верхняя половина —
-/// в освобождённой клетке, нижняя заходит на таймлайн. В пересечении
-/// клик забирает событие: его интерактив регистрируется позже
-/// (egui: позднее = поверх). Возвращает мс кликнутого события; мутация
+/// выделение). Строка — клетка целиком над таймлайном, низ по его
+/// границе (пересечения нет). Возвращает мс кликнутого события; мутация
 /// выделения и seek — хозяина.
 #[allow(clippy::too_many_arguments)]
 pub fn show_events(
@@ -519,10 +517,11 @@ pub fn show_events(
         return None;
     }
     let span = window.span_ms().max(1);
-    let row = egui::Rect::from_min_max(
-        egui::pos2(timeline_rect.left(), timeline_rect.top() - cell_y(1) / 2.0),
-        egui::pos2(timeline_rect.right(), timeline_rect.top() + cell_y(1) / 2.0),
-    );
+    let row: egui::Rect = timeline_rect
+        .into_ruler()
+        .collapse_top()
+        .extrude(0.0, -cell_y(1))
+        .into();
     let mut order: Vec<(Stamp, LapEvent)> = events
         .iter()
         .rev()
@@ -544,9 +543,13 @@ pub fn show_events(
             timeline_rect.left() + frac * timeline_rect.width(),
             row.center().y,
         );
-        // Ячейка события — ровно клетка сетки, позиционирование —
-        // по центру (суб-клетно).
-        let rect = egui::Rect::from_center_size(center, CELL_SIZE);
+        // Ячейка события — 2 клетки сетки, глиф по центру;
+        // позиционирование — по центру (суб-клетно).
+        let rect: egui::Rect = center
+            .into_ruler()
+            .extrude(cell_x(1), CELL_SIZE.y / 2.0)
+            .extrude(-cell_x(1), -CELL_SIZE.y / 2.0)
+            .into();
         let highlighted = {
             let d = pos.ms_since(*at);
             d >= before && d < after
@@ -564,10 +567,10 @@ pub fn show_events(
             selected == Some(*at),
         );
         // Клик — выделение события (+ seek, как по ячейке таблицы) —
-        // хозяина. События строки — пада из выделения.
-        // Клик-зона на полсимвола шире ректа ячейки.
+        // хозяина. События строки — пада из выделения. Клик-зона —
+        // рект ячейки (база).
         let response = ui.interact(
-            rect.expand2(egui::vec2(CELL_SIZE.x / 2.0, 0.0)),
+            rect,
             egui::Id::unique(("tl_event", *at)),
             egui::Sense::click(),
         );

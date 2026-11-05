@@ -46,10 +46,11 @@ pub enum ViewfinderContents {
     Off,
 }
 
-/// Метка, имя пилота и цветная рамка вокруг вьюфайндера. Виджету отводится
-/// rect на 2 строки выше вьюфайндера: верхние 2 строки — метка с именем,
-/// остальное передаётся замыканию под картинку. Рамка рисуется
-/// StrokeKind::Outside — фактически за пределами rect виджета.
+/// Метка, имя пилота и цветная рамка вокруг вьюфайндера. Виджету
+/// отводится rect пада на клетку шире картинки: поля ½ клетки по
+/// бокам — рамка (8 px, Inside), сверху — таб 1¾ клетки, под ним
+/// полоса рамки ¼ клетки; видео — внутри рамки, ничего не вылезает
+/// за пределы rect.
 pub struct ViewfinderFrame<'a> {
     pub label: &'a str,
     pub name: &'a str,
@@ -67,24 +68,32 @@ impl<'a> ViewfinderFrame<'a> {
         rect: egui::Rect,
         contents: impl FnOnce(&mut egui::Ui, egui::Rect),
     ) {
-        let viewfinder_rect = rect.with_min_y(rect.min.y + cell_y(2));
+        let inset = cell_x(1) / 2.0;
+        // Рамка — внутри бокса: прямоугольник на клетку шире и на пол-
+        // клетки выше видео, штрих Inside. Верхняя полоса [1½, 1¾] —
+        // четверть над видео, низ таба пересекает (как раньше).
+        let frame_rect = rect.with_min_y(rect.min.y + cell_y(3) / 2.0);
         ui.painter().rect_stroke(
-            viewfinder_rect,
+            frame_rect,
             0.0,
-            egui::Stroke::new(cell_x(1) / 2.0, self.color),
-            egui::StrokeKind::Outside,
+            egui::Stroke::new(inset, self.color),
+            egui::StrokeKind::Inside,
         );
+        // Видео — прежнего размера, на ¼ клетки выше: низ ушёл на 8 px
+        // вверх, освободив полосу рамки внутри бокса.
+        let viewfinder_rect = rect
+            .shrink2(egui::vec2(inset, 0.0))
+            .with_min_y(rect.min.y + cell_y(7) / 4.0)
+            .with_max_y(rect.max.y - cell_y(1) / 4.0);
 
-        let label_rect: egui::Rect = viewfinder_rect
+        // Фон таба — текст плюс клетка паддинга с каждой стороны,
+        // прижат к левому краю бокса (выступов нет).
+        let label_rect: egui::Rect = rect
             .left_top()
             .into_ruler()
-            .extrude(cell_x(self.label.len() as isize * 2), cell_y(-2))
+            .extrude(cell_x(self.label.len() as isize * 2 + 2), cell_y(7) / 4.0)
             .into();
-        ui.painter().rect_filled(
-            label_rect.expand2(egui::vec2(cell_x(1) / 2.0, 0.0)),
-            0.0,
-            self.color,
-        );
+        ui.painter().rect_filled(label_rect, 0.0, self.color);
         ui.painter().text(
             label_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -100,8 +109,8 @@ impl<'a> ViewfinderFrame<'a> {
             .extrude(0.0, cell_y(1))
             .into();
         ui.painter().text(
-            // Имя пилота: пластиковым, на полсимвола ниже края.
-            name_rect.left_top() + egui::vec2(0.0, cell_y(1) / 4.0),
+            // Имя пилота: пластиковым, ровно по клетке.
+            name_rect.left_top(),
             egui::Align2::LEFT_TOP,
             self.name,
             style::FONT_REGULAR,

@@ -9,9 +9,9 @@ use time::OffsetDateTime;
 use crate::config::setup::PadConfig;
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
-use std::cmp::Reverse;
 use serde_yaml::from_str as from_yaml_string;
 use serde_yaml::to_string as to_yaml_string;
+use std::cmp::Reverse;
 use std::fs;
 use std::io::Result as IoResult;
 
@@ -540,7 +540,6 @@ impl Feat {
             .map(|(start, end)| end.ms_since(*start).max(0) as u64)
             .sum()
     }
-
 }
 
 /// Фит пада по дистилляту, вид — из правил гонки. Участвуют только
@@ -576,7 +575,10 @@ pub fn compute_feat(
     };
     match kind {
         FeatKind::Most => Feat {
-            count: completed.iter().filter(|(_, line)| is_success(line)).count(),
+            count: completed
+                .iter()
+                .filter(|(_, line)| is_success(line))
+                .count(),
             kind,
             intervals: (0..completed.len())
                 .map(|i| (start_of(i), completed[i].0))
@@ -594,7 +596,11 @@ pub fn compute_feat(
             // равные — первое окно (как у тренера).
             for window in (1..=size.min(completed.len())).rev() {
                 let best_at = (0..=completed.len() - window)
-                    .filter(|&i| completed[i..i + window].iter().all(|(_, line)| is_success(line)))
+                    .filter(|&i| {
+                        completed[i..i + window]
+                            .iter()
+                            .all(|(_, line)| is_success(line))
+                    })
                     .min_by_key(|&i| {
                         completed[i..i + window]
                             .iter()
@@ -1349,14 +1355,24 @@ mod feat_compute_tests {
                 },
             );
         }
-        journal.push(Stamp(100_000), JournalEntry::RaceFinished { rule: super::RaceFinishRule::Manual });
+        journal.push(
+            Stamp(100_000),
+            JournalEntry::RaceFinished {
+                rule: super::RaceFinishRule::Manual,
+            },
+        );
         journal.lap_infos("pad-1")
     }
 
     #[test]
     fn best1_takes_fastest_success() {
         // lap 25s (holeshot), lap 12s, fault, lap 15s → best-1 = 12s.
-        let lines = race_lines(&[(25_000, "lap"), (37_000, "lap"), (40_000, "fault"), (55_000, "lap")]);
+        let lines = race_lines(&[
+            (25_000, "lap"),
+            (37_000, "lap"),
+            (40_000, "fault"),
+            (55_000, "lap"),
+        ]);
         let feat = compute_feat(FeatKind::Best1, Some(Stamp(10_000)), &lines);
         assert_eq!(feat.count, 1);
         assert_eq!(feat.raw_time_ms(), 12_000);
@@ -1366,7 +1382,12 @@ mod feat_compute_tests {
     fn best3_consecutive_breaks_on_fail_and_degrades() {
         // lap 10s, lap 11s, fault, lap 9s: честных 3 подряд нет —
         // окно 2 (10+11), а не одиночное 9.
-        let lines = race_lines(&[(20_000, "lap"), (31_000, "lap"), (34_000, "fault"), (43_000, "lap")]);
+        let lines = race_lines(&[
+            (20_000, "lap"),
+            (31_000, "lap"),
+            (34_000, "fault"),
+            (43_000, "lap"),
+        ]);
         let feat = compute_feat(FeatKind::Best3, Some(Stamp(10_000)), &lines);
         assert_eq!(feat.count, 2);
         assert_eq!(feat.raw_time_ms(), 21_000);
@@ -1386,7 +1407,12 @@ mod feat_compute_tests {
         // lap 15s (успех), fault в открытый круг, lap 30s (fail),
         // lap 8s (успех): count — 2 успешных, сумма 15+30+8
         // (время зафейленного круга входит).
-        let lines = race_lines(&[(25_000, "lap"), (35_000, "fault"), (55_000, "lap"), (63_000, "lap")]);
+        let lines = race_lines(&[
+            (25_000, "lap"),
+            (35_000, "fault"),
+            (55_000, "lap"),
+            (63_000, "lap"),
+        ]);
         let feat = compute_feat(FeatKind::Most, Some(Stamp(10_000)), &lines);
         assert_eq!(feat.count, 2);
         assert_eq!(feat.raw_time_ms(), 53_000);

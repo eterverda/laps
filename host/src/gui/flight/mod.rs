@@ -24,7 +24,7 @@ use crate::gui::flight::scrub::{
     ScrollGate, SeekButton, SeekEvent, Timeline, TimelineEvent, show_events,
 };
 use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
-use crate::gui::view::{Letterbox, TransportButton, hint_badge, hint_badge_corner};
+use crate::gui::view::{Corner, Letterbox, TransportButton, hint_badge, hint_badge_corner};
 use crate::model::flight::{
     Feat, Interval, Journal, JournalEntry, LapEvent, LapLine, RaceClip, Stamp, compute_feat,
     feat_places, latest_journal,
@@ -311,9 +311,48 @@ struct RecContents {
 }
 
 /// TIMER: готовый текст и признак приглушения (мигание/нули).
-struct TimerContents {
+pub struct TimerContents {
     text: String,
     dim: bool,
+}
+
+/// Живопись таймера (нижний ряд flight, центр джамботрона): иконка +
+/// текст двойным шрифтом, база по pos. Контент и живопись общие.
+pub fn paint_timer(
+    painter: &egui::Painter,
+    ctx: &egui::Context,
+    pos: egui::Pos2,
+    timer: &TimerContents,
+) {
+    let icon = "\u{f43a}";
+    let icon_w = measure_text(ctx, style::FONT_REGULAR_X2, icon).x;
+    let color = if timer.dim {
+        style::TIMER_INACTIVE
+    } else {
+        style::TIMER_ACTIVE
+    };
+    painter.text(
+        pos,
+        egui::Align2::LEFT_BOTTOM,
+        icon,
+        style::FONT_REGULAR_X2,
+        color,
+    );
+    painter.text(
+        egui::pos2(pos.x + icon_w + cell_x(1), pos.y),
+        egui::Align2::LEFT_BOTTOM,
+        &timer.text,
+        style::FONT_REGULAR_X2,
+        color,
+    );
+}
+
+/// Полная ширина таймера (иконка + клетка + текст) — для центрирования.
+pub fn timer_width(ctx: &egui::Context, timer: &TimerContents) -> f32 {
+    let icon = "\u{f43a}";
+    measure_text(ctx, style::FONT_REGULAR_X2, icon).x
+        + cell_x(1)
+        + measure_text(ctx, style::FONT_REGULAR_X2, &timer.text).x
 }
 
 /// Таймлайн в мс-домене (журнальном): окно записи — [start, end].
@@ -1198,7 +1237,12 @@ impl Flight {
         }
     }
 
-    pub fn update(&mut self, ui: &mut egui::Ui, navigator: &mut Navigator) {
+    pub fn update(
+        &mut self,
+        ui: &mut egui::Ui,
+        navigator: &mut Navigator,
+        jumbotron: &mut jumbotron::Jumbotron,
+    ) {
         // Main-клавиатура (Idle/Live/Review): события egui уходят в
         // канал текущей фазы — локальный хаб (Idle, Review) или гоночный
         // поток (Live).
@@ -1232,6 +1276,8 @@ impl Flight {
                     .extrude(0.0, cell_y(TOP_BAR_ROWS))
                     .into();
                 self.header.show(ui, header_rect);
+
+                jumbotron::jumbo_button(ui, header_rect, jumbotron);
 
                 // Таймлайн (только DVR): рисуется раньше кнопок — под
                 // ними. Две клетки высотой, вся ширина, поля по 4
@@ -1448,6 +1494,7 @@ impl Flight {
                             &content.label,
                             &content.pilot,
                             content.color,
+                            Corner::TopLeft,
                         )
                         .show(ui, frame_rect, |ui, rect| {
                             viewfinder::Viewfinder::new(content.viewport).show(
@@ -1764,30 +1811,31 @@ impl Flight {
                 }
 
                 // TIMER: в live-фазах — счётчик гонки (цвет с учётом
-                // мигания/нулей), в DVR — позиция.
-                let timer_pos = egui::pos2(timer_left, y);
-                let timer_icon = "\u{f43a}";
-                let icon_w = measure_text(ui.ctx(), style::FONT_REGULAR_X2, timer_icon).x;
-                let timer_color = if frame.timer.dim {
-                    style::TIMER_INACTIVE
-                } else {
-                    style::TIMER_ACTIVE
-                };
-                ui.painter().text(
-                    timer_pos,
-                    egui::Align2::LEFT_BOTTOM,
-                    timer_icon,
-                    style::FONT_REGULAR_X2,
-                    timer_color,
-                );
-                ui.painter().text(
-                    egui::pos2(timer_pos.x + icon_w + cell_x(1), timer_pos.y),
-                    egui::Align2::LEFT_BOTTOM,
-                    &frame.timer.text,
-                    style::FONT_REGULAR_X2,
-                    timer_color,
+                // мигания/нулей), в DVR — позиция. Живопись общая с
+                // джамботроном.
+                paint_timer(
+                    ui.painter(),
+                    ui.ctx(),
+                    egui::pos2(timer_left, y),
+                    &frame.timer,
                 );
             });
+
+        // Джамботрон: окно трансляции. Транслируется контент главного
+        // экрана в любой фазе: Idle/Live — камеры, Review — плееры DVR.
+        // Закрытие окна (крестик ОС) гасит тоггл — внутри show.
+        let feed: Vec<jumbotron::Feed> = frame
+            .pads
+            .iter()
+            .map(|pad| jumbotron::Feed {
+                label: &pad.label,
+                pilot: &pad.pilot,
+                color: pad.color,
+                viewport: pad.viewport,
+                image: pad.image,
+            })
+            .collect();
+        jumbotron.show(ui.ctx(), Some(&feed), Some(&frame.timer));
 
         if self.exit_requested {
             self.exit_requested = false;

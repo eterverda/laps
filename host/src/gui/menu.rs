@@ -1,4 +1,4 @@
-use super::{State, header, view};
+use super::{State, header, jumbotron, view};
 use crate::gui::ruler::{IntoRuler, cell_x, cell_y};
 
 pub struct Menu {
@@ -27,7 +27,7 @@ impl Menu {
         }
     }
 
-    pub fn update(&mut self, ui: &mut egui::Ui) -> Action {
+    pub fn update(&mut self, ui: &mut egui::Ui, jumbotron: &mut jumbotron::Jumbotron) -> Action {
         let mut action = Action::None;
         // Разметка — копия flight'овской: тот же Letterbox (160×45
         // клеток, виртуальный максимум 50 строк, обводка) и тот же
@@ -43,6 +43,7 @@ impl Menu {
                     .extrude(0.0, cell_y(2))
                     .into();
                 self.header.show(ui, header_rect);
+                jumbotron::jumbo_button(ui, header_rect, jumbotron);
 
                 // START — в центре площадки. Кнопка транспортного стиля
                 // flight'а (interact → paint); ширина — контент плюс по

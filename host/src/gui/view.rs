@@ -86,19 +86,18 @@ impl Letterbox {
             )
         };
 
-        // Виртуальный размер — всегда целое число клеток: виджеты внутри
-        // якорятся к краям rect'а, флоор к клеткам за пределами Letterbox
-        // не нужен. Границы (min/max) кратны клеткам, округление в них
-        // не вылезает.
-        let virtual_size = egui::vec2(
-            (virtual_size.x / CELL_SIZE.x).round() * CELL_SIZE.x,
-            (virtual_size.y / CELL_SIZE.y).round() * CELL_SIZE.y,
-        );
+        // Виртуальный размер — целые пиксели (не клетки): внутри
+        // канваса верстается в px, к клеткам привязываются сами
+        // виджеты. Клеточный снап — снаружи (экранная разметка),
+        // здесь — только округление до целого px.
+        let virtual_size = egui::vec2(virtual_size.x.round(), virtual_size.y.round());
         let screen_offset = min_rect + offset;
         let rect = egui::Rect::from_min_size(screen_offset, virtual_size * scale);
 
         if self.outline {
-            let window = ui.min_rect();
+            // Окно — весь доступный прямоугольник: у корневого ui
+            // min_rect нулевой, max_rect — весь вьюпорт.
+            let window = ui.max_rect();
 
             if guidelines::ENABLED {
                 if rect.height() < window.height() {
@@ -534,4 +533,53 @@ pub fn content_width(ctx: &egui::Context, text: &str) -> f32 {
         width += cell_x(1) * (words.len() - 1) as f32;
     }
     width
+}
+
+#[cfg(test)]
+mod letterbox_tests {
+    use super::*;
+
+    /// Штриховка обводки рисуется, когда вокруг кадра есть полосы
+    /// (окно не 16:9); при 16:9 полос нет — и штриховать нечего.
+    #[test]
+    fn letterbox_outline_hatch_in_bars() {
+        let count_hatch = |screen: egui::Vec2| {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
+                ..Default::default()
+            };
+            // Корневой ui напрямую — как в джамботроне (без панели).
+            let out = ctx.run_ui(raw, |ui| {
+                Letterbox::new(egui::vec2(1920.0, 1080.0))
+                    .outline(true)
+                    .show(ui, |_ui| {});
+            });
+            let egui::FullOutput {
+                shapes,
+                mut textures_delta,
+                ..
+            } = out;
+            textures_delta.clear();
+            shapes
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.shape,
+                        egui::Shape::LineSegment {
+                            stroke: egui::Stroke { color, .. },
+                            ..
+                        } if color.a() == 0x0e
+                    )
+                })
+                .count()
+        };
+        // 960×700: бары сверху/снизу — штрих есть.
+        let wide = count_hatch(egui::vec2(960.0, 700.0));
+        // 960×540 (ровное 16:9): полос нет — штриха нет.
+        let exact = count_hatch(egui::vec2(960.0, 540.0));
+        eprintln!("hatch lines: 960x700 -> {wide}, 960x540 -> {exact}");
+        assert!(wide > 10, "hatch missing on root ui");
+        assert_eq!(exact, 0);
+    }
 }

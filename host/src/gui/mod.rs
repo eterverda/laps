@@ -12,6 +12,7 @@ use std::sync::Arc;
 mod flight;
 mod guidelines;
 mod header;
+mod jumbotron;
 mod menu;
 mod ruler;
 mod style;
@@ -37,6 +38,9 @@ struct App {
     state: State,
     setup: Setup,
     assignments: HashMap<String, Pilot>,
+    /// Джамботрон: окно трансляции — на уровне приложения, переживает
+    /// навигацию между экранами.
+    jumbotron: jumbotron::Jumbotron,
     // Живёт с приложением: Drop останавливает accept-поток и снимает
     // регистрацию инстанса.
     _server: Option<Server>,
@@ -114,6 +118,7 @@ impl App {
             setup,
             assignments,
             remote_rx,
+            jumbotron: jumbotron::Jumbotron::new(),
             _server: server,
         }
     }
@@ -164,16 +169,23 @@ impl eframe::App for App {
                 let mut navigator = Navigator::default();
 
                 match self.state {
-                    State::Menu(ref mut menu) => match menu.update(ui) {
-                        menu::Action::Start => navigator.goto(Box::new(flight::Flight::live(
-                            &ctx,
-                            self.setup.clone(),
-                            self.assignments.clone(),
-                            RaceRules::default(),
-                        ))),
-                        menu::Action::None => {}
-                    },
-                    State::Flight(ref mut flight) => flight.update(ui, &mut navigator),
+                    State::Menu(ref mut menu) => {
+                        match menu.update(ui, &mut self.jumbotron) {
+                            menu::Action::Start => navigator.goto(Box::new(flight::Flight::live(
+                                &ctx,
+                                self.setup.clone(),
+                                self.assignments.clone(),
+                                RaceRules::default(),
+                            ))),
+                            menu::Action::None => {}
+                        }
+                        // В меню нет эфира: джамботрон в фазе None
+                        // («Please Stand By»), но окно живо.
+                        self.jumbotron.show(&ctx, None, None);
+                    }
+                    State::Flight(ref mut flight) => {
+                        flight.update(ui, &mut navigator, &mut self.jumbotron)
+                    }
                 }
 
                 if let Some(state) = navigator.0 {

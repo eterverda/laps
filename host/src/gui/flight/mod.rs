@@ -19,12 +19,14 @@ use crate::driver::dvr::{CAPTURES_DIR, RecordState};
 use crate::driver::keyboard::ExclusiveKeyboard;
 use crate::driver::keyboard::{KeyPressed, Keyboard};
 use crate::driver::player::{Player, PlayerState};
+use crate::egui_ext::UiExt;
 use crate::gui::flight::scrub::{
     PLAY_SPEEDS, RPT_SIZES, SCROLL_REARM, SCROLL_STEP, SEEK_RELEASE_RAMP, SEEK_SPEEDS, SEEK_TAP,
     ScrollGate, SeekButton, SeekEvent, Timeline, TimelineEvent, show_events,
 };
 use crate::gui::ruler::{CELL_SIZE, IntoRuler, cell_x, cell_y};
 use crate::gui::view::{Corner, Letterbox, TransportButton, hint_badge, hint_badge_corner};
+use crate::gui::viewfinder::{self, ViewfinderContents, ViewfinderFrame, ViewfinderFrameContents};
 use crate::model::flight::{
     Feat, Interval, Journal, JournalEntry, LapEvent, LapLine, RaceClip, Stamp, compute_feat,
     feat_places, latest_journal,
@@ -254,12 +256,10 @@ struct PadContents {
     /// Пад активен (глобальные клавиши): голубая рамка вокруг контента
     /// колонки (вьюфайндер и бокс кругов).
     active: bool,
-    label: String,
-    pilot: String,
-    color: egui::Color32,
-    /// UV-вьюпорт камеры.
-    viewport: egui::Rect,
-    image: viewfinder::ViewfinderContents,
+    /// Метка, имя и цвет рамки вьюфайндера.
+    frame: ViewfinderFrameContents,
+    /// Картинка: текстура с UV-вьюпортом камеры либо состояние.
+    image: ViewfinderContents,
     /// Alt: эффективное разрешение ("1080p") или "error".
     res_badge: Option<String>,
     /// Дистилят кругов: (метка конца круга, строка, события с метками);
@@ -311,6 +311,7 @@ struct RecContents {
 }
 
 /// TIMER: готовый текст и признак приглушения (мигание/нули).
+#[derive(Clone)]
 pub struct TimerContents {
     text: String,
     dim: bool,
@@ -705,14 +706,15 @@ impl Flight {
                         let capture_state = webcam.capture_state();
                         webcam.update_frame();
                         match capture_state {
-                            CaptureState::Live => {
-                                viewfinder::ViewfinderContents::Texture(webcam.texture())
-                            }
-                            CaptureState::Dead => viewfinder::ViewfinderContents::Error,
-                            CaptureState::Starting => viewfinder::ViewfinderContents::Pending,
+                            CaptureState::Live => ViewfinderContents::Texture {
+                                id: webcam.texture(),
+                                uv: pad.fpv.viewport.to_rect(),
+                            },
+                            CaptureState::Dead => ViewfinderContents::Error,
+                            CaptureState::Starting => ViewfinderContents::Pending,
                         }
                     }
-                    None => viewfinder::ViewfinderContents::Off,
+                    None => ViewfinderContents::Off,
                 };
                 // Alt-бейдж: разрешение показываем только для камер
                 // активных падов (как раньше — по shown_cameras).
@@ -738,13 +740,14 @@ impl Flight {
                 PadContents {
                     pad_id: pad_id.clone(),
                     active: active_pad.is_some_and(|a| a == pad_id),
-                    label: pad.label.clone(),
-                    pilot: assignments
-                        .get(pad_id)
-                        .map_or("", |pilot| pilot.name.as_str())
-                        .to_owned(),
-                    color: pad.color.to_color32(),
-                    viewport: pad.fpv.viewport.to_rect(),
+                    frame: ViewfinderFrameContents {
+                        label: pad.label.clone(),
+                        name: assignments
+                            .get(pad_id)
+                            .map_or("", |pilot| pilot.name.as_str())
+                            .to_owned(),
+                        color: pad.color.to_color32(),
+                    },
                     image,
                     res_badge,
                     laps: laps.get(pad_id).cloned().unwrap_or_default(),
@@ -989,17 +992,20 @@ impl Flight {
                         // начался/закончился — серый глиф (Pending).
                         PlayerState::Ready => {
                             if Self::clip_gap(&clip, &d.players, camera_id, pos) {
-                                viewfinder::ViewfinderContents::Pending
+                                ViewfinderContents::Pending
                             } else {
-                                viewfinder::ViewfinderContents::Texture(p.texture())
+                                ViewfinderContents::Texture {
+                                    id: p.texture(),
+                                    uv: pad.fpv.viewport.to_rect(),
+                                }
                             }
                         }
-                        PlayerState::Failed(_) => viewfinder::ViewfinderContents::Error,
-                        PlayerState::Opening => viewfinder::ViewfinderContents::Pending,
+                        PlayerState::Failed(_) => ViewfinderContents::Error,
+                        PlayerState::Opening => ViewfinderContents::Pending,
                     },
                     // Камера без файла (запись не состоялась): красный
                     // плюс по центру, как у мёртвой камеры.
-                    None => viewfinder::ViewfinderContents::Error,
+                    None => ViewfinderContents::Error,
                 };
                 let res_badge = if alt {
                     let res = match d.players.get(camera_id) {
@@ -1019,13 +1025,14 @@ impl Flight {
                 PadContents {
                     pad_id: pad_id.clone(),
                     active: active_pad.is_some_and(|a| a == pad_id),
-                    label: pad.label.clone(),
-                    pilot: assignments
-                        .get(pad_id)
-                        .map_or("", |pilot| pilot.name.as_str())
-                        .to_owned(),
-                    color: pad.color.to_color32(),
-                    viewport: pad.fpv.viewport.to_rect(),
+                    frame: ViewfinderFrameContents {
+                        label: pad.label.clone(),
+                        name: assignments
+                            .get(pad_id)
+                            .map_or("", |pilot| pilot.name.as_str())
+                            .to_owned(),
+                        color: pad.color.to_color32(),
+                    },
                     image,
                     res_badge,
                     // Скраббинг: чистый дистилят (без текущего круга).
@@ -1490,23 +1497,23 @@ impl Flight {
                         let viewfinder =
                             ruler.extrude(cell_x(viewfinder_cols), cell_y(viewfinder_rows + 2));
                         let frame_rect: egui::Rect = viewfinder.into();
-                        viewfinder::ViewfinderFrame::new(
-                            &content.label,
-                            &content.pilot,
-                            content.color,
-                            Corner::TopLeft,
-                        )
-                        .show(ui, frame_rect, |ui, rect| {
-                            viewfinder::Viewfinder::new(content.viewport).show(
-                                ui,
-                                content.image,
-                                rect,
-                            );
-                            // Alt: эффективное разрешение вьюпорта
-                            // (в правом нижнем углу картинки).
-                            if let Some(badge) = &content.res_badge {
-                                hint_badge_corner(ui, rect, std::slice::from_ref(badge));
-                            }
+                        // Фрейм рисует себя в max_rect вырезанного
+                        // Ui; видео хостит замыкание чилда.
+                        ui.place_ui(frame_rect, |ui| {
+                            ViewfinderFrame::new(content.frame.clone())
+                                .corner(Corner::TopLeft)
+                                .show(ui, |ui| {
+                                    ui.add(viewfinder::Viewfinder::new(content.image));
+                                    // Alt: эффективное разрешение вьюпорта
+                                    // (в правом нижнем углу картинки).
+                                    if let Some(badge) = &content.res_badge {
+                                        hint_badge_corner(
+                                            ui,
+                                            ui.max_rect(),
+                                            std::slice::from_ref(badge),
+                                        );
+                                    }
+                                });
                         });
                     }
                 }
@@ -1824,18 +1831,21 @@ impl Flight {
         // Джамботрон: окно трансляции. Транслируется контент главного
         // экрана в любой фазе: Idle/Live — камеры, Review — плееры DVR.
         // Закрытие окна (крестик ОС) гасит тоггл — внутри show.
-        let feed: Vec<jumbotron::Feed> = frame
+        let feed: Vec<jumbotron::JumboPadContents> = frame
             .pads
             .iter()
-            .map(|pad| jumbotron::Feed {
-                label: &pad.label,
-                pilot: &pad.pilot,
-                color: pad.color,
-                viewport: pad.viewport,
+            .map(|pad| jumbotron::JumboPadContents {
+                frame: pad.frame.clone(),
                 image: pad.image,
             })
             .collect();
-        jumbotron.show(ui.ctx(), Some(&feed), Some(&frame.timer));
+        jumbotron.show(
+            ui.ctx(),
+            jumbotron::JumbotronContents {
+                pads: feed,
+                timer: Some(frame.timer.clone()),
+            },
+        );
 
         if self.exit_requested {
             self.exit_requested = false;

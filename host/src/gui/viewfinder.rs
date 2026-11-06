@@ -1,21 +1,43 @@
+use crate::egui_ext::UiExt;
 use crate::gui::ruler::{cell_x, cell_y};
 use crate::gui::style;
 use crate::gui::view;
 use std::sync::OnceLock;
 
+/// Содержимое картинки пада: текстура кадра с UV-вьюпортом камеры
+/// (кадр текстуры, не экрана) либо состояние без картинки.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ViewfinderContents {
+    Texture {
+        id: egui::TextureId,
+        uv: egui::Rect,
+    },
+    /// Камера заводится/плеер открывается/разрыв таймлайна — серый глиф.
+    Pending,
+    Error,
+    Off,
+}
+
+/// Виджет-картинка пада над контентом. Rect — max_rect вырезанного
+/// коллером Ui (обмер — снаружи, у хостящего фрейма).
+#[derive(Clone, Copy)]
 pub struct Viewfinder {
-    pub uv: egui::Rect,
+    content: ViewfinderContents,
 }
 
 impl Viewfinder {
-    pub fn new(uv: egui::Rect) -> Self {
-        Self { uv }
+    pub fn new(content: ViewfinderContents) -> Self {
+        Self { content }
     }
+}
 
-    pub fn show(&self, ui: &mut egui::Ui, contents: ViewfinderContents, rect: egui::Rect) {
-        match contents {
-            ViewfinderContents::Texture(id) => {
-                ui.painter().image(id, rect, self.uv, egui::Color32::WHITE);
+impl egui::Widget for Viewfinder {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let response = ui.allocate_rect(ui.max_rect(), egui::Sense::hover());
+        let rect = response.rect;
+        match self.content {
+            ViewfinderContents::Texture { id, uv } => {
+                ui.painter().image(id, rect, uv, egui::Color32::WHITE);
             }
             // Нет картинки (камера заводится, плеер открывается, разрыв
             // записи на таймлайне): тесткард-заглушка.
@@ -35,54 +57,59 @@ impl Viewfinder {
             }
             ViewfinderContents::Off => {}
         }
+        response
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ViewfinderContents {
-    Texture(egui::TextureId),
-    /// Нет картинки: заводится/открывается/разрыв таймлайна — серый глиф.
-    Pending,
-    Error,
-    Off,
+/// Вьюфайндер с рамкой. Rect компонента — max_rect Ui, вырезанного
+/// коллером. Рисует цветную обводку, таб в углу `corner` (нижние углы
+/// — вертикальное зеркало верстки), имя пилота; содержимое видео
+/// хостит замыканием (чилдрн получает дочерний Ui под video_rect).
+/// Обмер снаружи: бокс = видео (+1 колонка рамки, +2 строки: таб 1¾ +
+/// полоса ¼).
+#[derive(Clone)]
+pub struct ViewfinderFrameContents {
+    pub label: String,
+    pub name: String,
+    pub color: egui::Color32,
 }
 
-/// Метка, имя пилота и цветная рамка вокруг вьюфайндера. Виджету
-/// отводится rect пада на клетку шире картинки: поля ½ клетки по
-/// бокам — рамка (8 px, Inside), видео — внутри рамки, ничего не
-/// вылезает за пределы rect. Таб: угол `corner`; нижние углы —
-/// вертикальное зеркало верстки внутри того же rect.
-pub struct ViewfinderFrame<'a> {
-    pub label: &'a str,
-    pub name: &'a str,
-    pub color: egui::Color32,
+pub struct ViewfinderFrame {
+    content: ViewfinderFrameContents,
     corner: view::Corner,
 }
 
-impl<'a> ViewfinderFrame<'a> {
-    /// `corner` — угол таба; нижние углы — вертикальное зеркало
-    /// верстки внутри того же rect.
-    pub fn new(label: &'a str, name: &'a str, color: egui::Color32, corner: view::Corner) -> Self {
+impl ViewfinderFrame {
+    pub fn new(content: ViewfinderFrameContents) -> Self {
         Self {
-            label,
-            name,
-            color,
-            corner,
+            content,
+            corner: view::Corner::TopLeft,
         }
     }
 
-    pub fn show(
+    /// Позиция таба: угол рамки. По умолчанию TopLeft. Для нижних
+    /// углов вёрстка зеркалится: таб к нижнему краю, рамка — к верхнему.
+    pub fn corner(mut self, corner: view::Corner) -> Self {
+        self.corner = corner;
+        self
+    }
+
+    pub fn show<R>(
         &self,
         ui: &mut egui::Ui,
-        rect: egui::Rect,
-        contents: impl FnOnce(&mut egui::Ui, egui::Rect),
-    ) {
-        let inset = cell_x(1) / 2.0;
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::InnerResponse<R> {
+        let rect = ui.max_rect();
         let top = matches!(self.corner, view::Corner::TopLeft | view::Corner::TopRight);
+        let left = matches!(
+            self.corner,
+            view::Corner::TopLeft | view::Corner::BottomLeft
+        );
+        let inset = cell_x(1) / 2.0;
         // Верстка — как на главном (верхние табы) либо её вертикальное
-        // зеркало (нижние): рамка на 1½ клетки уже бокса по высоте
-        // (под таб), текстура ровно на 2 меньше (таб 1¾ + полосы ¼+¼):
-        // у верхних табов прижата ¼ к низу, у нижних — ¼ к верху. Все
+        // зеркало (нижние): рамка на 1½ клетки уже бокса по высоте (под
+        // таб), текстура ровно на 2 меньше (таб 1¾ + полосы ¼+¼): у
+        // верхних табов прижата ¼ к низу, у нижних — ¼ к верху. Все
         // размеры одинаковы, меняется только привязка.
         let frame_rect = if top {
             rect.with_min_y(rect.min.y + cell_y(3) / 2.0)
@@ -92,30 +119,23 @@ impl<'a> ViewfinderFrame<'a> {
         ui.painter().rect_stroke(
             frame_rect,
             0.0,
-            egui::Stroke::new(inset, self.color),
+            egui::Stroke::new(inset, self.content.color),
             egui::StrokeKind::Inside,
         );
-        // Видео — прежнего размера, на ¼ клетки ниже/выше полос рамки.
-        let viewfinder_rect = frame_rect.shrink2(egui::vec2(inset, inset));
+        // Видео — внутри рамки, 8 px по кругу от полос.
+        let video_rect = frame_rect.shrink2(egui::vec2(inset, inset));
 
-        // Таб: фон — текст плюс клетка паддинга с каждой стороны;
-        // угол — corner (сторона рамки × привязка к краю), снаружи/
-        // внутри — outside. Имя — сбоку таба (справа для левых
-        // привязок, слева для правых).
-        let tab_w = cell_x(self.label.len() as isize * 2 + 2);
+        // Таб: фон — текст плюс клетка паддинга с каждой стороны.
+        // Имя — сбоку таба (справа для левых привязок, слева для
+        // правых), строго по сетке: у верхних табов — верхняя клетка
+        // бокса, у нижних — первая клетка под низом бокса.
+        let tab_w = cell_x(self.content.label.len() as isize * 2 + 2);
         let tab_h = cell_y(7) / 4.0;
-        let left = matches!(
-            self.corner,
-            view::Corner::TopLeft | view::Corner::BottomLeft
-        );
         let tab_x = if left {
             rect.left()
         } else {
             rect.right() - tab_w
         };
-        // Таб 1¾ клетки прижат к своей границе компонента; внутренняя
-        // грань перекрывает полосу рамки на ¼. Нижний таб: низ =
-        // низу компонента.
         let tab_y = if top {
             rect.top()
         } else {
@@ -123,18 +143,15 @@ impl<'a> ViewfinderFrame<'a> {
         };
         let label_rect =
             egui::Rect::from_min_size(egui::pos2(tab_x, tab_y), egui::vec2(tab_w, tab_h));
-        ui.painter().rect_filled(label_rect, 0.0, self.color);
+        ui.painter()
+            .rect_filled(label_rect, 0.0, self.content.color);
         ui.painter().text(
             label_rect.center(),
             egui::Align2::CENTER_CENTER,
-            self.label,
+            self.content.label.as_str(),
             style::FONT_REGULAR_X2,
             egui::Color32::WHITE,
         );
-        // Имя — сбоку таба (справа для левых привязок, слева для
-        // правых), строго по сетке: у верхних табов — верхняя клетка
-        // бокса, у нижних — первая клетка под низом бокса (в пределах
-        // висящего таба).
         let name_y = if top {
             label_rect.top()
         } else {
@@ -155,20 +172,20 @@ impl<'a> ViewfinderFrame<'a> {
             // Имя пилота: пластиковым, ровно по клетке.
             name_pos,
             name_align,
-            self.name,
+            self.content.name.as_str(),
             style::FONT_REGULAR,
             style::TRANSPORT_ACTIVE,
         );
-
-        contents(ui, viewfinder_rect);
+        // Видео — дочерний Ui, ограниченный video_rect.
+        ui.place_ui(video_rect, add_contents)
     }
 }
 
-pub const FULL_UV: egui::Rect =
-    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-static TESTCARD_TEXTURE: OnceLock<egui::TextureHandle> = OnceLock::new();
+const FULL_UV: egui::Rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
 fn testcard_texture_id(ui: &mut egui::Ui) -> egui::TextureId {
+    static TESTCARD_TEXTURE: OnceLock<egui::TextureHandle> = OnceLock::new();
+
     TESTCARD_TEXTURE
         .get_or_init(|| {
             let tree = resvg::usvg::Tree::from_data(

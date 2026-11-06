@@ -86,10 +86,8 @@ impl Letterbox {
             )
         };
 
-        // Виртуальный размер — целые пиксели (не клетки): внутри
-        // канваса верстается в px, к клеткам привязываются сами
-        // виджеты. Клеточный снап — снаружи (экранная разметка),
-        // здесь — только округление до целого px.
+        // Инвариант виртуального канваса: размер — целые пиксели.
+        // Клеточная привязка — задача виджетов внутри, не канваса.
         let virtual_size = egui::vec2(virtual_size.x.round(), virtual_size.y.round());
         let screen_offset = min_rect + offset;
         let rect = egui::Rect::from_min_size(screen_offset, virtual_size * scale);

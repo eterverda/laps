@@ -181,7 +181,8 @@ impl eframe::App for App {
                         }
                         // В меню нет эфира: джамботрон в фазе None
                         // («Please Stand By»), но окно живо.
-                        self.jumbotron.show(&ctx, None, None);
+                        self.jumbotron
+                            .show(&ctx, jumbotron::JumbotronContents::default());
                     }
                     State::Flight(ref mut flight) => {
                         flight.update(ui, &mut navigator, &mut self.jumbotron)

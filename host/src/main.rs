@@ -7,6 +7,7 @@ use crate::remote::Response;
 mod assets;
 mod config;
 mod driver;
+mod egui_ext;
 mod gui;
 mod model;
 mod remote;

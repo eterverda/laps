@@ -728,9 +728,15 @@ impl Flight {
                     };
                     Some(match res {
                         Some(r) => {
-                            let lines =
-                                r.height as f32 * (pad.fpv.viewport.bottom - pad.fpv.viewport.top);
-                            format!("{}p", lines.round() as u32)
+                            let lines = r.height as f32 * pad.fpv.viewport.to_rect().height();
+                            // Формат «540p@60fps»: эффективные строки
+                            // вьюпорта @ целевой fps камеры.
+                            match setup.cameras.get(&pad.fpv.camera_id) {
+                                Some(c) => {
+                                    format!("{}p@{}fps", lines.round() as u32, c.frame_rate.0)
+                                }
+                                None => format!("{}p", lines.round() as u32),
+                            }
                         }
                         None => "error".to_owned(),
                     })
@@ -1015,9 +1021,11 @@ impl Flight {
                         None => setup.cameras.get(camera_id).map(|c| c.resolution),
                     };
                     res.map(|r| {
-                        let lines =
-                            r.height as f32 * (pad.fpv.viewport.bottom - pad.fpv.viewport.top);
-                        format!("{}p", lines.round() as u32)
+                        let lines = r.height as f32 * pad.fpv.viewport.to_rect().height();
+                        match setup.cameras.get(camera_id) {
+                            Some(c) => format!("{}p@{}fps", lines.round() as u32, c.frame_rate.0),
+                            None => format!("{}p", lines.round() as u32),
+                        }
                     })
                 } else {
                     None

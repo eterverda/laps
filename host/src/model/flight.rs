@@ -554,34 +554,41 @@ pub fn compute_feat(
     lines: &[(Stamp, LapLine, Vec<(Stamp, LapEvent)>)],
 ) -> Feat {
     let is_success = |line: &LapLine| matches!(line, LapLine::Success { .. });
-    let completed: Vec<(Stamp, &LapLine)> = lines
+    let completed: Vec<usize> = lines
         .iter()
-        .filter(|(_, line, _)| is_success(line) || matches!(line, LapLine::Fail { .. }))
-        .map(|(at, line, _)| (*at, line))
+        .enumerate()
+        .filter(|(_, (_, line, _))| is_success(line) || matches!(line, LapLine::Fail { .. }))
+        .map(|(i, _)| i)
         .collect();
-    // Старт первого интервала — старт гонки; без него (эфир: GUI оси
-    // не видит) — выводим из длительности (дистиллятор считал её ровно
-    // как end − start, стык точный).
-    let start_of = |i: usize| -> Stamp {
-        if i == 0 {
-            race_start.unwrap_or_else(|| {
-                completed[0]
-                    .0
-                    .plus_ms(-(completed[0].1.duration().as_millis() as i64))
-            })
+    // Старт первого интервала: конец предыдущей строки (при холшоте
+    // первый счётный круг начинается с конца HS, а не со старта гонки
+    // — иначе время HS попадает в круг). Первая строка без предка —
+    // старт гонки; без него (эфир: GUI оси не видит) — выводим из
+    // длительности (дистиллятор считал её ровно как end − start,
+    // стык точный).
+    let start_of = |k: usize| -> Stamp {
+        let i = completed[k];
+        if k > 0 {
+            lines[completed[k - 1]].0
+        } else if i > 0 {
+            lines[i - 1].0
         } else {
-            completed[i - 1].0
+            race_start.unwrap_or_else(|| {
+                lines[i]
+                    .0
+                    .plus_ms(-(lines[i].1.duration().as_millis() as i64))
+            })
         }
     };
     match kind {
         FeatKind::Most => Feat {
             count: completed
                 .iter()
-                .filter(|(_, line)| is_success(line))
+                .filter(|&&i| is_success(&lines[i].1))
                 .count(),
             kind,
             intervals: (0..completed.len())
-                .map(|i| (start_of(i), completed[i].0))
+                .map(|k| (start_of(k), lines[completed[k]].0))
                 .collect(),
         },
         best => {
@@ -596,15 +603,15 @@ pub fn compute_feat(
             // равные — первое окно (как у тренера).
             for window in (1..=size.min(completed.len())).rev() {
                 let best_at = (0..=completed.len() - window)
-                    .filter(|&i| {
-                        completed[i..i + window]
+                    .filter(|&k| {
+                        completed[k..k + window]
                             .iter()
-                            .all(|(_, line)| is_success(line))
+                            .all(|&i| is_success(&lines[i].1))
                     })
-                    .min_by_key(|&i| {
-                        completed[i..i + window]
+                    .min_by_key(|&k| {
+                        completed[k..k + window]
                             .iter()
-                            .map(|(_, line)| line.duration().as_millis() as u64)
+                            .map(|&i| lines[i].1.duration().as_millis() as u64)
                             .sum::<u64>()
                     });
                 if let Some(at) = best_at {
@@ -612,7 +619,7 @@ pub fn compute_feat(
                         count: window,
                         kind,
                         intervals: (at..at + window)
-                            .map(|j| (start_of(j), completed[j].0))
+                            .map(|k| (start_of(k), lines[completed[k]].0))
                             .collect(),
                     };
                 }
@@ -1425,6 +1432,70 @@ mod feat_compute_tests {
         let feat = compute_feat(FeatKind::Best3, Some(Stamp(10_000)), &lines);
         assert_eq!(feat.count, 0);
         assert!(feat.intervals.is_empty());
+    }
+
+    #[test]
+    fn best2_picks_min_pair_sum() {
+        // 10 + 11 = 21 против 11 + 9 = 20: минимум — вторая пара.
+        let lines = race_lines(&[(20_000, "lap"), (31_000, "lap"), (40_000, "lap")]);
+        let feat = compute_feat(FeatKind::Best2, Some(Stamp(10_000)), &lines);
+        assert_eq!(feat.count, 2);
+        assert_eq!(feat.raw_time_ms(), 20_000);
+    }
+
+    #[test]
+    fn race_start_fallback_infers_from_first_duration() {
+        // Без старта гонки первый интервал выводится из длительности
+        // первого круга — стык с дистиллятором точный, результат тот же.
+        let lines = race_lines(&[(20_000, "lap"), (32_000, "lap")]);
+        let feat = compute_feat(FeatKind::Best1, None, &lines);
+        assert_eq!(feat.raw_time_ms(), 10_000);
+        assert_eq!(feat.intervals, vec![(Stamp(10_000), Stamp(20_000))]);
+    }
+
+    #[test]
+    fn holeshot_line_is_not_a_lap() {
+        // HS (10s), круг 1 (12s), круг 2 (8s): HS — не круг, в фит не
+        // входит; Best1 = 8s, Best2 = 20s (12+8), а не окна с HS.
+        let mut journal = Journal::new(
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+            BTreeMap::new(),
+            Default::default(),
+            Default::default(),
+        );
+        journal.header.rules.holeshot_enabled = true;
+        journal.push(Stamp(10_000), JournalEntry::RaceStarted {});
+        for ms in [20_000, 32_000, 40_000] {
+            journal.push(
+                Stamp(ms),
+                JournalEntry::RaceEvent {
+                    pad_id: "pad-1".to_owned(),
+                    name: LapEvent::Lap,
+                },
+            );
+        }
+        let lines = journal.lap_infos("pad-1");
+        assert!(
+            matches!(lines[0].1, LapLine::Holeshot { .. }),
+            "первая строка — HS: {:?}",
+            lines[0].1
+        );
+        let best1 = compute_feat(FeatKind::Best1, Some(Stamp(10_000)), &lines);
+        assert_eq!(best1.count, 1);
+        assert_eq!(best1.raw_time_ms(), 8_000);
+        let best2 = compute_feat(FeatKind::Best2, Some(Stamp(10_000)), &lines);
+        assert_eq!(best2.count, 2);
+        assert_eq!(best2.raw_time_ms(), 20_000);
+    }
+
+    #[test]
+    fn equal_windows_take_the_first() {
+        // Два круга по 10s: равные окна — первое (как у тренера).
+        // Первый круг начинается со старта гонки, не с конца «предыдущей»
+        // строки (строк-то нет — холшот выключен).
+        let lines = race_lines(&[(20_000, "lap"), (30_000, "lap")]);
+        let feat = compute_feat(FeatKind::Best1, Some(Stamp(10_000)), &lines);
+        assert_eq!(feat.intervals, vec![(Stamp(10_000), Stamp(20_000))]);
     }
 }
 

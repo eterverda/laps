@@ -732,7 +732,11 @@ fn open_session(path: &str, config: &CameraConfig) -> IoResult<V4l2Session> {
                         log::info!("first frame after STREAMON is a fragment, drained");
                     }
                 }
-                let _ = unsafe { qbuf(fd, &mut first) }.map_err(IoError::from);
+                // Буфер обязан вернуться в кольцо: потерянный здесь —
+                // сессия с дыркой, неудачный qbuf = fd умирает.
+                if let Err(e) = unsafe { qbuf(fd, &mut first) } {
+                    return Err(IoError::from(e));
+                }
             }
         }
         Ok(V4l2Session {
@@ -791,21 +795,30 @@ impl CaptureSession for V4l2Session {
             }
         }
         if !dequeued {
-            return Err(FrameError::Recoverable(
-                "DQBUF kept returning EAGAIN after polling".to_owned(),
+            return Err(FrameError::recoverable(
+                "DQBUF kept returning EAGAIN after polling",
             ));
         }
         if buf.flags & V4L2_BUF_FLAG_ERROR != 0 {
             // Corrupted in transit (e.g. lost USB packet) — uvcvideo
-            // delivers it flagged and possibly truncated.
-            return Err(FrameError::Recoverable(format!(
+            // delivers it flagged and possibly truncated. The buffer
+            // still goes back to the ring: a flagged frame left
+            // unqueued drains the ring (4 buffers → dead stream after
+            // a handful of link errors).
+            if let Err(e) = unsafe { qbuf(self.fd, &mut buf) } {
+                return Err(FrameError::unrecoverable(e));
+            }
+            return Err(FrameError::recoverable(format!(
                 "driver flagged buffer {} as erroneous (sequence {})",
                 buf.index, buf.sequence
             )));
         }
         let index = buf.index as usize;
         if index >= self.buffers.len() {
-            return Err(FrameError::Recoverable(format!(
+            if let Err(e) = unsafe { qbuf(self.fd, &mut buf) } {
+                return Err(FrameError::unrecoverable(e));
+            }
+            return Err(FrameError::recoverable(format!(
                 "DQBUF returned index {} out of {} buffers",
                 buf.index,
                 self.buffers.len()
@@ -819,8 +832,9 @@ impl CaptureSession for V4l2Session {
         )
         .expect("index checked above");
         // Buffer copied — return it to the driver before processing.
-        unsafe { qbuf(self.fd, &mut buf) }
-            .map_err(|e| FrameError::Recoverable(IoError::from(e).to_string()))?;
+        if let Err(e) = unsafe { qbuf(self.fd, &mut buf) } {
+            return Err(FrameError::unrecoverable(e));
+        }
         Ok(Frame {
             at: buffer_timestamp(&buf, &self.mono_anchor),
             data,
@@ -877,16 +891,17 @@ fn extract_frame(
 
 fn frame_error(poll_rc: i32) -> FrameError {
     if poll_rc == 0 {
-        FrameError::Recoverable("DQBUF poll timeout".to_owned())
+        FrameError::recoverable("DQBUF poll timeout".to_owned())
     } else {
-        FrameError::Unrecoverable(format!("DQBUF poll error: {poll_rc}"))
+        // poll вернул -1: errno валиден, это смерть fd-уровня.
+        FrameError::unrecoverable(IoError::last_os_error())
     }
 }
 
 fn frame_error_e(e: IoError) -> FrameError {
     match e.raw_os_error() {
-        Some(libc::ENODEV) | Some(libc::EIO) => FrameError::Unrecoverable(e.to_string()),
-        _ => FrameError::Recoverable(e.to_string()),
+        Some(code) if code == libc::ENODEV || code == libc::EIO => FrameError::unrecoverable(e),
+        _ => FrameError::recoverable(e.to_string()),
     }
 }
 

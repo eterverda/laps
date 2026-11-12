@@ -8,6 +8,7 @@
 //! файле — `mjpeg`-поток. Никаких «MJPEG-кадров».
 
 use crate::config::camera::{CameraConfig, FrameRateConfig, PixelConfig, ResolutionConfig};
+use std::io::Error as IoError;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,12 +34,24 @@ pub struct DeviceInfo {
 pub enum FrameError {
     /// Пропустить кадр и продолжать (временный сбой; при подряд идущих
     /// ошибках снаружи работает watchdog по времени без кадров).
-    Recoverable(String),
-    /// Камера потеряна окончательно — остановить capture-поток.
-    /// Пока не конструируется (nokhwa всё отдаёт как Recoverable);
-    /// для будущих бэкендов (V4L2: EIO/ENODEV) — см. docs/capture-backend-plan.md.
-    #[allow(dead_code)]
-    Unrecoverable(String),
+    Recoverable(IoError),
+    /// Камера потеряна окончательно — остановить capture-поток. V4L2:
+    /// смерть fd/сессии (ENODEV/EIO, потерянный из кольца буфер).
+    Unrecoverable(IoError),
+}
+
+impl FrameError {
+    /// Unrecoverable по системной ошибке (errno живёт внутри объекта;
+    /// nix Errno переезжает через From<Errno> for io::Error).
+    pub fn unrecoverable(e: impl Into<IoError>) -> Self {
+        FrameError::Unrecoverable(e.into())
+    }
+
+    /// Recoverable с диагностическим сообщением (системного errno нет —
+    /// сбой описывается текстом).
+    pub fn recoverable(message: impl Into<String>) -> Self {
+        FrameError::Recoverable(IoError::other(message.into()))
+    }
 }
 
 /// Кадр: таймстемп + контент. Таймстемп — момент захвата: бэкенд

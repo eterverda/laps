@@ -4,8 +4,8 @@ use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::{RESPONSE_TIMEOUT, Response, Server};
 use crossbeam_channel as crossbeam;
+use indexmap::IndexMap;
 use serde_yaml::from_str as from_yaml_string;
-use std::collections::HashMap;
 use std::process;
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ struct App {
     _server: Option<Server>,
 }
 
-fn hardcoded_assignments() -> HashMap<String, Pilot> {
+fn hardcoded_assignments() -> IndexMap<String, Pilot> {
     ["pad-1", "pad-2", "pad-3", "pad-4"]
         .into_iter()
         .map(|pad_id| (pad_id.to_owned(), Pilot::random()))

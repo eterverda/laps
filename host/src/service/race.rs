@@ -15,7 +15,8 @@ use crate::model::pilot::Pilot;
 use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
 use crate::service::key_matcher::{KeyMatch, KeyMatcher};
 use crossbeam_channel as crossbeam;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use indexmap::IndexMap;
+use std::collections::VecDeque;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -158,16 +159,16 @@ struct RaceCore {
     /// презентация, но часы гонки завязаны на его длительность).
     buzzer_len: Duration,
     /// camera_id → конфиг (стемы, расширения файлов записи).
-    cameras: HashMap<String, CameraConfig>,
+    cameras: IndexMap<String, CameraConfig>,
     /// Имена файлов открытых сессий по камерам (FIFO: сессия привязывается
     /// к первому кадру по порядку стартов).
-    rec_pending: HashMap<String, VecDeque<String>>,
+    rec_pending: IndexMap<String, VecDeque<String>>,
     /// Отложенные события (REC-on и VideoAttached головы до старта
     /// гонки): пишутся в журнал в момент старта гонки, при отмене —
     /// выбрасываются.
     rec_deferred: Vec<(Stamp, JournalEntry)>,
     /// Последнее известное first_frame_at по камерам (edge-детект).
-    rec_seen: HashMap<String, Option<Instant>>,
+    rec_seen: IndexMap<String, Option<Instant>>,
     /// Гонка состоялась (Running или дальше): отличает финиш после гонки
     /// (журнал отдаём в DVR) от отмены записи до старта (ядро дропается,
     /// GUI возвращается в Idle).
@@ -175,10 +176,10 @@ struct RaceCore {
     /// pad_id → начало текущего круга: момент последнего зафиксированного
     /// Lap (первый круг — старт гонки, `start_at`). Метка дистилята
     /// `Current.since`, из журнала не выводится (там ms-домен).
-    lap_started_at: HashMap<String, Instant>,
+    lap_started_at: IndexMap<String, Instant>,
     /// pad_id → события текущего круга (fault/correct с последнего Lap):
     /// живут в дистиляте `Current`, журнал их хранит сам.
-    lap_events: HashMap<String, Vec<(Stamp, LapEvent)>>,
+    lap_events: IndexMap<String, Vec<(Stamp, LapEvent)>>,
     /// Матчер клавиатурных биндингов: бинды падов из сетапа + глобальная
     /// таблица (цифры — активный пад, Space — lap активного). Матчер
     /// чистый: активный пад — состояние ядра, матчится с ним как с
@@ -201,9 +202,9 @@ impl RaceCore {
         rules: RaceRules,
         captures_dir: PathBuf,
         buzzer_len: Duration,
-        pads: BTreeMap<String, PadConfig>,
-        assignments: HashMap<String, Pilot>,
-        cameras: HashMap<String, CameraConfig>,
+        pads: IndexMap<String, PadConfig>,
+        assignments: IndexMap<String, Pilot>,
+        cameras: IndexMap<String, CameraConfig>,
         key_matcher: KeyMatcher,
         active_pad: Option<String>,
     ) -> (Self, Vec<Effect>) {
@@ -219,12 +220,12 @@ impl RaceCore {
             started: now,
             buzzer_len,
             cameras,
-            rec_pending: HashMap::new(),
+            rec_pending: IndexMap::new(),
             rec_deferred: Vec::new(),
-            rec_seen: HashMap::new(),
+            rec_seen: IndexMap::new(),
             raced: false,
-            lap_started_at: HashMap::new(),
-            lap_events: HashMap::new(),
+            lap_started_at: IndexMap::new(),
+            lap_events: IndexMap::new(),
             key_matcher,
             active_pad,
         };
@@ -697,10 +698,10 @@ mod tests {
             },
             temp_dir(),
             Duration::ZERO, // гудок нулевой: числа сценариев проще
-            BTreeMap::new(),
-            HashMap::new(),
-            HashMap::from([("camera-1".to_owned(), test_camera())]),
-            test_matcher(BTreeMap::new()),
+            IndexMap::new(),
+            IndexMap::new(),
+            IndexMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(IndexMap::new()),
             None,
         )
         .0
@@ -708,7 +709,7 @@ mod tests {
 
     /// Матчер над заданными падами (setup на входе — только источник
     /// падов и их биндов).
-    fn test_matcher(pads: BTreeMap<String, PadConfig>) -> KeyMatcher {
+    fn test_matcher(pads: IndexMap<String, PadConfig>) -> KeyMatcher {
         // Биндинги тестов — уровень сетапа: «A на key-1 → lap pad-1»,
         // «Shift+B на key-1 → fault pad-1» (бывшие падовые бинды).
         let keybinds = vec![
@@ -728,17 +729,17 @@ mod tests {
             },
         ];
         KeyMatcher::new(&Setup {
-            cameras: BTreeMap::new(),
+            cameras: IndexMap::new(),
             pads,
             keybinds,
             #[cfg(target_os = "linux")]
-            exclusive_keyboards: BTreeMap::new(),
+            exclusive_keyboards: IndexMap::new(),
         })
     }
 
     /// Пад с одним биндингом «A → lap» на эксклюзивной клавиатуре key-1.
-    fn test_pads() -> BTreeMap<String, PadConfig> {
-        let mut pads = BTreeMap::new();
+    fn test_pads() -> IndexMap<String, PadConfig> {
+        let mut pads = IndexMap::new();
         pads.insert(
             "pad-1".to_owned(),
             PadConfig {
@@ -790,8 +791,8 @@ mod tests {
             temp_dir(),
             Duration::ZERO,
             test_pads(),
-            HashMap::new(),
-            HashMap::from([("camera-1".to_owned(), test_camera())]),
+            IndexMap::new(),
+            IndexMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(test_pads()),
             None,
         );
@@ -865,8 +866,8 @@ mod tests {
             temp_dir(),
             Duration::ZERO,
             test_pads(),
-            HashMap::new(),
-            HashMap::from([("camera-1".to_owned(), test_camera())]),
+            IndexMap::new(),
+            IndexMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(test_pads()),
             None,
         );
@@ -977,7 +978,7 @@ mod tests {
                 },
             },
         );
-        let assignments = HashMap::from([
+        let assignments = IndexMap::from([
             ("pad-1".to_owned(), Pilot::new("P-1")),
             ("pad-2".to_owned(), Pilot::new("P-2")),
         ]);
@@ -995,7 +996,7 @@ mod tests {
             Duration::ZERO,
             pads.clone(),
             assignments,
-            HashMap::from([("camera-1".to_owned(), test_camera())]),
+            IndexMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(pads),
             None,
         );
@@ -1289,7 +1290,7 @@ mod tests {
     #[test]
     fn fileless_camera_leaves_no_trace() {
         let mut clock = FakeClock::new();
-        let mut cameras = HashMap::from([("camera-1".to_owned(), test_camera())]);
+        let mut cameras = IndexMap::from([("camera-1".to_owned(), test_camera())]);
         cameras.insert("camera-2".to_owned(), test_camera());
         let mut core = RaceCore::new(
             clock.now,
@@ -1301,10 +1302,10 @@ mod tests {
             },
             temp_dir(),
             Duration::ZERO,
-            BTreeMap::new(),
-            HashMap::new(),
+            IndexMap::new(),
+            IndexMap::new(),
             cameras,
-            test_matcher(BTreeMap::new()),
+            test_matcher(IndexMap::new()),
             None,
         )
         .0;
@@ -1347,10 +1348,10 @@ mod tests {
             },
             temp_dir(),
             Duration::ZERO,
-            BTreeMap::new(),
-            HashMap::new(),
-            HashMap::from([("camera-1".to_owned(), test_camera())]),
-            test_matcher(BTreeMap::new()),
+            IndexMap::new(),
+            IndexMap::new(),
+            IndexMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(IndexMap::new()),
             None,
         )
         .0;
@@ -1452,11 +1453,11 @@ impl Race {
     pub fn spawn(
         rules: RaceRules,
         captures_dir: PathBuf,
-        pads: BTreeMap<String, PadConfig>,
-        assignments: HashMap<String, Pilot>,
-        cameras: HashMap<String, CameraConfig>,
+        pads: IndexMap<String, PadConfig>,
+        assignments: IndexMap<String, Pilot>,
+        cameras: IndexMap<String, CameraConfig>,
         key_matcher: KeyMatcher,
-        recorders: HashMap<String, Recorder>,
+        recorders: IndexMap<String, Recorder>,
         keyboard_rx: crossbeam::Receiver<KeyPressed>,
         wake: Arc<dyn Fn() + Send + Sync>,
         audio: Audio,
@@ -1665,7 +1666,7 @@ fn countdown_steps(delay: Duration) -> Vec<(Duration, Sound)> {
 }
 
 /// Исполнение эффектов ядра: команды рекордерам, звук.
-fn apply(effects: &[Effect], recorders: &HashMap<String, Recorder>, audio: &Audio) {
+fn apply(effects: &[Effect], recorders: &IndexMap<String, Recorder>, audio: &Audio) {
     for effect in effects {
         match effect {
             Effect::Record { sessions } => {

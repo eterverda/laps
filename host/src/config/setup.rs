@@ -1,5 +1,5 @@
+use indexmap::IndexMap;
 use serde::Deserialize;
-use std::collections::BTreeMap;
 
 use crate::config::camera::{CameraConfig, ViewportConfig};
 #[cfg(target_os = "linux")]
@@ -9,8 +9,8 @@ use crate::config::keyboard::KeyBind;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Setup {
-    pub cameras: BTreeMap<String, CameraConfig>,
-    pub pads: BTreeMap<String, PadConfig>,
+    pub cameras: IndexMap<String, CameraConfig>,
+    pub pads: IndexMap<String, PadConfig>,
     /// Клавиатурные биндинги (уровень сетапа, не пада): каждый несёт
     /// `pad-id` — над каким падом сигнал; без него сигнал уходит
     /// активному паду.
@@ -20,7 +20,7 @@ pub struct Setup {
     // сетап-файлы уже могли описывать клавиатуры.
     #[serde(default)]
     #[cfg(target_os = "linux")]
-    pub exclusive_keyboards: BTreeMap<String, ExclusiveKeyboardConfig>,
+    pub exclusive_keyboards: IndexMap<String, ExclusiveKeyboardConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]

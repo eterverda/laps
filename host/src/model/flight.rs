@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use indexmap::IndexMap;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -26,8 +26,8 @@ pub struct JournalHeader {
     /// Правила гонки: контекст полёта, журнал их хранит — без них
     /// холодный вход не воспроизведёт имена кругов и результаты.
     pub rules: RaceRules,
-    pub pads: BTreeMap<String, PadConfig>,
-    pub assignments: HashMap<String, Pilot>,
+    pub pads: IndexMap<String, PadConfig>,
+    pub assignments: IndexMap<String, Pilot>,
 }
 
 impl JournalHeader {
@@ -142,19 +142,19 @@ impl Journal {
 
     /// Состав пилотов из заголовка записи (scrub показывает его,
     /// не текущий рандом приложения).
-    pub fn assignments(&self) -> &HashMap<String, Pilot> {
+    pub fn assignments(&self) -> &IndexMap<String, Pilot> {
         &self.header.assignments
     }
 
     /// Пады записанной гонки (заголовок).
-    pub fn pads(&self) -> &BTreeMap<String, PadConfig> {
+    pub fn pads(&self) -> &IndexMap<String, PadConfig> {
         &self.header.pads
     }
 
     pub fn new(
         date_time: OffsetDateTime,
-        pads: BTreeMap<String, PadConfig>,
-        assignments: HashMap<String, Pilot>,
+        pads: IndexMap<String, PadConfig>,
+        assignments: IndexMap<String, Pilot>,
         rules: RaceRules,
     ) -> Self {
         Self {
@@ -483,7 +483,7 @@ pub struct RaceClip {
     pub recording: Option<Interval>,
     /// camera_id → (имя файла, метка первого кадра = ноль файла):
     /// файл кладётся на полоску по первому кадру.
-    pub files: HashMap<String, (String, Stamp)>,
+    pub files: IndexMap<String, (String, Stamp)>,
     /// Момент нажатия RACE (начало отсчёта): стартовая позиция
     /// курсора DVR и точка на таймлайне.
     pub race_countdown: Option<Stamp>,
@@ -813,7 +813,7 @@ mod tests {
 
     fn sample_journal() -> Journal {
         let date_time = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-        let mut pads = BTreeMap::new();
+        let mut pads = IndexMap::new();
         pads.insert(
             "pad-1".to_owned(),
             PadConfig {
@@ -825,7 +825,7 @@ mod tests {
                 },
             },
         );
-        let mut assignments = HashMap::new();
+        let mut assignments = IndexMap::new();
         assignments.insert("pad-1".to_owned(), Pilot::new("Цой Жив"));
         let mut journal = Journal::new(
             date_time,
@@ -1380,6 +1380,7 @@ pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod feat_compute_tests {
     use super::{FeatKind, Journal, JournalEntry, LapEvent, LapLine, Stamp, compute_feat};
+    use indexmap::IndexMap;
     use std::collections::BTreeMap;
 
     /// Гонка: старт, затем события пада; холшот включён (дистиллят
@@ -1387,7 +1388,7 @@ mod feat_compute_tests {
     fn race_lines(events: &[(u64, &str)]) -> Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)> {
         let mut journal = Journal::new(
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
-            BTreeMap::new(),
+            IndexMap::new(),
             Default::default(),
             Default::default(),
         );
@@ -1504,7 +1505,7 @@ mod feat_compute_tests {
         // входит; Best1 = 8s, Best2 = 20s (12+8), а не окна с HS.
         let mut journal = Journal::new(
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
-            BTreeMap::new(),
+            IndexMap::new(),
             Default::default(),
             Default::default(),
         );
@@ -1547,6 +1548,7 @@ mod feat_compute_tests {
 #[cfg(test)]
 mod feat_places_tests {
     use super::{Feat, FeatKind, Stamp, feat_places};
+    use indexmap::IndexMap;
 
     fn feat(count: usize, total_ms: u64) -> Feat {
         // Интервалы рвём поровну — raw_time_ms = total_ms.

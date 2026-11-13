@@ -21,6 +21,7 @@ fixedbitset = "0.5"
 rodio = { version = "0.23", default-features = false, features = ["playback", "wav"] }
 crossbeam-utils = "0.8"
 eframe = "0.37"
+indexmap = { version = "2", features = ["serde"] }
 egui = "0.37"
 log = "0.4"
 

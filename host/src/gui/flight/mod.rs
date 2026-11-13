@@ -287,8 +287,7 @@ struct ButtonContents {
 
 impl ButtonContents {
     /// Мёртвая кнопка (не кликабельна, без баббла): эфирный транспорт,
-    /// REC/RACE в DVR. Константа, а не fn: None конструируется без
-    /// пейлоада, String в const-выражении не создаётся.
+    /// REC/RACE в DVR.
     const DEAD: ButtonContents = ButtonContents {
         enabled: false,
         active: false,
@@ -427,7 +426,12 @@ impl Flight {
         let exclusive_keyboards = attach_exclusive_keyboards(&setup, &keyboard_tx);
         let main = Keyboard::new(&keyboard_tx);
         let key_matcher = KeyMatcher::new(&setup);
-        let pads = setup.pads.clone();
+        let pads = setup
+            .pads
+            .iter()
+            .filter(|(pad_id, _)| assignments.contains_key(*pad_id))
+            .map(|(pad_id, pad)| (pad_id.clone(), pad.clone()))
+            .collect();
         Self {
             setup,
             assignments,
@@ -616,7 +620,8 @@ impl Flight {
         match &mut self.phase {
             Mode::Idle(i) => Self::prepare_idle(
                 i,
-                &self.setup,
+                &self.setup.cameras,
+                &self.pads,
                 &self.assignments,
                 &self.shown_cameras,
                 &mut self.selection,
@@ -628,7 +633,8 @@ impl Flight {
                 let active_pad = self.selection.pad().map(str::to_owned);
                 Self::prepare_live(
                     l,
-                    &self.setup,
+                    &self.setup.cameras,
+                    &self.pads,
                     &self.assignments,
                     &self.shown_cameras,
                     active_pad.as_deref(),
@@ -637,7 +643,8 @@ impl Flight {
             }
             Mode::Review(d) => Self::prepare_dvr(
                 d,
-                &self.setup,
+                &self.setup.cameras,
+                &self.pads,
                 &self.assignments,
                 &mut self.selection,
                 ctx,
@@ -684,16 +691,15 @@ impl Flight {
     #[allow(clippy::too_many_arguments)]
     fn prepare_pads(
         webcams: &mut HashMap<String, Camera>,
-        setup: &Setup,
+        cameras: &IndexMap<String, CameraConfig>,
+        pads: &IndexMap<String, PadConfig>,
         assignments: &IndexMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
         laps: &HashMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
         active_pad: Option<&str>,
         alt: bool,
     ) -> Vec<PadContents> {
-        setup
-            .pads
-            .iter()
+        pads.iter()
             .take(MAX_PADS)
             .map(|(pad_id, pad)| {
                 let image = match webcams.get_mut(&pad.fpv.camera_id) {
@@ -716,17 +722,17 @@ impl Flight {
                 let res_badge = if alt && shown_cameras.contains_key(&pad.fpv.camera_id) {
                     let res = match webcams.get(&pad.fpv.camera_id) {
                         Some(w) if w.capture_state() == CaptureState::Dead => None,
-                        Some(w) => w.resolution().or_else(|| {
-                            setup.cameras.get(&pad.fpv.camera_id).map(|c| c.resolution)
-                        }),
-                        None => setup.cameras.get(&pad.fpv.camera_id).map(|c| c.resolution),
+                        Some(w) => w
+                            .resolution()
+                            .or_else(|| cameras.get(&pad.fpv.camera_id).map(|c| c.resolution)),
+                        None => cameras.get(&pad.fpv.camera_id).map(|c| c.resolution),
                     };
                     Some(match res {
                         Some(r) => {
                             let lines = r.height as f32 * pad.fpv.viewport.height();
                             // Формат «540p@60fps»: эффективные строки
                             // вьюпорта @ целевой fps камеры.
-                            match setup.cameras.get(&pad.fpv.camera_id) {
+                            match cameras.get(&pad.fpv.camera_id) {
                                 Some(c) => {
                                     format!("{}p@{}fps", lines.round() as u32, c.frame_rate.0)
                                 }
@@ -762,7 +768,8 @@ impl Flight {
     /// Кадр эфира: контент из захватов, кнопки REC/RACE, счётчик гонки.
     fn prepare_live(
         l: &mut Live,
-        setup: &Setup,
+        cameras: &IndexMap<String, CameraConfig>,
+        pads: &IndexMap<String, PadConfig>,
         assignments: &IndexMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
         active_pad: Option<&str>,
@@ -774,7 +781,8 @@ impl Flight {
         let now = Instant::now();
         let mut pads = Self::prepare_pads(
             &mut l.webcams,
-            setup,
+            cameras,
+            pads,
             assignments,
             shown_cameras,
             &l.laps,
@@ -883,7 +891,8 @@ impl Flight {
     /// родит поток), счётчик погашен.
     fn prepare_idle(
         i: &mut Idle,
-        setup: &Setup,
+        cameras: &IndexMap<String, CameraConfig>,
+        pads: &IndexMap<String, PadConfig>,
         assignments: &IndexMap<String, Pilot>,
         shown_cameras: &HashMap<String, CameraConfig>,
         selection: &mut Selection,
@@ -908,7 +917,8 @@ impl Flight {
         let no_laps = HashMap::new();
         let pads = Self::prepare_pads(
             &mut i.webcams,
-            setup,
+            cameras,
+            pads,
             assignments,
             shown_cameras,
             &no_laps,
@@ -964,7 +974,8 @@ impl Flight {
     /// файла — Error. Плееры здесь же получают update_frame.
     fn prepare_dvr_pads(
         d: &mut Review,
-        setup: &Setup,
+        cameras: &IndexMap<String, CameraConfig>,
+        pads: &IndexMap<String, PadConfig>,
         assignments: &IndexMap<String, Pilot>,
         active_pad: Option<&str>,
         alt: bool,
@@ -981,9 +992,7 @@ impl Flight {
         for player in d.players.values_mut() {
             player.update_frame();
         }
-        setup
-            .pads
-            .iter()
+        pads.iter()
             .take(MAX_PADS)
             .map(|(pad_id, pad)| {
                 let camera_id = &pad.fpv.camera_id;
@@ -1012,12 +1021,12 @@ impl Flight {
                     let res = match d.players.get(camera_id) {
                         Some(p) => p
                             .resolution()
-                            .or_else(|| setup.cameras.get(camera_id).map(|c| c.resolution)),
-                        None => setup.cameras.get(camera_id).map(|c| c.resolution),
+                            .or_else(|| cameras.get(camera_id).map(|c| c.resolution)),
+                        None => cameras.get(camera_id).map(|c| c.resolution),
                     };
                     res.map(|r| {
                         let lines = r.height as f32 * pad.fpv.viewport.height();
-                        match setup.cameras.get(camera_id) {
+                        match cameras.get(camera_id) {
                             Some(c) => format!("{}p@{}fps", lines.round() as u32, c.frame_rate.0),
                             None => format!("{}p", lines.round() as u32),
                         }
@@ -1068,7 +1077,8 @@ impl Flight {
     /// Кадр DVR: контент из плееров, транспорт, шкала, позиция.
     fn prepare_dvr(
         d: &mut Review,
-        setup: &Setup,
+        cameras: &IndexMap<String, CameraConfig>,
+        pads: &IndexMap<String, PadConfig>,
         assignments: &IndexMap<String, Pilot>,
         selection: &mut Selection,
         ctx: &egui::Context,
@@ -1174,7 +1184,8 @@ impl Flight {
                     .collect()
             })
             .unwrap_or_default();
-        let mut pads = Self::prepare_dvr_pads(d, setup, assignments, selection_pad.as_deref(), alt);
+        let mut pads =
+            Self::prepare_dvr_pads(d, cameras, pads, assignments, selection_pad.as_deref(), alt);
         Self::assign_places(&mut pads);
         let transport = TransportContents {
             rew: ButtonContents {
@@ -1861,7 +1872,7 @@ impl Flight {
                 if let Mode::Live(l) = &self.phase {
                     l.race.exit();
                 }
-                navigator.goto(menu::Menu::new())
+                navigator.goto(menu::Menu::new(&self.setup.pads))
             }
             Action::Rec => {
                 // Первое нажатие в Idle рождает поток; в Live уходит

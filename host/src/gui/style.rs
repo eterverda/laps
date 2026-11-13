@@ -5,8 +5,8 @@ const FONT_SIZE_REGULAR: f32 = 26.0;
 use crate::config::setup::ColorConfig;
 
 /// Цвета рамок вьюфайндеров.
-pub const PAD_RED: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x33, 0x33);
-pub const PAD_BLUE: egui::Color32 = egui::Color32::from_rgb(0x33, 0x33, 0xFF);
+pub const PAD_RED: egui::Color32 = egui::Color32::from_rgb(0xCC, 0x33, 0x33);
+pub const PAD_BLUE: egui::Color32 = egui::Color32::from_rgb(0x44, 0x66, 0xFF);
 pub const PAD_GREEN: egui::Color32 = egui::Color32::from_rgb(0x33, 0xCC, 0x33);
 pub const PAD_YELLOW: egui::Color32 = egui::Color32::from_rgb(0xF5, 0xBC, 0x00);
 

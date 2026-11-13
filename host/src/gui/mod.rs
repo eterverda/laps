@@ -1,10 +1,8 @@
 use crate::config::setup::Setup;
 use crate::model::flight::Journal;
-use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::{RESPONSE_TIMEOUT, Response, Server};
 use crossbeam_channel as crossbeam;
-use indexmap::IndexMap;
 use serde_yaml::from_str as from_yaml_string;
 use std::process;
 use std::sync::Arc;
@@ -46,13 +44,6 @@ struct App {
     _server: Option<Server>,
 }
 
-fn hardcoded_assignments() -> IndexMap<String, Pilot> {
-    ["pad-1", "pad-2", "pad-3", "pad-4"]
-        .into_iter()
-        .enumerate()
-        .map(|(i, pad_id)| (pad_id.to_owned(), Pilot::new(format!("Пилот {}", i + 1))))
-        .collect()
-}
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, journal: Option<Journal>) -> Self {
@@ -113,12 +104,9 @@ impl App {
                     setup.clone(),
                     journal,
                 ))),
-                None => State::Flight(Box::new(flight::Flight::live(
-                    &cc.egui_ctx,
-                    setup.clone(),
-                    hardcoded_assignments(),
-                    rules,
-                ))),
+                // Обычный запуск — меню: состав пилотов правится там,
+                // эфир рождается кнопкой START.
+                None => State::Menu(menu::Menu::new(&setup.pads)),
             },
             setup,
             rules,
@@ -176,12 +164,14 @@ impl eframe::App for App {
                 match self.state {
                     State::Menu(ref mut menu) => {
                         match menu.update(ui, &mut self.jumbotron) {
-                            menu::Action::Start => navigator.goto(Box::new(flight::Flight::live(
-                                &ctx,
-                                self.setup.clone(),
-                                hardcoded_assignments(),
-                                self.rules,
-                            ))),
+                            menu::Action::Start(assignments) => {
+                                navigator.goto(Box::new(flight::Flight::live(
+                                    &ctx,
+                                    self.setup.clone(),
+                                    assignments,
+                                    self.rules,
+                                )))
+                            }
                             menu::Action::None => {}
                         }
                         // В меню нет эфира: джамботрон в фазе None

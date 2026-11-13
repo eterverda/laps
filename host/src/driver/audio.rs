@@ -69,6 +69,7 @@ impl Sound {
         }
     }
 
+    #[cfg(test)]
     pub const fn duration(&self) -> Duration {
         self.duration
     }

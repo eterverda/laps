@@ -3,7 +3,7 @@
     "yaml-language-server": {
       "settings": {
         "yaml": {
-          "customTags": ["!laps-setup-1 mapping"]
+          "customTags": ["!laps-setup-1 mapping", "!laps-race-rules-1 mapping"]
         }
       }
     }

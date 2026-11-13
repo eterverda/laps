@@ -12,7 +12,7 @@ use crate::driver::dvr::{RecordParams, RecordState};
 use crate::driver::keyboard::KeyPressed;
 use crate::model::flight::{Journal, JournalEntry, LapEvent, LapLine, RaceFinishRule, Stamp};
 use crate::model::pilot::Pilot;
-use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_start_delay};
+use crate::model::rules::{PRE_BEEP_SECS, RaceRules, sample_start_delay};
 use crate::service::key_matcher::{KeyMatch, KeyMatcher};
 use crossbeam_channel as crossbeam;
 use indexmap::IndexMap;
@@ -156,9 +156,6 @@ struct RaceCore {
     /// Ноль меток журнала: мс события = at − started. Журнал метки
     /// только хранит — считает производитель (это ядро).
     started: Instant,
-    /// Длина гудка: старт гонки — конец отсчёта + гудок (звук —
-    /// презентация, но часы гонки завязаны на его длительность).
-    buzzer_len: Duration,
     /// camera_id → конфиг (стемы, расширения файлов записи).
     cameras: HashMap<String, CameraConfig>,
     /// Имена файлов открытых сессий по камерам (FIFO: сессия привязывается
@@ -202,7 +199,6 @@ impl RaceCore {
         now: Instant,
         rules: RaceRules,
         captures_dir: PathBuf,
-        buzzer_len: Duration,
         pads: IndexMap<String, PadConfig>,
         assignments: IndexMap<String, Pilot>,
         cameras: HashMap<String, CameraConfig>,
@@ -219,7 +215,6 @@ impl RaceCore {
             journal: Journal::new(date_time, pads, assignments, rules),
             captures_dir,
             started: now,
-            buzzer_len,
             cameras,
             rec_pending: HashMap::new(),
             rec_deferred: Vec::new(),
@@ -491,7 +486,7 @@ impl RaceCore {
                 let delay = self.countdown_delay();
                 self.defer_countdown(now);
                 self.phase = RaceStage::Countdown {
-                    start_at: race_time_start(now, delay, self.buzzer_len),
+                    start_at: now + delay,
                 };
                 vec![Effect::Countdown { delay }]
             }
@@ -614,7 +609,14 @@ impl RaceCore {
     }
 
     fn countdown_delay(&self) -> Duration {
-        Duration::from_secs(PRE_BEEP_SECS) + sample_start_delay(&self.rules.start_signal_delay)
+        // Бипы отсчёта — отдельным выключателем: пропущены — пауза
+        // только из start-signal-delay (0ms — старт по нажатию RACE).
+        let beeps = if self.rules.start_skip_countdown {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(PRE_BEEP_SECS)
+        };
+        beeps + sample_start_delay(&self.rules.start_signal_delay)
     }
 
     /// Сессии записи всех камер: одно имя на камеру (повторный старт
@@ -661,6 +663,7 @@ mod tests {
     use crate::config::keyboard::KeyBind;
     use crate::config::setup::Setup;
     use crate::driver::keyboard::key_set;
+    use crate::model::flight::FeatKind;
     use crate::model::rules::StartSignalDelay;
     use std::env::temp_dir;
 
@@ -692,13 +695,14 @@ mod tests {
         RaceCore::new(
             clock.now,
             RaceRules {
+                start_skip_countdown: false,
                 max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
                 holeshot_enabled: true,
-                ..RaceRules::default()
+                max_laps: None,
+                feat_kind: FeatKind::Most,
             },
             temp_dir(),
-            Duration::ZERO, // гудок нулевой: числа сценариев проще
             IndexMap::new(),
             IndexMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
@@ -775,6 +779,81 @@ mod tests {
         }
     }
 
+    /// Ядро с заданными правилами: пустые пады/назначения, одна камера.
+    fn core_with_rules(clock: &FakeClock, rules: RaceRules) -> RaceCore {
+        RaceCore::new(
+            clock.now,
+            rules,
+            temp_dir(),
+            IndexMap::new(),
+            IndexMap::new(),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
+            test_matcher(IndexMap::new()),
+            None,
+        )
+        .0
+    }
+
+    /// Отсчёт выключен + задержка 0: гонка стартует в момент нажатия
+    /// RACE (гудок в тесте нулевой).
+    #[test]
+    fn skip_countdown_zero_delay_starts_at_press() {
+        let clock = FakeClock::new();
+        let rules = RaceRules {
+            start_skip_countdown: true,
+            start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
+            max_duration: None,
+            max_laps: None,
+            holeshot_enabled: true,
+            feat_kind: FeatKind::Most,
+        };
+        let mut core = core_with_rules(&clock, rules);
+        let press = clock.now;
+        core.race_pressed(press);
+        core.tick(press);
+        assert!(
+            matches!(core.phase(), RaceStage::Running { start_at } if start_at == press),
+            "старт в момент нажатия: {:?}",
+            core.phase()
+        );
+        assert_eq!(
+            journal_marks(&core),
+            vec![(0, "rec"), (0, "cd"), (0, "go")],
+            "все три события — с меткой нажатия"
+        );
+    }
+
+    /// Отсчёт выключен, но задержка сигнала остаётся: фаза Countdown
+    /// живёт ровно её длину (бипов нет).
+    #[test]
+    fn skip_countdown_keeps_signal_delay() {
+        let mut clock = FakeClock::new();
+        let pause = Duration::from_secs(2);
+        let rules = RaceRules {
+            start_skip_countdown: true,
+            start_signal_delay: StartSignalDelay::random(pause, pause),
+            max_duration: None,
+            max_laps: None,
+            holeshot_enabled: true,
+            feat_kind: FeatKind::Most,
+        };
+        let mut core = core_with_rules(&clock, rules);
+        let press = clock.now;
+        core.race_pressed(press);
+        core.tick(clock.advance(1_000));
+        assert!(
+            matches!(core.phase(), RaceStage::Countdown { .. }),
+            "пауза сигнала ещё идёт: {:?}",
+            core.phase()
+        );
+        core.tick(clock.advance(1_000));
+        assert!(
+            matches!(core.phase(), RaceStage::Running { start_at } if start_at == press + pause),
+            "старт после паузы сигнала: {:?}",
+            core.phase()
+        );
+    }
+
     /// Глобальные клавиши в гонке: цифра активирует/гасит пад,
     /// Space — lap активного пада; состояние активного пада —
     /// `active_pad()`.
@@ -784,13 +863,14 @@ mod tests {
         let (mut core, _effects) = RaceCore::new(
             clock.now,
             RaceRules {
+                start_skip_countdown: false,
                 max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
                 holeshot_enabled: true,
-                ..RaceRules::default()
+                max_laps: None,
+                feat_kind: FeatKind::Most,
             },
             temp_dir(),
-            Duration::ZERO,
             test_pads(),
             IndexMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
@@ -859,13 +939,14 @@ mod tests {
         let (mut core, _effects) = RaceCore::new(
             clock.now,
             RaceRules {
+                start_skip_countdown: false,
                 max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
                 holeshot_enabled: true,
-                ..RaceRules::default()
+                max_laps: None,
+                feat_kind: FeatKind::Most,
             },
             temp_dir(),
-            Duration::ZERO,
             test_pads(),
             IndexMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
@@ -986,15 +1067,15 @@ mod tests {
         let (mut core, _effects) = RaceCore::new(
             clock.now,
             RaceRules {
+                start_skip_countdown: false,
                 max_duration: None,
                 max_laps: Some(1),
                 // Холшот в лимит не входит.
                 holeshot_enabled: false,
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
-                ..RaceRules::default()
+                feat_kind: FeatKind::Most,
             },
             temp_dir(),
-            Duration::ZERO,
             pads.clone(),
             assignments,
             HashMap::from([("camera-1".to_owned(), test_camera())]),
@@ -1296,13 +1377,14 @@ mod tests {
         let mut core = RaceCore::new(
             clock.now,
             RaceRules {
+                start_skip_countdown: false,
                 max_duration: Some(DURATION),
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
                 holeshot_enabled: true,
-                ..RaceRules::default()
+                max_laps: None,
+                feat_kind: FeatKind::Most,
             },
             temp_dir(),
-            Duration::ZERO,
             IndexMap::new(),
             IndexMap::new(),
             cameras,
@@ -1343,12 +1425,14 @@ mod tests {
         let mut core = RaceCore::new(
             clock.now,
             RaceRules {
+                start_skip_countdown: false,
                 max_duration: None,
                 start_signal_delay: StartSignalDelay::random(Duration::ZERO, Duration::ZERO),
-                ..RaceRules::default()
+                max_laps: None,
+                holeshot_enabled: true,
+                feat_kind: FeatKind::Most,
             },
             temp_dir(),
-            Duration::ZERO,
             IndexMap::new(),
             IndexMap::new(),
             HashMap::from([("camera-1".to_owned(), test_camera())]),
@@ -1470,7 +1554,7 @@ impl Race {
             Instant::now(),
             rules,
             captures_dir.clone(),
-            BUZZER.duration(),
+            // Гудок играет на старте; часы завязаны на его начало (MultiGP).
             pads,
             assignments,
             cameras,
@@ -1650,20 +1734,17 @@ impl Race {
     }
 }
 
-/// Звуковая программа отсчёта: бипы по секундам, гудок на старте.
-/// Задержка до гудка — из ядра (там же сэмплирована пауза сигнала).
+/// Звуковая программа отсчёта: бипы по секундам (не больше, чем
+/// секунд в паузе), гудок — ровно на старте. Задержка до гудка — из
+/// ядра (там же сэмплирована пауза сигнала и выключатель бипов).
 fn countdown_steps(delay: Duration) -> Vec<(Duration, Sound)> {
-    let interval = delay.saturating_sub(Duration::from_secs(PRE_BEEP_SECS));
-    if interval.is_zero() {
-        vec![(Duration::ZERO, BUZZER)]
-    } else {
-        let mut steps: Vec<(Duration, Sound)> = (0..PRE_BEEP_SECS)
-            .map(Duration::from_secs)
-            .map(|t| (t, STAGE))
-            .collect();
-        steps.push((delay, BUZZER));
-        steps
-    }
+    let beeps = PRE_BEEP_SECS.min(delay.as_secs());
+    let mut steps: Vec<(Duration, Sound)> = (0..beeps)
+        .map(Duration::from_secs)
+        .map(|t| (t, STAGE))
+        .collect();
+    steps.push((delay, BUZZER));
+    steps
 }
 
 /// Исполнение эффектов ядра: команды рекордерам, звук.

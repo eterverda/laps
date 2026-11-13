@@ -4,7 +4,7 @@
 
 use crate::model::flight::FeatKind;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Сигнал старта: случайная пауза в [min, max) между последним бипом
 /// отсчёта и гудком. Единственный вариант — рандом (как в laps-bar/
@@ -76,13 +76,15 @@ impl Default for StartSignalDelay {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RaceRules {
+    /// Пропуск отсчёта из 3 бипов перед стартом. true — бипы не
+    /// звучат, остаётся только start-signal-delay.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub start_skip_countdown: bool,
     /// Дефолт (1s-3s) в файл не пишется: пропуск = дефолт.
     #[serde(default, skip_serializing_if = "StartSignalDelay::is_default")]
     pub start_signal_delay: StartSignalDelay,
-    /// Лимит длительности гонки. None — без лимита: гонка идёт, пока
-    /// её не завершат (RACE/REC/EXIT); в файл не пишется (пропуск =
-    /// без лимита). Some — humantime-строкой («90s»), не мапкой
-    /// secs/nanos.
+    /// Лимит длительности гонки. None — без лимита (пропуск ключа в
+    /// файле). Some — humantime-строкой («1m 30s»).
     #[serde(
         default,
         with = "opt_humantime",
@@ -106,36 +108,18 @@ pub struct RaceRules {
     pub feat_kind: FeatKind,
 }
 
-impl Default for RaceRules {
-    fn default() -> Self {
-        Self {
-            start_signal_delay: Default::default(),
-            max_duration: Some(Duration::from_secs(90)),
-            max_laps: None,
-            holeshot_enabled: true,
-            feat_kind: Default::default(),
-        }
-    }
-}
-
 /// Число бипов отсчёта перед стартовой паузой.
 pub const PRE_BEEP_SECS: u64 = 3;
 
 /// Пауза для конкретного старта: равномерный выбор в [min_delay,
 /// max_delay); вырожденный случай (min == max) — само значение.
-pub(crate) fn sample_start_delay(signal: &StartSignalDelay) -> Duration {
+pub fn sample_start_delay(signal: &StartSignalDelay) -> Duration {
     let min = signal.min();
     let span = signal.max().saturating_sub(min).as_millis() as u64;
     if span == 0 {
         return min;
     }
     min + Duration::from_millis(rand::random_range(0..span))
-}
-
-/// Момент фактического старта гонки: конец отсчёта + длина гудка
-/// (счётчик стартует, когда гудок доиграл).
-pub(crate) fn race_time_start(start: Instant, delay: Duration, buzzer_len: Duration) -> Instant {
-    start + delay + buzzer_len
 }
 
 /// Option<Duration> как humantime-строка: Some — «90s», None — null.
@@ -162,74 +146,53 @@ mod tests {
 
     /// Конструктор держит границы; вырожденный диапазон min == max
     /// отдаёт само значение.
-    /// Правила пишутся humantime-строками («90s»), не мапкой
-    /// secs/nanos; раундтрип сохраняет значения.
     #[test]
     fn rules_yaml_uses_humantime() {
-        let yaml = serde_yaml::to_string(&RaceRules::default()).unwrap();
+        let parse = |s: &str| serde_yaml::from_str::<RaceRules>(s).unwrap();
+        let yaml = serde_yaml::to_string(&parse(
+            "max-duration: 1m 30s\nholeshot-enabled: true\nfeat-kind: most\n",
+        ))
+        .unwrap();
         assert!(yaml.contains("max-duration: 1m 30s"), "{yaml}");
-        // Дефолтный сигнал старта в файл не пишется (пропуск = дефолт).
         assert!(!yaml.contains("start-signal-delay"), "{yaml}");
-        let back: RaceRules = serde_yaml::from_str(&yaml).unwrap();
+        let back = parse(&yaml);
         assert_eq!(back.max_duration, Some(Duration::from_secs(90)));
         assert_eq!(back.start_signal_delay, StartSignalDelay::default());
-        // Недефолтный — строка-диапазон.
-        let custom = RaceRules {
-            start_signal_delay: StartSignalDelay::random(
-                Duration::from_secs(1),
-                Duration::from_secs(5),
-            ),
-            ..RaceRules::default()
-        };
-        let yaml = serde_yaml::to_string(&custom).unwrap();
+        let yaml = serde_yaml::to_string(&parse(
+            "start-signal-delay: 1s-5s\nholeshot-enabled: true\nfeat-kind: most\n",
+        ))
+        .unwrap();
         assert!(yaml.contains("start-signal-delay: 1s-5s"), "{yaml}");
         assert_eq!(
-            serde_yaml::from_str::<RaceRules>(&yaml)
-                .unwrap()
-                .start_signal_delay,
-            custom.start_signal_delay
+            parse(&yaml).start_signal_delay,
+            StartSignalDelay::random(Duration::from_secs(1), Duration::from_secs(5))
         );
-        // min == max — одно значение с обеих сторон.
-        let fixed = RaceRules {
-            start_signal_delay: StartSignalDelay::random(
-                Duration::from_secs(7),
-                Duration::from_secs(7),
-            ),
-            ..RaceRules::default()
-        };
-        let yaml = serde_yaml::to_string(&fixed).unwrap();
+        let yaml = serde_yaml::to_string(&parse(
+            "start-signal-delay: 7s\nholeshot-enabled: true\nfeat-kind: most\n",
+        ))
+        .unwrap();
         assert!(yaml.contains("start-signal-delay: 7s"), "{yaml}");
         assert_eq!(
-            serde_yaml::from_str::<RaceRules>(&yaml)
-                .unwrap()
-                .start_signal_delay,
-            fixed.start_signal_delay
+            parse(&yaml).start_signal_delay,
+            StartSignalDelay::random(Duration::from_secs(7), Duration::from_secs(7))
         );
-        // Итоговый вид пишется всегда (дефолт неочевиден) — kebab.
+    }
+
+    #[test]
+    fn rules_yaml_format_details() {
+        let parse = |s: &str| serde_yaml::from_str::<RaceRules>(s).unwrap();
+        let yaml =
+            serde_yaml::to_string(&parse("holeshot-enabled: true\nfeat-kind: most\n")).unwrap();
         assert!(yaml.contains("feat-kind: most"), "{yaml}");
-        let custom = RaceRules {
-            feat_kind: crate::model::flight::FeatKind::Best1,
-            ..RaceRules::default()
-        };
-        let yaml = serde_yaml::to_string(&custom).unwrap();
+        let yaml =
+            serde_yaml::to_string(&parse("holeshot-enabled: true\nfeat-kind: best-1\n")).unwrap();
         assert!(yaml.contains("feat-kind: best-1"), "{yaml}");
-        assert_eq!(
-            serde_yaml::from_str::<RaceRules>(&yaml).unwrap().feat_kind,
-            custom.feat_kind
-        );
+        assert_eq!(parse(&yaml).feat_kind, FeatKind::Best1);
         // None лимита — поле отсутствует (пропуск = без лимита).
-        let none = RaceRules {
-            max_duration: None,
-            ..RaceRules::default()
-        };
-        let yaml = serde_yaml::to_string(&none).unwrap();
+        let yaml =
+            serde_yaml::to_string(&parse("holeshot-enabled: true\nfeat-kind: most\n")).unwrap();
         assert!(!yaml.contains("max-duration"), "{yaml}");
-        assert_eq!(
-            serde_yaml::from_str::<RaceRules>(&yaml)
-                .unwrap()
-                .max_duration,
-            None
-        );
+        assert_eq!(parse(&yaml).max_duration, None);
     }
 
     #[test]
@@ -243,5 +206,15 @@ mod tests {
         assert_eq!(degenerate.max(), Duration::from_secs(7));
 
         assert_eq!(StartSignalDelay::default().min(), Duration::from_secs(1));
+    }
+
+    /// Пропуск start-skip-countdown в yaml = false: отсчёт по
+    /// умолчанию звучит.
+    #[test]
+    fn start_skip_countdown_absent_means_false() {
+        let r: RaceRules =
+            serde_yaml::from_str("max-duration: 1m 30s\nholeshot-enabled: true\nfeat-kind: most\n")
+                .unwrap();
+        assert!(!r.start_skip_countdown);
     }
 }

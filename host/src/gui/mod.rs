@@ -37,6 +37,7 @@ struct App {
     remote_rx: crossbeam::Receiver<(Vec<String>, crossbeam::Sender<Response>)>,
     state: State,
     setup: Setup,
+    rules: RaceRules,
     /// Джамботрон: окно трансляции — на уровне приложения, переживает
     /// навигацию между экранами.
     jumbotron: jumbotron::Jumbotron,
@@ -95,6 +96,13 @@ impl App {
                 process::exit(1);
             }
         };
+        let rules: RaceRules = match from_yaml_string(crate::assets::RULES_YAML) {
+            Ok(rules) => rules,
+            Err(e) => {
+                log::error!("embedded rules.yaml failed to parse: {e}");
+                process::exit(1);
+            }
+        };
         Self {
             // CLI `laps scrub` — Flight со загруженным журналом
             // (загрузка и падение — в main, сюда журнал обязателен).
@@ -108,10 +116,11 @@ impl App {
                     &cc.egui_ctx,
                     setup.clone(),
                     hardcoded_assignments(),
-                    RaceRules::default(),
+                    rules,
                 ))),
             },
             setup,
+            rules,
             remote_rx,
             jumbotron: jumbotron::Jumbotron::new(),
             _server: server,
@@ -170,7 +179,7 @@ impl eframe::App for App {
                                 &ctx,
                                 self.setup.clone(),
                                 hardcoded_assignments(),
-                                RaceRules::default(),
+                                self.rules,
                             ))),
                             menu::Action::None => {}
                         }

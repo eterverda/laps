@@ -1,0 +1,6 @@
+!laps-race-rules-1
+start-skip-countdown: true
+start-signal-delay: 0
+max-duration: 1m 30s
+holeshot-enabled: true
+feat-kind: most

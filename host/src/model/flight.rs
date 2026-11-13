@@ -789,6 +789,7 @@ mod tests {
     use super::*;
     use crate::config::camera::ViewportConfig;
     use crate::config::setup::{ColorConfig, FpvConfig};
+    use crate::model::rules::StartSignalDelay;
     use std::env::temp_dir;
     use std::process;
 
@@ -833,8 +834,12 @@ mod tests {
             pads,
             assignments,
             RaceRules {
+                start_skip_countdown: false,
+                start_signal_delay: StartSignalDelay::default(),
+                max_duration: None,
+                max_laps: None,
                 holeshot_enabled: true,
-                ..RaceRules::default()
+                feat_kind: FeatKind::Most,
             },
         );
         journal.push(Stamp(0), JournalEntry::RecordStarted {});
@@ -1381,6 +1386,7 @@ pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod feat_compute_tests {
     use super::{FeatKind, Journal, JournalEntry, LapEvent, LapLine, Stamp, compute_feat};
+    use crate::model::rules::{RaceRules, StartSignalDelay};
     use indexmap::IndexMap;
 
     /// Гонка: старт, затем события пада; холшот включён (дистиллят
@@ -1389,8 +1395,15 @@ mod feat_compute_tests {
         let mut journal = Journal::new(
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
             IndexMap::new(),
-            Default::default(),
-            Default::default(),
+            IndexMap::new(),
+            RaceRules {
+                start_skip_countdown: false,
+                start_signal_delay: StartSignalDelay::default(),
+                max_duration: None,
+                max_laps: None,
+                holeshot_enabled: false,
+                feat_kind: FeatKind::Most,
+            },
         );
         // Без холшота: каждый пролёт — круг.
         journal.header.rules.holeshot_enabled = false;
@@ -1506,10 +1519,16 @@ mod feat_compute_tests {
         let mut journal = Journal::new(
             time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
             IndexMap::new(),
-            Default::default(),
-            Default::default(),
+            IndexMap::new(),
+            RaceRules {
+                start_skip_countdown: false,
+                start_signal_delay: StartSignalDelay::default(),
+                max_duration: None,
+                max_laps: None,
+                holeshot_enabled: true,
+                feat_kind: FeatKind::Most,
+            },
         );
-        journal.header.rules.holeshot_enabled = true;
         journal.push(Stamp(10_000), JournalEntry::RaceStarted {});
         for ms in [20_000, 32_000, 40_000] {
             journal.push(

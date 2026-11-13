@@ -160,7 +160,8 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
   (`crossbeam::select!`: намерение / клавиатура / дедлайн ядра) и
   шлёт GUI `Notice::State` (при изменении) / `EnterReview` /
   `BackToIdle`. Правила гонки (сигнал старта, отсчёт, длительность) —
-  `model::rules` (`RaceRules.duration: Option`, None — без авто-финиша).
+  `model::rules` (`
+.duration: Option`, None — без авто-финиша).
   GUI (`gui::flight.rs`) — только намерения и рендер снапшота
   `RaceStage`, гоночного стейта не имеет; до старта гонки отжатия
   шагают назад, после — только вперёд
@@ -332,7 +333,10 @@ first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
   any string starting with a digit. Revisit noyalib only if serde_yaml
   breaks — setup files in YAML
 - Default setup embedded from `assets/setup.yaml` and loaded once at app
-  startup — no tests or other code may depend on its contents;
+  startup — no tests or other code may depend on its contents; the same
+  for `RaceRules::default()` — it parses the embedded `assets/rules.yaml`
+  (kebab-case, humantime durations; absent `max-duration`/`max-laps` =
+  no limit), values live in the file, not in code;
   config-loaded types carry the `Config` suffix (`CameraConfig`,
   `PadConfig`, `DvrConfig`, …), except `Setup`. Don't rename the
   backend crates' own types (`nokhwa::Camera*` and friends)
@@ -349,7 +353,7 @@ first_frame_at`, поллит обёртка; имя — FIFO `rec_pending`) /
   platforms return an empty list until their backend lands);
   `driver::keyboard` itself is unconditional — platform backends live in
   submodules (linux today, mac later); no args → GUI mode
-- **Remote control** (`src/remote/mod.rs`): the same binary controls a
+- **Remote** (`src/remote/mod.rs`): the same binary controls a
   running instance. Invocation: `laps [+pid] +command [tail]` — `+pid`
   (at most one) addresses a specific instance; without it the command
   goes to the single running instance, and with several — an error

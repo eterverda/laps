@@ -108,7 +108,7 @@ impl CaptureSession for NokhwaSession {
         // latency by one frame period (same anchor as the v4l2 backend).
         let buf = match self.camera.frame_raw() {
             Ok(data) => data.into_owned(),
-            Err(e) => return Err(FrameError::recoverable(e)),
+            Err(e) => return Err(FrameError::recoverable(e.to_string())),
         };
         let timestamp = Instant::now();
         // Буфер может быть больше самого кадра (ёмкость буфера vs

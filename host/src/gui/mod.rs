@@ -49,7 +49,8 @@ struct App {
 fn hardcoded_assignments() -> IndexMap<String, Pilot> {
     ["pad-1", "pad-2", "pad-3", "pad-4"]
         .into_iter()
-        .map(|pad_id| (pad_id.to_owned(), Pilot::random()))
+        .enumerate()
+        .map(|(i, pad_id)| (pad_id.to_owned(), Pilot::new(format!("Пилот {}", i + 1))))
         .collect()
 }
 

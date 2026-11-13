@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -483,7 +484,7 @@ pub struct RaceClip {
     pub recording: Option<Interval>,
     /// camera_id → (имя файла, метка первого кадра = ноль файла):
     /// файл кладётся на полоску по первому кадру.
-    pub files: IndexMap<String, (String, Stamp)>,
+    pub files: HashMap<String, (String, Stamp)>,
     /// Момент нажатия RACE (начало отсчёта): стартовая позиция
     /// курсора DVR и точка на таймлайне.
     pub race_countdown: Option<Stamp>,
@@ -1381,7 +1382,6 @@ pub fn latest_journal(dir: &Path) -> Option<PathBuf> {
 mod feat_compute_tests {
     use super::{FeatKind, Journal, JournalEntry, LapEvent, LapLine, Stamp, compute_feat};
     use indexmap::IndexMap;
-    use std::collections::BTreeMap;
 
     /// Гонка: старт, затем события пада; холшот включён (дистиллят
     /// даст строку Holeshot на первый успех — она не считается).
@@ -1548,8 +1548,6 @@ mod feat_compute_tests {
 #[cfg(test)]
 mod feat_places_tests {
     use super::{Feat, FeatKind, Stamp, feat_places};
-    use indexmap::IndexMap;
-
     fn feat(count: usize, total_ms: u64) -> Feat {
         // Интервалы рвём поровну — raw_time_ms = total_ms.
         Feat {

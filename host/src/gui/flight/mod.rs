@@ -39,6 +39,7 @@ use crate::service::race::{Notice, Race, RaceStage};
 use crate::service::transport::{Circle, Transport};
 use crossbeam_channel as crossbeam;
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
@@ -86,7 +87,7 @@ enum Mode {
 /// Данные Idle-эфира: только захваты (как в Live, но без race, state
 /// и keepawake).
 struct Idle {
-    webcams: IndexMap<String, Camera>,
+    webcams: HashMap<String, Camera>,
     /// Матчер клавиатурных биндингов фазы (чистый: активный пад —
     /// из выделения экрана); события пока только логируются.
     key_matcher: KeyMatcher,
@@ -99,7 +100,7 @@ struct Idle {
     /// плашки дисконнекта — дальше.
     #[allow(dead_code)]
     #[cfg(target_os = "linux")]
-    exclusive_keyboards: IndexMap<String, ExclusiveKeyboard>,
+    exclusive_keyboards: HashMap<String, ExclusiveKeyboard>,
 }
 
 impl Default for Idle {
@@ -108,12 +109,12 @@ impl Default for Idle {
     fn default() -> Self {
         let (keyboard_tx, keyboard_rx) = crossbeam::unbounded();
         Self {
-            webcams: IndexMap::new(),
+            webcams: HashMap::new(),
             key_matcher: KeyMatcher::default(),
             main_keyboard: Keyboard::new(&keyboard_tx),
             keyboard_rx,
             #[cfg(target_os = "linux")]
-            exclusive_keyboards: IndexMap::new(),
+            exclusive_keyboards: HashMap::new(),
         }
     }
 }
@@ -127,7 +128,7 @@ struct Live {
     race: Race,
     /// pad_id → дистилят кругов (последний Notice::Laps): строки журнала
     /// + текущий круг (бегущее время рендер считает по `since`).
-    laps: IndexMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
+    laps: HashMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
     /// Момент рождения (REC) на часах GUI: «сейчас» = elapsed.
     rec_at: Instant,
     /// Ноль оси журнала сессии (от spawn): кадрит elapsed в Stamp.
@@ -135,13 +136,13 @@ struct Live {
     /// Последний снапшот состояния эфира (рендер кнопок/счётчиков).
     state: RaceStage,
     rules: RaceRules,
-    webcams: IndexMap<String, Camera>,
+    webcams: HashMap<String, Camera>,
     /// Main-клавиатура: уехала сюда из Idle вместе с каналом клавиатур.
     main_keyboard: Keyboard,
     /// Состояния клавиатур — вместе с main из Idle.
     #[allow(dead_code)]
     #[cfg(target_os = "linux")]
-    exclusive_keyboards: IndexMap<String, ExclusiveKeyboard>,
+    exclusive_keyboards: HashMap<String, ExclusiveKeyboard>,
     /// Подавление сна: держится ради Drop (inhibit снимается при
     /// разрушении), чтений нет.
     #[allow(dead_code)]
@@ -186,7 +187,7 @@ struct Review {
     main_keyboard: Keyboard,
     keyboard_rx: crossbeam::Receiver<KeyPressed>,
     /// camera_id → плеер записи.
-    players: IndexMap<String, Player>,
+    players: HashMap<String, Player>,
     /// Транспорт DVR: общая головка в домене сессии записи. Плееры —
     /// доставщики: каждый кадр позиция и скорость уходят в плееры
     /// синками, worker'ы экстраполируют на своих часах.
@@ -382,7 +383,7 @@ pub struct Flight {
     /// Материализованы ради owned-среза для гоночного потока и дедупа
     /// захватов; снятие лимита MAX_PADS ролей не меняет — только фильтр
     /// в shown_pads.
-    shown_cameras: IndexMap<String, CameraConfig>,
+    shown_cameras: HashMap<String, CameraConfig>,
     /// Состав падов эфира/записи: live — из сетапа, dvr — из
     /// заголовка журнала.
     pads: IndexMap<String, PadConfig>,
@@ -416,7 +417,7 @@ impl Flight {
         // Захваты — данные фазы Idle; поток гонки и keepawake рождаются
         // первым REC/RACE (Idle → Live). Мапа shown_cameras уже
         // продедуплена по camera_id — открываем захват по одному на камеру.
-        let mut webcams = IndexMap::new();
+        let mut webcams = HashMap::new();
         for (id, camera) in &shown_cameras {
             webcams.insert(id.clone(), Camera::open(camera.clone(), ctx.clone()));
         }
@@ -471,7 +472,7 @@ impl Flight {
                 log::warn!("screen inhibit failed: {e}");
                 None
             });
-        let recorders: IndexMap<_, _> = idle
+        let recorders: HashMap<_, _> = idle
             .webcams
             .iter()
             .map(|(id, camera)| (id.clone(), camera.recorder()))
@@ -505,7 +506,7 @@ impl Flight {
             race,
             rec_at: Instant::now(),
             axis_zero,
-            laps: IndexMap::new(),
+            laps: HashMap::new(),
             state: RaceStage::Before,
             rules: self.rules,
             webcams: idle.webcams,
@@ -551,7 +552,7 @@ impl Flight {
         let assignments = journal.assignments().clone();
         let rules = journal.header().rules;
         let pads = journal.pads().clone();
-        let shown_cameras: IndexMap<String, CameraConfig> = pads_cameras(&setup, pads.values());
+        let shown_cameras: HashMap<String, CameraConfig> = pads_cameras(&setup, pads.values());
         let phase = Mode::Review(Review::open(ctx, journal, &setup));
         Self {
             setup,
@@ -650,8 +651,8 @@ impl Flight {
     /// target — целевой fps (dvr.frame-rate, иначе camera); «error» при
     /// мёртвом потоке и при провале записи в REC-он.
     fn fps_lines(
-        webcams: &IndexMap<String, Camera>,
-        shown_cameras: &IndexMap<String, CameraConfig>,
+        webcams: &HashMap<String, Camera>,
+        shown_cameras: &HashMap<String, CameraConfig>,
         rec_on: bool,
     ) -> Vec<String> {
         shown_cameras
@@ -682,11 +683,11 @@ impl Flight {
     /// (неназначенные — пустые рамки).
     #[allow(clippy::too_many_arguments)]
     fn prepare_pads(
-        webcams: &mut IndexMap<String, Camera>,
+        webcams: &mut HashMap<String, Camera>,
         setup: &Setup,
         assignments: &IndexMap<String, Pilot>,
-        shown_cameras: &IndexMap<String, CameraConfig>,
-        laps: &IndexMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
+        shown_cameras: &HashMap<String, CameraConfig>,
+        laps: &HashMap<String, Vec<(Stamp, LapLine, Vec<(Stamp, LapEvent)>)>>,
         active_pad: Option<&str>,
         alt: bool,
     ) -> Vec<PadContents> {
@@ -763,7 +764,7 @@ impl Flight {
         l: &mut Live,
         setup: &Setup,
         assignments: &IndexMap<String, Pilot>,
-        shown_cameras: &IndexMap<String, CameraConfig>,
+        shown_cameras: &HashMap<String, CameraConfig>,
         active_pad: Option<&str>,
         alt: bool,
     ) -> FrameContents {
@@ -884,7 +885,7 @@ impl Flight {
         i: &mut Idle,
         setup: &Setup,
         assignments: &IndexMap<String, Pilot>,
-        shown_cameras: &IndexMap<String, CameraConfig>,
+        shown_cameras: &HashMap<String, CameraConfig>,
         selection: &mut Selection,
         rules: RaceRules,
         ctx: &egui::Context,
@@ -904,7 +905,7 @@ impl Flight {
         {
             ctx.request_repaint_after(UI_TICK);
         }
-        let no_laps = IndexMap::new();
+        let no_laps = HashMap::new();
         let pads = Self::prepare_pads(
             &mut i.webcams,
             setup,
@@ -1953,7 +1954,7 @@ impl Flight {
     /// или уже закончился (журнальный домен).
     fn clip_gap(
         clip: &Option<RaceClip>,
-        players: &IndexMap<String, Player>,
+        players: &HashMap<String, Player>,
         camera_id: &str,
         journal_pos: Stamp,
     ) -> bool {
@@ -2140,7 +2141,7 @@ impl Review {
     /// асинхронно — транзит, пока все не открылись (Ready/Failed).
     fn open(ctx: &egui::Context, journal: Journal, setup: &Setup) -> Self {
         let clip = RaceClip::from_events(journal.iter());
-        let mut players = IndexMap::new();
+        let mut players = HashMap::new();
         let dir = Path::new(CAPTURES_DIR);
         for (camera_id, (filename, _)) in &clip.files {
             let path = dir.join(filename);
@@ -2216,8 +2217,8 @@ impl Review {
 fn attach_exclusive_keyboards(
     setup: &Setup,
     tx: &crossbeam::Sender<KeyPressed>,
-) -> IndexMap<String, ExclusiveKeyboard> {
-    let mut keyboards = IndexMap::new();
+) -> HashMap<String, ExclusiveKeyboard> {
+    let mut keyboards = HashMap::new();
     for (id, cfg) in &setup.exclusive_keyboards {
         match ExclusiveKeyboard::new(tx, id, cfg) {
             Ok(keyboard) => {
@@ -2239,7 +2240,7 @@ fn attach_exclusive_keyboards(
 fn pads_cameras<'a>(
     setup: &Setup,
     pads: impl Iterator<Item = &'a PadConfig>,
-) -> IndexMap<String, CameraConfig> {
+) -> HashMap<String, CameraConfig> {
     pads.filter_map(|pad| {
         setup
             .cameras
@@ -2253,7 +2254,7 @@ fn pads_cameras<'a>(
 fn filter_cameras(
     setup: &Setup,
     assignments: &IndexMap<String, Pilot>,
-) -> IndexMap<String, CameraConfig> {
+) -> HashMap<String, CameraConfig> {
     pads_cameras(
         setup,
         setup

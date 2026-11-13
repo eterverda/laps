@@ -16,6 +16,7 @@ use crate::model::rules::{PRE_BEEP_SECS, RaceRules, race_time_start, sample_star
 use crate::service::key_matcher::{KeyMatch, KeyMatcher};
 use crossbeam_channel as crossbeam;
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::mem;
 use std::path::PathBuf;
@@ -159,16 +160,16 @@ struct RaceCore {
     /// презентация, но часы гонки завязаны на его длительность).
     buzzer_len: Duration,
     /// camera_id → конфиг (стемы, расширения файлов записи).
-    cameras: IndexMap<String, CameraConfig>,
+    cameras: HashMap<String, CameraConfig>,
     /// Имена файлов открытых сессий по камерам (FIFO: сессия привязывается
     /// к первому кадру по порядку стартов).
-    rec_pending: IndexMap<String, VecDeque<String>>,
+    rec_pending: HashMap<String, VecDeque<String>>,
     /// Отложенные события (REC-on и VideoAttached головы до старта
     /// гонки): пишутся в журнал в момент старта гонки, при отмене —
     /// выбрасываются.
     rec_deferred: Vec<(Stamp, JournalEntry)>,
     /// Последнее известное first_frame_at по камерам (edge-детект).
-    rec_seen: IndexMap<String, Option<Instant>>,
+    rec_seen: HashMap<String, Option<Instant>>,
     /// Гонка состоялась (Running или дальше): отличает финиш после гонки
     /// (журнал отдаём в DVR) от отмены записи до старта (ядро дропается,
     /// GUI возвращается в Idle).
@@ -176,10 +177,10 @@ struct RaceCore {
     /// pad_id → начало текущего круга: момент последнего зафиксированного
     /// Lap (первый круг — старт гонки, `start_at`). Метка дистилята
     /// `Current.since`, из журнала не выводится (там ms-домен).
-    lap_started_at: IndexMap<String, Instant>,
+    lap_started_at: HashMap<String, Instant>,
     /// pad_id → события текущего круга (fault/correct с последнего Lap):
     /// живут в дистиляте `Current`, журнал их хранит сам.
-    lap_events: IndexMap<String, Vec<(Stamp, LapEvent)>>,
+    lap_events: HashMap<String, Vec<(Stamp, LapEvent)>>,
     /// Матчер клавиатурных биндингов: бинды падов из сетапа + глобальная
     /// таблица (цифры — активный пад, Space — lap активного). Матчер
     /// чистый: активный пад — состояние ядра, матчится с ним как с
@@ -204,7 +205,7 @@ impl RaceCore {
         buzzer_len: Duration,
         pads: IndexMap<String, PadConfig>,
         assignments: IndexMap<String, Pilot>,
-        cameras: IndexMap<String, CameraConfig>,
+        cameras: HashMap<String, CameraConfig>,
         key_matcher: KeyMatcher,
         active_pad: Option<String>,
     ) -> (Self, Vec<Effect>) {
@@ -220,12 +221,12 @@ impl RaceCore {
             started: now,
             buzzer_len,
             cameras,
-            rec_pending: IndexMap::new(),
+            rec_pending: HashMap::new(),
             rec_deferred: Vec::new(),
-            rec_seen: IndexMap::new(),
+            rec_seen: HashMap::new(),
             raced: false,
-            lap_started_at: IndexMap::new(),
-            lap_events: IndexMap::new(),
+            lap_started_at: HashMap::new(),
+            lap_events: HashMap::new(),
             key_matcher,
             active_pad,
         };
@@ -700,7 +701,7 @@ mod tests {
             Duration::ZERO, // гудок нулевой: числа сценариев проще
             IndexMap::new(),
             IndexMap::new(),
-            IndexMap::from([("camera-1".to_owned(), test_camera())]),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(IndexMap::new()),
             None,
         )
@@ -792,7 +793,7 @@ mod tests {
             Duration::ZERO,
             test_pads(),
             IndexMap::new(),
-            IndexMap::from([("camera-1".to_owned(), test_camera())]),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(test_pads()),
             None,
         );
@@ -867,7 +868,7 @@ mod tests {
             Duration::ZERO,
             test_pads(),
             IndexMap::new(),
-            IndexMap::from([("camera-1".to_owned(), test_camera())]),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(test_pads()),
             None,
         );
@@ -996,7 +997,7 @@ mod tests {
             Duration::ZERO,
             pads.clone(),
             assignments,
-            IndexMap::from([("camera-1".to_owned(), test_camera())]),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(pads),
             None,
         );
@@ -1290,7 +1291,7 @@ mod tests {
     #[test]
     fn fileless_camera_leaves_no_trace() {
         let mut clock = FakeClock::new();
-        let mut cameras = IndexMap::from([("camera-1".to_owned(), test_camera())]);
+        let mut cameras = HashMap::from([("camera-1".to_owned(), test_camera())]);
         cameras.insert("camera-2".to_owned(), test_camera());
         let mut core = RaceCore::new(
             clock.now,
@@ -1350,7 +1351,7 @@ mod tests {
             Duration::ZERO,
             IndexMap::new(),
             IndexMap::new(),
-            IndexMap::from([("camera-1".to_owned(), test_camera())]),
+            HashMap::from([("camera-1".to_owned(), test_camera())]),
             test_matcher(IndexMap::new()),
             None,
         )
@@ -1455,9 +1456,9 @@ impl Race {
         captures_dir: PathBuf,
         pads: IndexMap<String, PadConfig>,
         assignments: IndexMap<String, Pilot>,
-        cameras: IndexMap<String, CameraConfig>,
+        cameras: HashMap<String, CameraConfig>,
         key_matcher: KeyMatcher,
-        recorders: IndexMap<String, Recorder>,
+        recorders: HashMap<String, Recorder>,
         keyboard_rx: crossbeam::Receiver<KeyPressed>,
         wake: Arc<dyn Fn() + Send + Sync>,
         audio: Audio,
@@ -1666,7 +1667,7 @@ fn countdown_steps(delay: Duration) -> Vec<(Duration, Sound)> {
 }
 
 /// Исполнение эффектов ядра: команды рекордерам, звук.
-fn apply(effects: &[Effect], recorders: &IndexMap<String, Recorder>, audio: &Audio) {
+fn apply(effects: &[Effect], recorders: &HashMap<String, Recorder>, audio: &Audio) {
     for effect in effects {
         match effect {
             Effect::Record { sessions } => {

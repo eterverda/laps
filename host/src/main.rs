@@ -1,7 +1,8 @@
-use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process;
 
+use crate::driver::dvr::CAPTURES_DIR;
+use crate::model::flight::Journal;
 use crate::remote::Response;
 
 mod assets;
@@ -120,27 +121,17 @@ fn main() {
             }
         },
         Some(Commands::Scrub) => {
-            let captures = PathBuf::from("captures");
-            // DVR живёт и без видео: журнала (yaml) хватает для полоски
-            // и транспорта — пустой captures не пускаем, видео не требуем.
-            let has_any = fs::read_dir(&captures)
-                .map(|mut d| {
-                    d.any(|e| {
-                        e.map(|e| {
-                            e.path()
-                                .extension()
-                                .and_then(|x| x.to_str())
-                                .is_some_and(|x| matches!(x, "mkv" | "mp4" | "mov" | "yaml"))
-                        })
-                        .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if !has_any {
-                eprintln!("nothing in captures/");
-                process::exit(1);
-            }
-            gui::run(Some(captures));
+            // Журнал обязателен: не загрузился — команда падает, окна
+            // не открываем. Видео не требуем: DVR живёт и без файлов
+            // камер (полоска и транспорт — из журнала).
+            let journal = match Journal::load_latest(Path::new(CAPTURES_DIR)) {
+                Ok(journal) => journal,
+                Err(e) => {
+                    eprintln!("laps scrub: {e}");
+                    process::exit(1);
+                }
+            };
+            gui::run(Some(journal));
         }
         Some(Commands::ListInstances) => {
             remote::cleanup();

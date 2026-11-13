@@ -10,7 +10,7 @@ mod laps;
 mod scrub;
 
 use crate::config::camera::CameraConfig;
-use crate::config::setup::Setup;
+use crate::config::setup::{PadConfig, Setup};
 use crate::driver::audio::Audio;
 use crate::driver::camera::Camera;
 use crate::driver::camera::CaptureState;
@@ -29,7 +29,7 @@ use crate::gui::view::{Corner, Letterbox, TransportButton, hint_badge, hint_badg
 use crate::gui::viewfinder::{self, ViewfinderContents, ViewfinderFrame, ViewfinderFrameContents};
 use crate::model::flight::{
     Feat, Interval, Journal, JournalEntry, LapEvent, LapLine, RaceClip, Stamp, compute_feat,
-    feat_places, latest_journal,
+    feat_places,
 };
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
@@ -38,8 +38,7 @@ use crate::service::key_matcher::{KeyMatch, KeyMatcher};
 use crate::service::race::{Notice, Race, RaceStage};
 use crate::service::transport::{Circle, Transport};
 use crossbeam_channel as crossbeam;
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{BTreeMap, HashMap};
 use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
@@ -384,6 +383,9 @@ pub struct Flight {
     /// захватов; снятие лимита MAX_PADS ролей не меняет — только фильтр
     /// в shown_pads.
     shown_cameras: HashMap<String, CameraConfig>,
+    /// Состав падов эфира/записи: live — из сетапа, dvr — из
+    /// заголовка журнала.
+    pads: BTreeMap<String, PadConfig>,
     res: Option<Res>,
     /// Запрошен выход (remote/кнопка/⌘W): ядру Intent::Exit уходит
     /// сразу, флаг — для навигации в меню из update (нужен Navigator).
@@ -424,12 +426,14 @@ impl Flight {
         let exclusive_keyboards = attach_exclusive_keyboards(&setup, &keyboard_tx);
         let main = Keyboard::new(&keyboard_tx);
         let key_matcher = KeyMatcher::new(&setup);
+        let pads = setup.pads.clone();
         Self {
             setup,
             assignments,
             rules,
             audio: Audio::spawn(),
             shown_cameras,
+            pads,
             res: None,
             exit_requested: false,
             header: header::Header::new(),
@@ -482,7 +486,7 @@ impl Flight {
         let (race, axis_zero) = Race::spawn(
             self.rules,
             PathBuf::from(CAPTURES_DIR),
-            self.setup.pads.clone(),
+            self.pads.clone(),
             self.assignments.clone(),
             self.shown_cameras.clone(),
             KeyMatcher::new(&self.setup),
@@ -538,34 +542,25 @@ impl Flight {
 
     /// Режим просмотра (CLI `laps scrub`) — без эфира, плееры открыты
     /// на старте, экран сразу в DVR (opening-транзит).
-    pub fn dvr(ctx: &egui::Context, setup: Setup, assignments: HashMap<String, Pilot>) -> Self {
-        // Холодный вход: последний журнал из captures/ → DVR; журнала
-        // нет — деградация на последние записи камер (пустая рамка).
-        let journal = latest_journal(Path::new(CAPTURES_DIR))
-            .and_then(|path| fs::read_to_string(&path).ok())
-            .and_then(|yaml| {
-                let (header, entries) = Journal::parse_stream(&yaml);
-                header.map(|header| {
-                    let mut journal = Journal::new(
-                        header.date_time,
-                        header.pads,
-                        header.assignments,
-                        header.rules,
-                    );
-                    for (ms, entry) in entries {
-                        journal.push(ms, entry);
-                    }
-                    journal
-                })
-            });
-        let shown_cameras = filter_cameras(&setup, &assignments);
+    pub fn dvr(ctx: &egui::Context, setup: Setup, journal: Journal) -> Self {
+        // Холодный вход: журнал уже загружен (CLI scrub грузит и
+        // падает при сбое — сюда он обязательный). Пады записи —
+        // из заголовка журнала (поле pads), сетап не мутируем.
+        // Состав и правила setup не несёт — их держим полями
+        // (заголовок записи).
+        let assignments = journal.assignments().clone();
+        let rules = journal.header().rules;
+        let pads = journal.pads().clone();
+        let shown_cameras: HashMap<String, CameraConfig> =
+            pads_cameras(&setup, pads.values());
         let phase = Mode::Review(Review::open(ctx, journal, &setup));
         Self {
             setup,
             assignments,
-            rules: RaceRules::default(),
+            rules,
             audio: Audio::spawn(),
             shown_cameras,
+            pads,
             res: None,
             exit_requested: false,
             header: header::Header::new(),
@@ -1401,7 +1396,7 @@ impl Flight {
                     }
                 }
 
-                let pads: Vec<_> = self.setup.pads.iter().take(MAX_PADS).collect();
+                let pads: Vec<_> = self.pads.iter().take(MAX_PADS).collect();
                 let columns = pads.len() as isize;
                 let viewfinder_rows = viewfinder_rows(pads.len());
                 let viewfinder_cols = viewfinder_cols(pads.len());
@@ -1891,7 +1886,7 @@ impl Flight {
     /// Переход эфир → DVR по закрытию гонки: строим Review, дроп Live
     /// гасит эфир (камеры, keepawake, гоночный поток).
     fn enter_review(&mut self, ctx: &egui::Context, journal: Journal) {
-        self.phase = Mode::Review(Review::open(ctx, Some(journal), &self.setup));
+        self.phase = Mode::Review(Review::open(ctx, journal, &self.setup));
     }
 
     /// Часы DVR в журнальном домене: (окно, позиция). Полоска — окно
@@ -2144,20 +2139,7 @@ impl Review {
     /// Полный набор данных DVR из журнала (None — пустой DVR: никаких
     /// чужих записей, только файлы журнала). Плееры открываются
     /// асинхронно — транзит, пока все не открылись (Ready/Failed).
-    fn open(ctx: &egui::Context, journal: Option<Journal>, setup: &Setup) -> Self {
-        let journal = journal.unwrap_or_else(|| {
-            // Пустой DVR (файла нет): правил нет — дефолт.
-            let date_time = time::OffsetDateTime::now_local().unwrap_or_else(|_| {
-                log::warn!("flight: local time unavailable, journal falls back to UTC");
-                time::OffsetDateTime::now_utc()
-            });
-            Journal::new(
-                date_time,
-                setup.pads.clone(),
-                HashMap::new(),
-                RaceRules::default(),
-            )
-        });
+    fn open(ctx: &egui::Context, journal: Journal, setup: &Setup) -> Self {
         let clip = RaceClip::from_events(journal.iter());
         let mut players = HashMap::new();
         let dir = Path::new(CAPTURES_DIR);
@@ -2252,22 +2234,36 @@ fn attach_exclusive_keyboards(
 /// по одному на камеру, гоночному потоку нужен owned срез. «Активные» =
 /// пады с пилотами, в пределах MAX_PADS (рендер падов идёт по всем —
 /// семантика иная).
+/// Пады → их камеры (дедуп по camera_id). Общее ядро фильтров
+/// shown_cameras: live-вариант дополнительно режет по составу и
+/// MAX_PADS, scrub берёт пады из заголовка журнала.
+fn pads_cameras<'a>(
+    setup: &Setup,
+    pads: impl Iterator<Item = &'a PadConfig>,
+) -> HashMap<String, CameraConfig> {
+    pads.filter_map(|pad| {
+        setup
+            .cameras
+            .get(&pad.fpv.camera_id)
+            .map(|camera| (pad.fpv.camera_id.clone(), camera.clone()))
+    })
+    .collect()
+}
+
+/// Камеры эфира: пады сетапа, участвующие в составе (≤ MAX_PADS).
 fn filter_cameras(
     setup: &Setup,
     assignments: &HashMap<String, Pilot>,
 ) -> HashMap<String, CameraConfig> {
-    setup
-        .pads
-        .iter()
-        .filter(|(pad_id, _)| assignments.contains_key(*pad_id))
-        .take(MAX_PADS)
-        .filter_map(|(_, pad)| {
-            setup
-                .cameras
-                .get(&pad.fpv.camera_id)
-                .map(|camera| (pad.fpv.camera_id.clone(), camera.clone()))
-        })
-        .collect()
+    pads_cameras(
+        setup,
+        setup
+            .pads
+            .iter()
+            .filter(|(pad_id, _)| assignments.contains_key(*pad_id))
+            .take(MAX_PADS)
+            .map(|(_, pad)| pad),
+    )
 }
 
 /// Число строк вьюфайндера по числу пилотов (копия live'овской раскладки).

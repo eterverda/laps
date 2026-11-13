@@ -106,6 +106,51 @@ pub struct Journal {
 }
 
 impl Journal {
+    /// Загрузить журнал из файла (yaml-стрим с заголовком). Ошибка —
+    /// любой сбой: файла нет, не прочитался, заголовка нет.
+    pub fn load(path: &Path) -> IoResult<Journal> {
+        let yaml = std::fs::read_to_string(path)?;
+        let (header, entries) = Self::parse_stream(&yaml);
+        let Some(header) = header else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("journal {path:?}: no header"),
+            ));
+        };
+        let mut journal = Journal::new(
+            header.date_time,
+            header.pads,
+            header.assignments,
+            header.rules,
+        );
+        for (ms, entry) in entries {
+            journal.push(ms, entry);
+        }
+        Ok(journal)
+    }
+
+    /// Последний журнал из каталога записей.
+    pub fn load_latest(dir: &Path) -> IoResult<Journal> {
+        let path = latest_journal(dir).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no journal in {dir:?}"),
+            )
+        })?;
+        Self::load(&path)
+    }
+
+    /// Состав пилотов из заголовка записи (scrub показывает его,
+    /// не текущий рандом приложения).
+    pub fn assignments(&self) -> &HashMap<String, Pilot> {
+        &self.header.assignments
+    }
+
+    /// Пады записанной гонки (заголовок).
+    pub fn pads(&self) -> &BTreeMap<String, PadConfig> {
+        &self.header.pads
+    }
+
     pub fn new(
         date_time: OffsetDateTime,
         pads: BTreeMap<String, PadConfig>,

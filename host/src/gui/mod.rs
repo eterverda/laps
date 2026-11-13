@@ -1,11 +1,11 @@
 use crate::config::setup::Setup;
+use crate::model::flight::Journal;
 use crate::model::pilot::Pilot;
 use crate::model::rules::RaceRules;
 use crate::remote::{RESPONSE_TIMEOUT, Response, Server};
 use crossbeam_channel as crossbeam;
 use serde_yaml::from_str as from_yaml_string;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 
@@ -37,7 +37,6 @@ struct App {
     remote_rx: crossbeam::Receiver<(Vec<String>, crossbeam::Sender<Response>)>,
     state: State,
     setup: Setup,
-    assignments: HashMap<String, Pilot>,
     /// Джамботрон: окно трансляции — на уровне приложения, переживает
     /// навигацию между экранами.
     jumbotron: jumbotron::Jumbotron,
@@ -54,7 +53,7 @@ fn hardcoded_assignments() -> HashMap<String, Pilot> {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, scrub: Option<PathBuf>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, journal: Option<Journal>) -> Self {
         // Очередь команд в GUI (16 — с запасом над одним обслуживаемым
         // клиентом): переполнение = «gui unavailable».
         let (remote_tx, remote_rx) = crossbeam::bounded(16);
@@ -96,27 +95,23 @@ impl App {
                 process::exit(1);
             }
         };
-        let assignments = hardcoded_assignments();
         Self {
-            state: match &scrub {
-                // CLI `laps scrub` — Flight, стартующий в режиме
-                // просмотра записи.
-                // Каталог нужен только как флаг режима: журнал DVR
-                // парсится из captures/ сам.
-                Some(_) => State::Flight(Box::new(flight::Flight::dvr(
+            // CLI `laps scrub` — Flight со загруженным журналом
+            // (загрузка и падение — в main, сюда журнал обязателен).
+            state: match journal {
+                Some(journal) => State::Flight(Box::new(flight::Flight::dvr(
                     &cc.egui_ctx,
                     setup.clone(),
-                    assignments.clone(),
+                    journal,
                 ))),
                 None => State::Flight(Box::new(flight::Flight::live(
                     &cc.egui_ctx,
                     setup.clone(),
-                    assignments.clone(),
+                    hardcoded_assignments(),
                     RaceRules::default(),
                 ))),
             },
             setup,
-            assignments,
             remote_rx,
             jumbotron: jumbotron::Jumbotron::new(),
             _server: server,
@@ -174,7 +169,7 @@ impl eframe::App for App {
                             menu::Action::Start => navigator.goto(Box::new(flight::Flight::live(
                                 &ctx,
                                 self.setup.clone(),
-                                self.assignments.clone(),
+                                hardcoded_assignments(),
                                 RaceRules::default(),
                             ))),
                             menu::Action::None => {}
@@ -237,7 +232,7 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-pub fn run(scrub: Option<PathBuf>) {
+pub fn run(journal: Option<Journal>) {
     let options = eframe::NativeOptions {
         persist_window: false,
         viewport: egui::ViewportBuilder::default()
@@ -264,7 +259,7 @@ pub fn run(scrub: Option<PathBuf>) {
                 o.sync_window_theme = false; // don't touch native window decorations
             });
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc, scrub)))
+            Ok(Box::new(App::new(cc, journal)))
         }),
     )
     .unwrap();

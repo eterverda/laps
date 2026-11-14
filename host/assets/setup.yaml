@@ -8,9 +8,22 @@ cameras:
     dvr:
       container: mkv
       frame-rate: 30fps
+keybinds:
+  - keys: Q
+    pad-id: pad-1
+    action: lap
+  - keys: W
+    pad-id: pad-2
+    action: lap
+  - keys: E
+    pad-id: pad-3
+    action: lap
+  - keys: R
+    pad-id: pad-4
+    action: lap
 pads:
   pad-1:
-    label: R1
+    label: R2
     color: red
     fpv:
       camera-id: camera-1
@@ -22,7 +35,7 @@ pads:
       camera-id: camera-1
       viewport: 2x2-r1c2-narrow
   pad-3:
-    label: R4
+    label: R5
     color: green
     fpv:
       camera-id: camera-1

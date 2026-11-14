@@ -15,7 +15,7 @@ pub struct Setup {
     /// `pad-id` — над каким падом сигнал; без него сигнал уходит
     /// активному паду.
     #[serde(default)]
-    pub keybinds: Vec<KeyBind>,
+    pub key_binds: Vec<KeyBind>,
     // Аттачатся гоночной сессией (GUI → Race); парсинг здесь, чтобы
     // сетап-файлы уже могли описывать клавиатуры.
     #[serde(default)]
@@ -94,36 +94,36 @@ mod tests {
     }
 
     #[test]
-    fn test_setup_keybinds() {
+    fn test_setup_key_binds() {
         // keybinds parse: key as a yaml number resolves to the usage;
         // уровень сетапа, пад — полем биндинга.
         let setup: Setup = from_yaml_string(
-            "cameras: {}\npads: {}\nkeybinds:\n  - exclusive-keyboard-id: key-1\n    pad-id: pad-1\n    keys: 1\n    action: lap\n",
+            "cameras: {}\npads: {}\nkey-binds:\n  - exclusive-keyboard-id: key-1\n    pad-id: pad-1\n    keys: 1\n    action: lap\n",
         )
         .unwrap();
-        assert_eq!(setup.keybinds.len(), 1);
+        assert_eq!(setup.key_binds.len(), 1);
         assert_eq!(
-            setup.keybinds[0].keys,
+            setup.key_binds[0].keys,
             crate::driver::keyboard::key_set(&[0x1E])
         );
-        assert_eq!(setup.keybinds[0].pad_id.as_deref(), Some("pad-1"));
+        assert_eq!(setup.key_binds[0].pad_id.as_deref(), Some("pad-1"));
         #[cfg(target_os = "linux")]
         assert_eq!(
-            setup.keybinds[0].exclusive_keyboard_id.as_deref(),
+            setup.key_binds[0].exclusive_keyboard_id.as_deref(),
             Some("key-1")
         );
         // Биндинг без пада — легален (сигнал уйдёт активному паду).
         let setup: Setup = from_yaml_string(
-            "cameras: {}\npads: {}\nkeybinds:\n  - keys: Spacebar\n    action: lap\n",
+            "cameras: {}\npads: {}\nkey-binds:\n  - keys: Spacebar\n    action: lap\n",
         )
         .unwrap();
-        assert_eq!(setup.keybinds[0].pad_id, None);
+        assert_eq!(setup.key_binds[0].pad_id, None);
         // Отсутствие блока — пустой список, не ошибка.
         let setup: Setup = from_yaml_string("cameras: {}\npads: {}\n").unwrap();
-        assert!(setup.keybinds.is_empty());
+        assert!(setup.key_binds.is_empty());
         // Неизвестное имя клавиши — ошибка конфига.
         assert!(from_yaml_string::<Setup>(
-            "cameras: {}\npads: {}\nkeybinds:\n  - exclusive-keyboard-id: key-1\n    key: banana\n    action: lap\n"
+            "cameras: {}\npads: {}\nkey-binds:\n  - exclusive-keyboard-id: key-1\n    key: banana\n    action: lap\n"
         )
         .is_err());
     }

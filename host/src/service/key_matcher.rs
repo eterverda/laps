@@ -93,7 +93,7 @@ impl KeyMatcher {
     pub fn new(setup: &Setup) -> Self {
         Self {
             pads: setup.pads.keys().cloned().collect(),
-            binds: setup.keybinds.clone(),
+            binds: setup.key_binds.clone(),
             global_binds: global_keybinds(),
         }
     }
@@ -177,7 +177,7 @@ pads:
     label: A2
     color: blue
     fpv: { camera-id: camera-1 }
-keybinds:
+key-binds:
   - pad-id: pad-1
     keys: F13
     action: fault

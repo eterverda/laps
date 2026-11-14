@@ -717,7 +717,7 @@ mod tests {
     fn test_matcher(pads: IndexMap<String, PadConfig>) -> KeyMatcher {
         // Биндинги тестов — уровень сетапа: «A на key-1 → lap pad-1»,
         // «Shift+B на key-1 → fault pad-1» (бывшие падовые бинды).
-        let keybinds = vec![
+        let key_binds = vec![
             KeyBind {
                 #[cfg(target_os = "linux")]
                 exclusive_keyboard_id: Some("key-1".to_owned()),
@@ -736,7 +736,7 @@ mod tests {
         KeyMatcher::new(&Setup {
             cameras: IndexMap::new(),
             pads,
-            keybinds,
+            key_binds,
             #[cfg(target_os = "linux")]
             exclusive_keyboards: IndexMap::new(),
         })

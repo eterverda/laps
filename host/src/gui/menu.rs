@@ -36,7 +36,7 @@ impl Menu {
         let labels: [(String, egui::Color32); 4] = std::array::from_fn(|i| {
             pads.get(&format!("pad-{}", i + 1)).map_or_else(
                 || (String::new(), egui::Color32::BLACK),
-                |pad| (pad.label.clone(), pad.color.to_color32()),
+                |pad| (pad.label.clone(), style::pad_color(pad.color)),
             )
         });
         Self {

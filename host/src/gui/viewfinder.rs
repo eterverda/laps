@@ -1,3 +1,4 @@
+use crate::config::camera::ViewportConfig;
 use crate::egui_ext::UiExt;
 use crate::gui::ruler::{cell_x, cell_y};
 use crate::gui::style;
@@ -6,11 +7,11 @@ use std::sync::OnceLock;
 
 /// Содержимое картинки пада: текстура кадра с UV-вьюпортом камеры
 /// (кадр текстуры, не экрана) либо состояние без картинки.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum ViewfinderContents {
     Texture {
         id: egui::TextureId,
-        uv: egui::Rect,
+        uv: ViewportConfig,
     },
     /// Камера заводится/плеер открывается/разрыв таймлайна — серый глиф.
     Pending,
@@ -37,6 +38,10 @@ impl egui::Widget for Viewfinder {
         let rect = response.rect;
         match self.content {
             ViewfinderContents::Texture { id, uv } => {
+                let uv = egui::Rect::from_min_max(
+                    egui::pos2(uv.left, uv.top),
+                    egui::pos2(uv.right, uv.bottom),
+                );
                 ui.painter().image(id, rect, uv, egui::Color32::WHITE);
             }
             // Нет картинки (камера заводится, плеер открывается, разрыв

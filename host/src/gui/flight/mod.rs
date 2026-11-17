@@ -702,7 +702,7 @@ impl Flight {
                         match capture_state {
                             CaptureState::Live => ViewfinderContents::Texture {
                                 id: webcam.texture(),
-                                uv: pad.fpv.viewport.to_rect(),
+                                uv: pad.fpv.viewport,
                             },
                             CaptureState::Dead => ViewfinderContents::Error,
                             CaptureState::Starting => ViewfinderContents::Pending,
@@ -722,7 +722,7 @@ impl Flight {
                     };
                     Some(match res {
                         Some(r) => {
-                            let lines = r.height as f32 * pad.fpv.viewport.to_rect().height();
+                            let lines = r.height as f32 * pad.fpv.viewport.height();
                             // Формат «540p@60fps»: эффективные строки
                             // вьюпорта @ целевой fps камеры.
                             match setup.cameras.get(&pad.fpv.camera_id) {
@@ -746,7 +746,7 @@ impl Flight {
                             .get(pad_id)
                             .map_or("", |pilot| pilot.name.as_str())
                             .to_owned(),
-                        color: pad.color.to_color32(),
+                        color: style::pad_color(pad.color),
                     },
                     image,
                     res_badge,
@@ -996,7 +996,7 @@ impl Flight {
                             } else {
                                 ViewfinderContents::Texture {
                                     id: p.texture(),
-                                    uv: pad.fpv.viewport.to_rect(),
+                                    uv: pad.fpv.viewport,
                                 }
                             }
                         }
@@ -1015,7 +1015,7 @@ impl Flight {
                         None => setup.cameras.get(camera_id).map(|c| c.resolution),
                     };
                     res.map(|r| {
-                        let lines = r.height as f32 * pad.fpv.viewport.to_rect().height();
+                        let lines = r.height as f32 * pad.fpv.viewport.height();
                         match setup.cameras.get(camera_id) {
                             Some(c) => format!("{}p@{}fps", lines.round() as u32, c.frame_rate.0),
                             None => format!("{}p", lines.round() as u32),
@@ -1033,7 +1033,7 @@ impl Flight {
                             .get(pad_id)
                             .map_or("", |pilot| pilot.name.as_str())
                             .to_owned(),
-                        color: pad.color.to_color32(),
+                        color: style::pad_color(pad.color),
                     },
                     image,
                     res_badge,

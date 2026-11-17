@@ -243,11 +243,9 @@ impl Default for ViewportConfig {
 }
 
 impl ViewportConfig {
-    pub fn to_rect(self) -> egui::Rect {
-        egui::Rect::from_min_max(
-            egui::pos2(self.left, self.top),
-            egui::pos2(self.right, self.bottom),
-        )
+    /// Высота вьюпорта в долях кадра (0..=1).
+    pub fn height(&self) -> f32 {
+        self.bottom - self.top
     }
 }
 

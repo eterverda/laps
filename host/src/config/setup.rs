@@ -48,17 +48,6 @@ pub enum ColorConfig {
     Yellow,
 }
 
-impl ColorConfig {
-    pub fn to_color32(self) -> egui::Color32 {
-        match self {
-            ColorConfig::Red => egui::Color32::from_rgb(0xFF, 0x33, 0x33),
-            ColorConfig::Blue => egui::Color32::from_rgb(0x33, 0x33, 0xFF),
-            ColorConfig::Green => egui::Color32::from_rgb(0x33, 0xCC, 0x33),
-            ColorConfig::Yellow => egui::Color32::from_rgb(0xF5, 0xBC, 0x00),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

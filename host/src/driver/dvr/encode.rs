@@ -2,40 +2,18 @@
 //! jpeg-камеры сюда не попадают: у них кадры идут в контейнер как есть
 //! (passthrough, см. pipeline в driver/camera).
 
+use jpeg_rusturbo::JpegEncoder;
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
 
-#[cfg(not(any(feature = "jpeg-rusturbo", feature = "jpeg-encoder")))]
-compile_error!("Enable feature `jpeg-rusturbo` (default) or `jpeg-encoder`");
-
-#[cfg(all(feature = "jpeg-rusturbo", feature = "jpeg-encoder"))]
-compile_error!("features `jpeg-rusturbo` and `jpeg-encoder` are mutually exclusive");
-
-/// Кодек выбирается cargo-фичей: `jpeg-rusturbo` (default) или
-/// `jpeg-encoder`.
-#[cfg(feature = "jpeg-rusturbo")]
+/// jpeg-rusturbo: SIMD-кодек, по замерам ~2× быстрее jpeg-encoder
+/// и на ~10% меньше выход при quality 60 (1080p RGBA).
 pub fn encode_rgba_to_jpeg(rgba: &[u8], width: u32, height: u32) -> IoResult<Vec<u8>> {
     const QUALITY: u8 = 60;
     let mut buf = Vec::new();
-    let mut enc = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut buf, QUALITY);
+    let mut enc = JpegEncoder::new_with_quality(&mut buf, QUALITY);
     enc.encode_rgba(rgba, width, height)
         .map_err(|e| IoError::other(format!("jpeg-rusturbo: {e}")))?;
-    Ok(buf)
-}
-
-#[cfg(feature = "jpeg-encoder")]
-pub fn encode_rgba_to_jpeg(rgba: &[u8], width: u32, height: u32) -> IoResult<Vec<u8>> {
-    const QUALITY: u8 = 60;
-    let mut buf = Vec::new();
-    let encoder = jpeg_encoder::Encoder::new(&mut buf, QUALITY);
-    encoder
-        .encode(
-            rgba,
-            width as u16,
-            height as u16,
-            jpeg_encoder::ColorType::Rgba,
-        )
-        .map_err(|e| IoError::other(format!("jpeg encode: {e}")))?;
     Ok(buf)
 }
 

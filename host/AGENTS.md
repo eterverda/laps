@@ -133,7 +133,7 @@ Desktop application for the Laps timing system. Cross-platform: macOS and Linux.
 - YUYV cameras: decode via **yuv** crate (dev-profile opt-level = 2)
 - Per-frame latency hot spots: buffer copy and decode; hot crates
   get `opt-level` bumps in dev profile (`zune-jpeg`/`jpeg-rusturbo`/
-  `jpeg-encoder`/`memchr` = 3, `yuv`/`epaint` = 2) instead of optimizing
+  `memchr` = 3, `yuv`/`epaint` = 2) instead of optimizing
   our own crate in dev
 - Camera lifecycle states (`CaptureState`: Starting/Live/Dead) signaled
   UI-ward via `crossbeam_utils::AtomicCell`
@@ -193,9 +193,8 @@ Own module `src/driver/dvr/`, no external muxer libraries, no ffmpeg.
 
 - **Passthrough**: camera already emits JPEG; recording = muxing blobs,
   CPU cost ≈ 0. YUYV: RGBA re-encoded to JPEG in the writer thread; codec
-  is a compile-time alternative (`jpeg-rusturbo` by default — SIMD;
-  `--no-default-features --features jpeg-encoder` switches; the two
-  features are mutually exclusive)
+  is `jpeg-rusturbo` (SIMD; chosen by benchmark: ~2× faster and
+  ~10% smaller output than `jpeg-encoder` at quality 60, 1080p RGBA)
 - **Containers** (per-camera setting in setup.yaml, `dvr.container`,
   default `mkv`):
   - `mkv` — Matroska/EBML, real per-frame millisecond timestamps
